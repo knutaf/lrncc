@@ -106,33 +106,30 @@ fn lex_all_tokens<'a>(input : &'a str) -> Result<Vec<&'a str>, String> {
 
     let mut remaining_input = input.trim();
     while remaining_input.len() > 0 {
-        let result = lex_next_token(&remaining_input);
-        if let Ok(split) = result {
-            //println!("[{}], [{}]", split.0, split.1);
-            tokens.push(split.0);
-            //println!("token: {}", split.0);
-            remaining_input = split.1.trim();
-        } else {
-            return Err(format!("lex error: {}", result.unwrap_err()));
+        match lex_next_token(&remaining_input) {
+            Ok(split) => {
+                //println!("[{}], [{}]", split.0, split.1);
+                tokens.push(split.0);
+                //println!("token: {}", split.0);
+                remaining_input = split.1.trim();
+            },
+            Err(msg) => return Err(msg)
         }
     }
 
     Ok(tokens)
 }
 
-fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Option<AstProgram<'a>> {
+fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Result<AstProgram<'a>, String> {
     // TODO: verify no remaining tokens
-    if let Some((function, _remaining_tokens)) = parse_function(remaining_tokens) {
-        Some(AstProgram {
+    parse_function(remaining_tokens).and_then(|(function, _remaining_tokens)| {
+        Ok(AstProgram {
             main_function: function,
         })
-    } else {
-        println!("failed parse_function");
-        None
-    }
+    })
 }
 
-fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Option<(AstFunction<'a>, &'b [&'a str])> {
+fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFunction<'a>, &'b [&'a str]), String> {
     if remaining_tokens.len() >= 5 {
         let (tokens, remaining_tokens) = remaining_tokens.split_at(5);
         if tokens[0] == "int" &&
@@ -141,70 +138,63 @@ fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Option<(AstFuncti
            tokens[4] == "{" {
             let name = tokens[1];
 
-            if let Some((body, remaining_tokens)) = parse_statement(remaining_tokens) {
-                Some((AstFunction {
-                    name,
-                    body,
-                }, remaining_tokens))
-                // TODO parse closing brace
-            } else {
-                println!("failed parse_statement");
-                None
-            }
-        }
-        else {
-            println!("failed fn header");
-            None
+            parse_statement(remaining_tokens).and_then(|(body, remaining_tokens)| {
+                if remaining_tokens.len() >= 1 {
+                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                    if tokens[0] == "}" {
+                        Ok((AstFunction {
+                            name,
+                            body,
+                        }, remaining_tokens))
+                    } else {
+                        Err(format!("function body missing closing brace"))
+                    }
+                } else {
+                    Err(format!("not enough tokens for function body closing brace"))
+                }
+            })
+        } else {
+            Err(format!("failed to find function declaration"))
         }
     } else {
-        println!("failed fn tokens len");
-        None
+        Err(format!("not enough tokens for function declaration"))
     }
 }
 
-fn parse_statement<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Option<(AstStatement, &'b [&'a str])> {
+fn parse_statement<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstStatement, &'b [&'a str]), String> {
     if remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
         if tokens[0] == "return" {
-            if let Some((expr, remaining_tokens)) = parse_expression(remaining_tokens) {
+            parse_expression(remaining_tokens).and_then(|(expr, remaining_tokens)| {
                 if remaining_tokens.len() >= 1 {
                     let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
                     if tokens[0] == ";" {
-                        Some((AstStatement::Return(expr), remaining_tokens))
+                        Ok((AstStatement::Return(expr), remaining_tokens))
                     } else {
-                        println!("failed semicolon");
-                        None
+                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
                     }
                 } else {
-                    println!("failed semicolon len");
-                    None
+                    Err(format!("not enough tokens for ending semicolon"))
                 }
-            } else {
-                println!("failed parse_expression");
-                None
-            }
+            })
         } else {
-            println!("failed statement return");
-            None
+            Err(format!("unrecognized statement starting with {}", tokens[0]))
         }
     } else {
-        println!("failed statement len 1");
-        None
+        Err(format!("not enough tokens for statement"))
     }
 }
 
-fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Option<(AstExpression, &'b [&'a str])> {
+fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
     if remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
         if let Ok(integer_literal) = tokens[0].parse::<u32>() {
-            Some((AstExpression::Constant(integer_literal), remaining_tokens))
+            Ok((AstExpression::Constant(integer_literal), remaining_tokens))
         } else {
-            println!("failed parse u32 {}", tokens[0]);
-            None
+            Err(format!("failed parse u32 {}", tokens[0]))
         }
     } else {
-        println!("failed tokens len");
-        None
+        Err(format!("not enough tokens for expression"))
     }
 }
 
@@ -277,15 +267,16 @@ fn main() {
 
             println!();
 
-            if let Some(program) = parse_program(&tokens) {
-                println!("AST:\n{}\n", program);
+            match parse_program(&tokens) {
+                Ok(program) => {
+                    println!("AST:\n{}\n", program);
 
-                let code = generate_program_code(&program);
-                println!("code:\n{}", code);
+                    let code = generate_program_code(&program);
+                    println!("code:\n{}", code);
 
-                compile_and_link(&code, &args[2]);
-            } else {
-                println!("parse error!");
+                    compile_and_link(&code, &args[2]);
+                },
+                Err(msg) => println!("{}", msg)
             }
         },
         Err(msg) => println!("{}", msg)
@@ -320,7 +311,7 @@ r"int main() {
 }";
         assert_eq!(
             parse_program(&lex_all_tokens(&input).unwrap()),
-            Some(AstProgram {
+            Ok(AstProgram {
                 main_function: AstFunction {
                     name: "main",
                     body: AstStatement::Return(
