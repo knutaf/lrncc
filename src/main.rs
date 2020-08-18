@@ -1,5 +1,6 @@
 use std::env;
 use std::fmt;
+use std::process::Command;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
@@ -208,7 +209,7 @@ fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Option<(AstExpr
     }
 }
 
-fn generate_function_body(ast_statement : &AstStatement) -> String {
+fn generate_function_body_code(ast_statement : &AstStatement) -> String {
     if let AstStatement::Return(expr) = ast_statement {
         if let AstExpression::Constant(val) = expr {
             format!("    mov rax,{}\n    ret\n", val)
@@ -223,13 +224,9 @@ fn generate_function_body(ast_statement : &AstStatement) -> String {
 fn generate_function_code(ast_function : &AstFunction) -> String {
     let mut result = format!("{} PROC\n", ast_function.name);
 
-    result += &generate_function_body(&ast_function.body);
+    result += &generate_function_body_code(&ast_function.body);
 
     result + &format!("{} ENDP\n", ast_function.name)
-//main PROC
-    //mov rax, 3
-    //ret
-//main ENDP
 }
 
 fn generate_program_code(ast_program : &AstProgram) -> String {
@@ -251,6 +248,22 @@ r"END
     result + footer
 }
 
+fn compile_and_link(code : &str, exe_path : &str) {
+    const temp_path : &str = "temp.asm";
+
+    std::fs::write(temp_path, &code);
+
+    let status = Command::new("ml64.exe")
+        .args(&[&format!("/Fe{}", exe_path), temp_path])
+        .status();
+
+    println!("assembly status: {:?}", status);
+
+    std::fs::remove_file(temp_path);
+    std::fs::remove_file("temp.obj");
+    std::fs::remove_file("mllink$.lnk");
+}
+
 fn main() {
     let args : Vec<String> = env::args().collect();
     println!("loading {}", args[1]);
@@ -269,7 +282,8 @@ fn main() {
 
             let code = generate_program_code(&program);
             println!("code:\n{}", code);
-            std::fs::write(&args[2], &code);
+
+            compile_and_link(&code, &args[2]);
         } else {
             println!("parse error!");
         }

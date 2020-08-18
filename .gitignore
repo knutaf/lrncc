@@ -1,3 +1,7 @@
+*.exe
+*.asm
+*.obj
+*.lnk
 input.txt
 merge_to_public.cmd
 **/target/
