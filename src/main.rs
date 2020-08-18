@@ -1,9 +1,21 @@
 use std::env;
-use std::io::prelude::*;
+use std::fmt;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
 use regex::Regex;
+
+trait AstToString {
+    fn ast_to_string(&self, indent_levels : u32) -> String;
+
+    fn get_indent_string(indent_levels : u32) -> String {
+        let mut result = String::new();
+        for _ in 0 .. indent_levels {
+            result += "    ";
+        }
+        result
+    }
+}
 
 #[derive(PartialEq, Clone, Debug)]
 struct AstProgram<'a> {
@@ -26,10 +38,42 @@ enum AstExpression {
     Constant(u32),
 }
 
-pub fn read_all_stdin() -> String {
-    let mut contents = String::new();
-    std::io::stdin().read_to_string(&mut contents).expect("failed to read input from stdin");
-    contents.trim().to_string()
+impl<'a> AstToString for AstProgram<'a> {
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        format!("{}", self.main_function.ast_to_string(0))
+    }
+}
+
+impl<'a> fmt::Display for AstProgram<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.ast_to_string(0))
+    }
+}
+
+impl<'a> AstToString for AstFunction<'a> {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
+        format!("{}FUNC {}:\n{}", Self::get_indent_string(indent_levels), self.name, self.body.ast_to_string(indent_levels + 1))
+    }
+}
+
+impl AstToString for AstStatement {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
+        if let AstStatement::Return(expr) = self {
+            format!("{}return {}", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
+        } else {
+            format!("{}err {:?}", Self::get_indent_string(indent_levels), self)
+        }
+    }
+}
+
+impl AstToString for AstExpression {
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        if let AstExpression::Constant(val) = self {
+            format!("{}", val)
+        } else {
+            format!("err {:?}", self)
+        }
+    }
 }
 
 fn lex_next_token<'a>(input : &'a str)  -> Option<(&'a str, &'a str)> {
@@ -175,9 +219,15 @@ fn main() {
             println!("{}", token);
         }
 
-        parse_program(&tokens);
+        println!();
+
+        if let Some(program) = parse_program(&tokens) {
+            println!("AST:\n{}", program);
+        } else {
+            println!("parse error!");
+        }
     } else {
-        println!("parse error!");
+        println!("lex error!");
     }
 }
 
