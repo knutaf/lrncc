@@ -1,3 +1,4 @@
+input.txt
 merge_to_public.cmd
 **/target/
 **/*.rs.bk

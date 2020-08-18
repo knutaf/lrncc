@@ -1,3 +1,4 @@
+use std::env;
 use std::io::prelude::*;
 
 #[macro_use] extern crate lazy_static;
@@ -164,7 +165,9 @@ fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Option<(AstExpr
 }
 
 fn main() {
-    let input = read_all_stdin();
+    let args : Vec<String> = env::args().collect();
+    println!("loading {}", args[1]);
+    let input = std::fs::read_to_string(&args[1]).unwrap();
     //println!("input: {}", input);
 
     if let Some(tokens) = lex_all_tokens(&input) {
