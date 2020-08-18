@@ -77,7 +77,7 @@ impl AstToString for AstExpression {
     }
 }
 
-fn lex_next_token<'a>(input : &'a str)  -> Option<(&'a str, &'a str)> {
+fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
     lazy_static! {
         static ref TOKEN_REGEXES : Vec<regex::Regex> = vec![
             Regex::new(r"^\{").expect("failed to compile regex"),
@@ -94,31 +94,30 @@ fn lex_next_token<'a>(input : &'a str)  -> Option<(&'a str, &'a str)> {
         if let Some(mat) = r.find(input) {
             let range = mat.range();
             //println!("match: {}, {}", range.start, range.end);
-            return Some(input.split_at(range.end));
+            return Ok(input.split_at(range.end));
         }
     }
 
-    return None;
+    Err(format!("unrecognized token starting at {}", input))
 }
 
-// TODO should use error instead of option
-fn lex_all_tokens<'a>(input : &'a str) -> Option<Vec<&'a str>> {
+fn lex_all_tokens<'a>(input : &'a str) -> Result<Vec<&'a str>, String> {
     let mut tokens : Vec<&'a str> = vec![];
 
     let mut remaining_input = input.trim();
     while remaining_input.len() > 0 {
-        if let Some(split) = lex_next_token(&remaining_input) {
+        let result = lex_next_token(&remaining_input);
+        if let Ok(split) = result {
             //println!("[{}], [{}]", split.0, split.1);
             tokens.push(split.0);
             //println!("token: {}", split.0);
             remaining_input = split.1.trim();
         } else {
-            println!("Unrecognized token starting at {}", remaining_input);
-            return None;
+            return Err(format!("lex error: {}", result.unwrap_err()));
         }
     }
 
-    Some(tokens)
+    Ok(tokens)
 }
 
 fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Option<AstProgram<'a>> {
@@ -270,25 +269,26 @@ fn main() {
     let input = std::fs::read_to_string(&args[1]).unwrap();
     //println!("input: {}", input);
 
-    if let Some(tokens) = lex_all_tokens(&input) {
-        for token in tokens.iter() {
-            println!("{}", token);
-        }
+    match lex_all_tokens(&input) {
+        Ok(tokens) => {
+            for token in tokens.iter() {
+                println!("{}", token);
+            }
 
-        println!();
+            println!();
 
-        if let Some(program) = parse_program(&tokens) {
-            println!("AST:\n{}\n", program);
+            if let Some(program) = parse_program(&tokens) {
+                println!("AST:\n{}\n", program);
 
-            let code = generate_program_code(&program);
-            println!("code:\n{}", code);
+                let code = generate_program_code(&program);
+                println!("code:\n{}", code);
 
-            compile_and_link(&code, &args[2]);
-        } else {
-            println!("parse error!");
-        }
-    } else {
-        println!("lex error!");
+                compile_and_link(&code, &args[2]);
+            } else {
+                println!("parse error!");
+            }
+        },
+        Err(msg) => println!("{}", msg)
     }
 }
 
@@ -302,7 +302,14 @@ mod test {
 r"int main() {
     return 2;
 }";
-        assert_eq!(lex_all_tokens(&input), Some(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"]));
+        assert_eq!(lex_all_tokens(&input), Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"]));
+    }
+
+    #[test]
+    fn lex_no_whitespace() {
+        let input =
+r"int main(){return 2;}";
+        assert_eq!(lex_all_tokens(&input), Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"]));
     }
 
     #[test]
