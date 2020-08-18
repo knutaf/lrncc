@@ -208,6 +208,49 @@ fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Option<(AstExpr
     }
 }
 
+fn generate_function_body(ast_statement : &AstStatement) -> String {
+    if let AstStatement::Return(expr) = ast_statement {
+        if let AstExpression::Constant(val) = expr {
+            format!("    mov rax,{}\n    ret\n", val)
+        } else {
+            String::from("unsupported expr")
+        }
+    } else {
+        String::from("unsupported statement")
+    }
+}
+
+fn generate_function_code(ast_function : &AstFunction) -> String {
+    let mut result = format!("{} PROC\n", ast_function.name);
+
+    result += &generate_function_body(&ast_function.body);
+
+    result + &format!("{} ENDP\n", ast_function.name)
+//main PROC
+    //mov rax, 3
+    //ret
+//main ENDP
+}
+
+fn generate_program_code(ast_program : &AstProgram) -> String {
+    const header : &str =
+r"INCLUDELIB msvcrt.lib
+.DATA
+
+.CODE
+start:
+";
+    const footer : &str =
+r"END
+";
+
+    let mut result = String::from(header);
+
+    result += &generate_function_code(&ast_program.main_function);
+
+    result + footer
+}
+
 fn main() {
     let args : Vec<String> = env::args().collect();
     println!("loading {}", args[1]);
@@ -222,7 +265,11 @@ fn main() {
         println!();
 
         if let Some(program) = parse_program(&tokens) {
-            println!("AST:\n{}", program);
+            println!("AST:\n{}\n", program);
+
+            let code = generate_program_code(&program);
+            println!("code:\n{}", code);
+            std::fs::write(&args[2], &code);
         } else {
             println!("parse error!");
         }
