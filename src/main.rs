@@ -132,7 +132,6 @@ fn lex_all_tokens<'a>(input : &'a str) -> Result<Vec<&'a str>, String> {
 }
 
 fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Result<AstProgram<'a>, String> {
-    // TODO: verify no remaining tokens
     parse_function(remaining_tokens).and_then(|(function, remaining_tokens)| {
         if remaining_tokens.len() == 0 {
             Ok(AstProgram {
@@ -224,27 +223,51 @@ fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpr
     }
 }
 
-fn generate_function_body_code(ast_statement : &AstStatement) -> String {
-    if let AstStatement::Return(expr) = ast_statement {
-        if let AstExpression::Constant(val) = expr {
-            format!("    mov rax,{}\n    ret\n", val)
-        } else {
-            String::from("unsupported expr")
-        }
-    } else {
-        String::from("unsupported statement")
+fn get_register_name(register_name : &str, width : u32) -> String {
+    match width {
+        8 => format!("{}l", register_name),
+        16 => format!("{}x", register_name),
+        32 => format!("e{}x", register_name),
+        64 => format!("r{}x", register_name),
+        _ => panic!("unexpected register name"),
     }
 }
 
-fn generate_function_code(ast_function : &AstFunction) -> String {
-    let mut result = format!("{} PROC\n", ast_function.name);
+fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
+    let reg64 = get_register_name(target_register, 64);
+    let reg8 = get_register_name(target_register, 8);
 
-    result += &generate_function_body_code(&ast_function.body);
-
-    result + &format!("{} ENDP\n", ast_function.name)
+    match ast_expression {
+        AstExpression::Constant(val) => Ok(format!("    mov {},{}", reg64, val)),
+        AstExpression::UnaryOperator(operator, box_expr) => {
+            generate_expression_code(box_expr, target_register).and_then(|inner_expr_code| {
+                match operator {
+                    AstUnaryOperator::Negation => Ok(format!("{}\n    neg {}", inner_expr_code, reg64)),
+                    AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not {}", inner_expr_code, reg64)),
+                    AstUnaryOperator::LogicalNot => Ok(format!("{}\n    cmp {},0\n    mov {},0\n    sete {}", inner_expr_code, reg64, reg64, reg8)),
+                }
+            })
+        },
+    }
 }
 
-fn generate_program_code(ast_program : &AstProgram) -> String {
+fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, String> {
+    if let AstStatement::Return(expr) = ast_statement {
+        generate_expression_code(expr, "a").and_then(|expr_code| {
+            Ok(format!("{}\n    ret", expr_code))
+        })
+    } else {
+        Err(format!("unsupported statement {:?}", ast_statement))
+    }
+}
+
+fn generate_function_code(ast_function : &AstFunction) -> Result<String, String> {
+    generate_statement_code(&ast_function.body).and_then(|function_code| {
+        Ok(format!("{} PROC\n{}\n{} ENDP", ast_function.name, function_code, ast_function.name))
+    })
+}
+
+fn generate_program_code(ast_program : &AstProgram) -> Result<String, String> {
     const header : &str =
 r"INCLUDELIB msvcrt.lib
 .DATA
@@ -256,11 +279,9 @@ start:
 r"END
 ";
 
-    let mut result = String::from(header);
-
-    result += &generate_function_code(&ast_program.main_function);
-
-    result + footer
+    generate_function_code(&ast_program.main_function).and_then(|main_code| {
+        Ok(String::from(header) + &main_code + "\n" + footer)
+    })
 }
 
 fn compile_and_link(code : &str, exe_path : &str) {
@@ -270,13 +291,15 @@ fn compile_and_link(code : &str, exe_path : &str) {
 
     let status = Command::new("ml64.exe")
         .args(&[&format!("/Fe{}", exe_path), temp_path])
-        .status();
+        .status()
+        .expect("failed to run ml64.exe");
 
     println!("assembly status: {:?}", status);
-
-    std::fs::remove_file(temp_path);
-    std::fs::remove_file("temp.obj");
-    std::fs::remove_file("mllink$.lnk");
+    if status.success() {
+        std::fs::remove_file(temp_path);
+        std::fs::remove_file("temp.obj");
+        std::fs::remove_file("mllink$.lnk");
+    }
 }
 
 fn main() {
@@ -297,10 +320,13 @@ fn main() {
                 Ok(program) => {
                     println!("AST:\n{}\n", program);
 
-                    let code = generate_program_code(&program);
-                    println!("code:\n{}", code);
-
-                    compile_and_link(&code, &args[2]);
+                    match generate_program_code(&program) {
+                        Ok(code) => {
+                            println!("code:\n{}", code);
+                            compile_and_link(&code, &args[2])
+                        }
+                        Err(msg) => println!("{}", msg),
+                    }
                 },
                 Err(msg) => println!("{}", msg)
             }
