@@ -413,7 +413,7 @@ r"int main() {{
         test_parse_failure("int main() { RETURN 0; }")
     }
 
-    fn test_parse_unary_operator(token : &str, operator : AstUnaryOperator) {
+    fn test_parse_single_unary_operator(token : &str, operator : AstUnaryOperator) {
         assert_eq!(
             parse_program(&lex_all_tokens(&format!("int main() {{ return {}1; }}", token)).unwrap()),
             Ok(AstProgram {
@@ -431,9 +431,33 @@ r"int main() {{
     }
 
     #[test]
-    fn parse_unary_operators() {
-        test_parse_unary_operator("-", AstUnaryOperator::Negation);
-        test_parse_unary_operator("~", AstUnaryOperator::BitwiseNot);
-        test_parse_unary_operator("!", AstUnaryOperator::LogicalNot);
+    fn parse_single_unary_operators() {
+        test_parse_single_unary_operator("-", AstUnaryOperator::Negation);
+        test_parse_single_unary_operator("~", AstUnaryOperator::BitwiseNot);
+        test_parse_single_unary_operator("!", AstUnaryOperator::LogicalNot);
+    }
+
+    #[test]
+    fn test_parse_multi_unary_operators() {
+        assert_eq!(
+            parse_program(&lex_all_tokens("int main() { return -~!1; }").unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression::UnaryOperator(
+                            AstUnaryOperator::Negation,
+                            Box::new(AstExpression::UnaryOperator(
+                                AstUnaryOperator::BitwiseNot,
+                                Box::new(AstExpression::UnaryOperator(
+                                    AstUnaryOperator::LogicalNot,
+                                    Box::new(AstExpression::Constant(1))
+                                ))
+                            ))
+                        )
+                    )
+                },
+            })
+        );
     }
 }
