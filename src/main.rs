@@ -85,6 +85,9 @@ fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
             Regex::new(r"^\(").expect("failed to compile regex"),
             Regex::new(r"^\)").expect("failed to compile regex"),
             Regex::new(r"^;").expect("failed to compile regex"),
+            Regex::new(r"^-").expect("failed to compile regex"),
+            Regex::new(r"^~").expect("failed to compile regex"),
+            Regex::new(r"^!").expect("failed to compile regex"),
             Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
             Regex::new(r"^[0-9]+").expect("failed to compile regex"),
         ];
@@ -301,6 +304,21 @@ r"int main() {
         let input =
 r"int main(){return 2;}";
         assert_eq!(lex_all_tokens(&input), Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"]));
+    }
+
+    #[test]
+    fn lex_negative() {
+        assert_eq!(lex_all_tokens("int main() { return -1; }"), Ok(vec!["int", "main", "(", ")", "{", "return", "-", "1", ";", "}"]));
+    }
+
+    #[test]
+    fn lex_bitwise_not() {
+        assert_eq!(lex_all_tokens("int main() { return ~1; }"), Ok(vec!["int", "main", "(", ")", "{", "return", "~", "1", ";", "}"]));
+    }
+
+    #[test]
+    fn lex_logical_not() {
+        assert_eq!(lex_all_tokens("int main() { return !1; }"), Ok(vec!["int", "main", "(", ")", "{", "return", "!", "1", ";", "}"]));
     }
 
     fn test_parse_simple(value : u32) {
