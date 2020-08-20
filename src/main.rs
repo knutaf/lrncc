@@ -133,10 +133,14 @@ fn lex_all_tokens<'a>(input : &'a str) -> Result<Vec<&'a str>, String> {
 
 fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Result<AstProgram<'a>, String> {
     // TODO: verify no remaining tokens
-    parse_function(remaining_tokens).and_then(|(function, _remaining_tokens)| {
-        Ok(AstProgram {
-            main_function: function,
-        })
+    parse_function(remaining_tokens).and_then(|(function, remaining_tokens)| {
+        if remaining_tokens.len() == 0 {
+            Ok(AstProgram {
+                main_function: function,
+            })
+        } else {
+            Err(format!("extra tokens after main function end: {:?}", remaining_tokens))
+        }
     })
 }
 
@@ -411,6 +415,11 @@ r"int main() {{
     #[test]
     fn parse_error_missing_statement_return_wrong_case() {
         test_parse_failure("int main() { RETURN 0; }")
+    }
+
+    #[test]
+    fn parse_error_extra_token() {
+        test_parse_failure("int main() { return 0; }}")
     }
 
     fn test_parse_single_unary_operator(token : &str, operator : AstUnaryOperator) {
