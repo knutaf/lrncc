@@ -35,8 +35,16 @@ enum AstStatement {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+enum AstUnaryOperator {
+    Negation,
+    BitwiseNot,
+    LogicalNot,
+}
+
+#[derive(PartialEq, Clone, Debug)]
 enum AstExpression {
     Constant(u32),
+    UnaryOperator(AstUnaryOperator, Box<AstExpression>),
 }
 
 impl<'a> AstToString for AstProgram<'a> {
@@ -194,7 +202,18 @@ fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpr
         if let Ok(integer_literal) = tokens[0].parse::<u32>() {
             Ok((AstExpression::Constant(integer_literal), remaining_tokens))
         } else {
-            Err(format!("failed parse u32 {}", tokens[0]))
+            let operator_result = match tokens[0] {
+                "-" => Ok((AstUnaryOperator::Negation, remaining_tokens)),
+                "~" => Ok((AstUnaryOperator::BitwiseNot, remaining_tokens)),
+                "!" => Ok((AstUnaryOperator::LogicalNot, remaining_tokens)),
+                _ => Err(format!("unknown operator {}", tokens[0]))
+            };
+
+            operator_result.and_then(|(operator, remaining_tokens)| {
+                parse_expression(remaining_tokens).and_then(|(inner_expression, remaining_tokens)| {
+                    Ok((AstExpression::UnaryOperator(operator, Box::new(inner_expression)), remaining_tokens))
+                })
+            })
         }
     } else {
         Err(format!("not enough tokens for expression"))
@@ -392,5 +411,29 @@ r"int main() {{
     #[test]
     fn parse_error_missing_statement_return_wrong_case() {
         test_parse_failure("int main() { RETURN 0; }")
+    }
+
+    fn test_parse_unary_operator(token : &str, operator : AstUnaryOperator) {
+        assert_eq!(
+            parse_program(&lex_all_tokens(&format!("int main() {{ return {}1; }}", token)).unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression::UnaryOperator(
+                            operator,
+                            Box::new(AstExpression::Constant(1))
+                        )
+                    )
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn parse_unary_operators() {
+        test_parse_unary_operator("-", AstUnaryOperator::Negation);
+        test_parse_unary_operator("~", AstUnaryOperator::BitwiseNot);
+        test_parse_unary_operator("!", AstUnaryOperator::LogicalNot);
     }
 }
