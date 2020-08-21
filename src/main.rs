@@ -390,62 +390,77 @@ r"int main() {{
     }
 
     fn test_parse_failure(input : &str) {
-        assert!(parse_program(&lex_all_tokens(input).unwrap()).is_err())
+        assert!(parse_program(&lex_all_tokens(input).unwrap()).is_err());
     }
 
     #[test]
     fn parse_return_0() {
-        test_parse_simple(0)
+        test_parse_simple(0);
     }
 
     #[test]
     fn parse_return_2() {
-        test_parse_simple(2)
+        test_parse_simple(2);
     }
 
     #[test]
     fn parse_return_multi_digit() {
-        test_parse_simple(12345)
+        test_parse_simple(12345);
     }
 
     #[test]
     fn parse_error_missing_open_paren() {
-        test_parse_failure("int main) { return 1; }")
+        test_parse_failure("int main) { return 1; }");
     }
 
     #[test]
     fn parse_error_missing_close_paren() {
-        test_parse_failure("int main( { return 1; }")
+        test_parse_failure("int main( { return 1; }");
     }
 
     #[test]
     fn parse_error_missing_retval() {
-        test_parse_failure("int main() { return; }")
+        test_parse_failure("int main() { return; }");
     }
 
     #[test]
     fn parse_error_missing_close_brace() {
-        test_parse_failure("int main() { return;")
+        test_parse_failure("int main() { return;");
     }
 
     #[test]
     fn parse_error_missing_statement_semicolon() {
-        test_parse_failure("int main() { return }")
+        test_parse_failure("int main() { return }");
+        test_parse_failure("int main() { return 5 }");
+        test_parse_failure("int main() { return !5 }");
     }
 
     #[test]
     fn parse_error_missing_statement_missing_space() {
-        test_parse_failure("int main() { return0; }")
+        test_parse_failure("int main() { return0; }");
     }
 
     #[test]
     fn parse_error_missing_statement_return_wrong_case() {
-        test_parse_failure("int main() { RETURN 0; }")
+        test_parse_failure("int main() { RETURN 0; }");
     }
 
     #[test]
     fn parse_error_extra_token() {
-        test_parse_failure("int main() { return 0; }}")
+        test_parse_failure("int main() { return 0; }}");
+    }
+
+    #[test]
+    fn parse_error_missing_unary_operand() {
+        test_parse_failure("int main() { return !; }}");
+        test_parse_failure("int main() { return !-~; }}");
+    }
+
+    #[test]
+    fn parse_error_unary_operand_misorder() {
+        test_parse_failure("int main() { return 5!; }}");
+        test_parse_failure("int main() { return 5-; }}");
+        test_parse_failure("int main() { return 5~; }}");
     }
 
     fn test_parse_single_unary_operator(token : &str, operator : AstUnaryOperator) {
