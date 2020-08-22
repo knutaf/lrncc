@@ -42,9 +42,64 @@ enum AstUnaryOperator {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-enum AstExpression {
+enum AstExpressionBinaryOperator {
+    Plus,
+    Minus,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AstTermBinaryOperator {
+    Multiply,
+    Divide,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AstFactor {
     Constant(u32),
-    UnaryOperator(AstUnaryOperator, Box<AstExpression>),
+    UnaryOperator(AstUnaryOperator, Box<AstFactor>),
+    Expression(Box<AstExpression>),
+}
+
+#[derive(PartialEq, Clone, Debug)]
+struct AstTermBinaryOperation {
+    operator : AstTermBinaryOperator,
+    rhs : AstFactor,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+struct AstTerm {
+    factor : AstFactor,
+    binary_ops : Vec<AstTermBinaryOperation>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+struct AstExpressionBinaryOperation {
+    operator : AstExpressionBinaryOperator,
+    rhs : AstTerm,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+struct AstExpression {
+    term : AstTerm,
+    binary_ops : Vec<AstExpressionBinaryOperation>,
+}
+
+impl AstTerm {
+    fn new(factor : AstFactor) -> AstTerm {
+        AstTerm {
+            factor,
+            binary_ops : vec![],
+        }
+    }
+}
+
+impl AstExpression {
+    fn new(term : AstTerm) -> AstExpression {
+        AstExpression {
+            term,
+            binary_ops : vec![],
+        }
+    }
 }
 
 impl<'a> AstToString for AstProgram<'a> {
@@ -75,13 +130,39 @@ impl AstToString for AstStatement {
     }
 }
 
-impl AstToString for AstExpression {
+impl AstToString for AstFactor {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
-        if let AstExpression::Constant(val) = self {
+        if let AstFactor::Constant(val) = self {
             format!("{}", val)
         } else {
             format!("err {:?}", self)
         }
+    }
+}
+
+impl AstToString for AstTerm {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
+        format!("term")
+        /* TODO implement
+        if let AstTerm::Factor(val) = self {
+            format!("{}", val.ast_to_string(indent_levels))
+        } else {
+            format!("err {:?}", self)
+        }
+        */
+    }
+}
+
+impl AstToString for AstExpression {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
+        format!("expr")
+        /* TODO fix
+        if let AstExpression::Term(val) = self {
+            format!("{}", val.ast_to_string(indent_levels))
+        } else {
+            format!("err {:?}", self)
+        }
+        */
     }
 }
 
@@ -96,6 +177,9 @@ fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
             Regex::new(r"^-").expect("failed to compile regex"),
             Regex::new(r"^~").expect("failed to compile regex"),
             Regex::new(r"^!").expect("failed to compile regex"),
+            Regex::new(r"^\+").expect("failed to compile regex"),
+            Regex::new(r"^/").expect("failed to compile regex"),
+            Regex::new(r"^\*").expect("failed to compile regex"),
             Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
             Regex::new(r"^[0-9]+").expect("failed to compile regex"),
         ];
@@ -199,28 +283,114 @@ fn parse_statement<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstState
     }
 }
 
-fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
+fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, &'b [&'a str]), String> {
     if remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
         if let Ok(integer_literal) = tokens[0].parse::<u32>() {
-            Ok((AstExpression::Constant(integer_literal), remaining_tokens))
+            Ok((AstFactor::Constant(integer_literal), remaining_tokens))
         } else {
-            let operator_result = match tokens[0] {
+            match tokens[0] {
                 "-" => Ok((AstUnaryOperator::Negation, remaining_tokens)),
                 "~" => Ok((AstUnaryOperator::BitwiseNot, remaining_tokens)),
                 "!" => Ok((AstUnaryOperator::LogicalNot, remaining_tokens)),
                 _ => Err(format!("unknown operator {}", tokens[0]))
-            };
-
-            operator_result.and_then(|(operator, remaining_tokens)| {
-                parse_expression(remaining_tokens).and_then(|(inner_expression, remaining_tokens)| {
-                    Ok((AstExpression::UnaryOperator(operator, Box::new(inner_expression)), remaining_tokens))
+            }.and_then(|(operator, remaining_tokens)| {
+                parse_factor(remaining_tokens).and_then(|(inner, remaining_tokens)| {
+                    Ok((AstFactor::UnaryOperator(operator, Box::new(inner)), remaining_tokens))
                 })
             })
         }
     } else {
-        Err(format!("not enough tokens for expression"))
+        Err(format!("not enough tokens for factor"))
     }
+}
+
+/* TODO remove
+fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
+    parse_factor(remaining_tokens).and_then(|(mut factor1, mut remaining_tokens)| {
+        while remaining_tokens.len() > 0 {
+            let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(1);
+            let binary_op = match tokens[0] {
+                "*" => Some(AstTermBinaryOperator::Multiply),
+                "/" => Some(AstTermBinaryOperator::Divide),
+                _ => None,
+            };
+
+            if let Some(operator) = binary_op {
+                parse_factor(remaining_expression_tokens).and_then(|(factor2, remaining_expression_tokens)| {
+                    factor1 = AstTerm::BinaryOperator(operator, factor1, factor2);
+                    remaining_tokens = remaining_expression_tokens;
+                })
+            } else {
+                return Ok((AstTerm::Factor(factor1), remaining_tokens));
+            }
+        }
+
+        Ok((AstTerm::Factor(factor1), remaining_tokens))
+    })
+}
+*/
+
+fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
+    parse_factor(remaining_tokens).and_then(|(factor1, mut remaining_tokens)| {
+        let mut term = AstTerm::new(factor1);
+        while remaining_tokens.len() > 0 {
+            let (tokens, remaining_term_tokens) = remaining_tokens.split_at(1);
+            let binary_op = match tokens[0] {
+                "*" => Some(AstTermBinaryOperator::Multiply),
+                "/" => Some(AstTermBinaryOperator::Divide),
+                _ => None,
+            };
+
+            if let Some(operator) = binary_op {
+                if let Ok((factor2, remaining_term_tokens)) = parse_factor(remaining_term_tokens) {
+                    term.binary_ops.push(AstTermBinaryOperation {
+                        operator,
+                        rhs : factor2,
+                    });
+
+                    remaining_tokens = remaining_term_tokens;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok((term, remaining_tokens))
+    })
+}
+
+fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
+    parse_term(remaining_tokens).and_then(|(term1, mut remaining_tokens)| {
+        let mut expr = AstExpression::new(term1);
+        while remaining_tokens.len() > 0 {
+            let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(1);
+            let binary_op = match tokens[0] {
+                "+" => Some(AstExpressionBinaryOperator::Plus),
+                "-" => Some(AstExpressionBinaryOperator::Minus),
+                _ => None,
+            };
+
+            if let Some(operator) = binary_op {
+                if let Ok((term2, remaining_expression_tokens)) = parse_term(remaining_expression_tokens) {
+                    expr.binary_ops.push(AstExpressionBinaryOperation {
+                        operator,
+                        rhs : term2,
+                    });
+
+                    remaining_tokens = remaining_expression_tokens;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok((expr, remaining_tokens))
+    })
 }
 
 fn get_register_name(register_name : &str, width : u32) -> String {
@@ -233,22 +403,28 @@ fn get_register_name(register_name : &str, width : u32) -> String {
     }
 }
 
-fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
+fn generate_factor_code(ast_factor : &AstFactor, target_register : &str) -> Result<String, String> {
     let reg64 = get_register_name(target_register, 64);
     let reg8 = get_register_name(target_register, 8);
 
-    match ast_expression {
-        AstExpression::Constant(val) => Ok(format!("    mov {},{}", reg64, val)),
-        AstExpression::UnaryOperator(operator, box_expr) => {
-            generate_expression_code(box_expr, target_register).and_then(|inner_expr_code| {
+    match ast_factor {
+        AstFactor::Constant(val) => Ok(format!("    mov {},{}", reg64, val)),
+        AstFactor::UnaryOperator(operator, box_factor) => {
+            generate_factor_code(box_factor, target_register).and_then(|inner_factor_code| {
                 match operator {
-                    AstUnaryOperator::Negation => Ok(format!("{}\n    neg {}", inner_expr_code, reg64)),
-                    AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not {}", inner_expr_code, reg64)),
-                    AstUnaryOperator::LogicalNot => Ok(format!("{}\n    cmp {},0\n    mov {},0\n    sete {}", inner_expr_code, reg64, reg64, reg8)),
+                    AstUnaryOperator::Negation => Ok(format!("{}\n    neg {}", inner_factor_code, reg64)),
+                    AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not {}", inner_factor_code, reg64)),
+                    AstUnaryOperator::LogicalNot => Ok(format!("{}\n    cmp {},0\n    mov {},0\n    sete {}", inner_factor_code, reg64, reg64, reg8)),
                 }
             })
         },
+        AstFactor::Expression(box_expr) => panic!("not ready or box expr"),
     }
+}
+
+fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
+    // TODO implement
+    Ok(format!("blah"))
 }
 
 fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, String> {
@@ -370,6 +546,10 @@ r"int main(){return 2;}";
         assert_eq!(lex_all_tokens("int main() { return !1; }"), Ok(vec!["int", "main", "(", ")", "{", "return", "!", "1", ";", "}"]));
     }
 
+    fn make_factor_expression(factor : AstFactor) -> AstExpression {
+        AstExpression::new(AstTerm::new(factor))
+    }
+
     fn test_parse_simple(value : u32) {
         let input = format!(
 r"int main() {{
@@ -382,7 +562,7 @@ r"int main() {{
                 main_function: AstFunction {
                     name: "main",
                     body: AstStatement::Return(
-                        AstExpression::Constant(value)
+                        make_factor_expression(AstFactor::Constant(value))
                     )
                 },
             })
@@ -470,10 +650,7 @@ r"int main() {{
                 main_function: AstFunction {
                     name: "main",
                     body: AstStatement::Return(
-                        AstExpression::UnaryOperator(
-                            operator,
-                            Box::new(AstExpression::Constant(1))
-                        )
+                        make_factor_expression(AstFactor::UnaryOperator(operator, Box::new(AstFactor::Constant(1))))
                     )
                 },
             })
@@ -495,15 +672,17 @@ r"int main() {{
                 main_function: AstFunction {
                     name: "main",
                     body: AstStatement::Return(
-                        AstExpression::UnaryOperator(
-                            AstUnaryOperator::Negation,
-                            Box::new(AstExpression::UnaryOperator(
-                                AstUnaryOperator::BitwiseNot,
-                                Box::new(AstExpression::UnaryOperator(
-                                    AstUnaryOperator::LogicalNot,
-                                    Box::new(AstExpression::Constant(1))
+                        make_factor_expression(
+                            AstFactor::UnaryOperator(
+                                AstUnaryOperator::Negation,
+                                Box::new(AstFactor::UnaryOperator(
+                                    AstUnaryOperator::BitwiseNot,
+                                    Box::new(AstFactor::UnaryOperator(
+                                        AstUnaryOperator::LogicalNot,
+                                        Box::new(AstFactor::Constant(1))
+                                    ))
                                 ))
-                            ))
+                            )
                         )
                     )
                 },
