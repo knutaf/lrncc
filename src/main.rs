@@ -721,6 +721,60 @@ r"int main() {{
     }
 
     #[test]
+    fn test_parse_single_binary_term_operation() {
+        assert_eq!(
+            parse_program(&lex_all_tokens("int main() { return 3 * 4; }").unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression::new(
+                            AstTerm {
+                                factor : AstFactor::Constant(3),
+                                binary_ops : vec![
+                                    AstTermBinaryOperation {
+                                        operator : AstTermBinaryOperator::Multiply,
+                                        rhs : AstFactor::Constant(4)
+                                    },
+                                ],
+                            },
+                        )
+                    )
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_multi_binary_term_operation() {
+        assert_eq!(
+            parse_program(&lex_all_tokens("int main() { return 3 * 4 / 5; }").unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression::new(
+                            AstTerm {
+                                factor : AstFactor::Constant(3),
+                                binary_ops : vec![
+                                    AstTermBinaryOperation {
+                                        operator : AstTermBinaryOperator::Multiply,
+                                        rhs : AstFactor::Constant(4)
+                                    },
+                                    AstTermBinaryOperation {
+                                        operator : AstTermBinaryOperator::Divide,
+                                        rhs : AstFactor::Constant(5)
+                                    },
+                                ],
+                            },
+                        )
+                    )
+                },
+            })
+        );
+    }
+
+    #[test]
     fn test_parse_multi_binary_expression_operation() {
         assert_eq!(
             parse_program(&lex_all_tokens("int main() { return 3 + 4 - 5; }").unwrap()),
