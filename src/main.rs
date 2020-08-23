@@ -288,6 +288,19 @@ fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, 
         let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
         if let Ok(integer_literal) = tokens[0].parse::<u32>() {
             Ok((AstFactor::Constant(integer_literal), remaining_tokens))
+        } else if tokens[0] == "(" {
+            parse_expression(remaining_tokens).and_then(|(inner, remaining_tokens)| {
+                if remaining_tokens.len() >= 1 {
+                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                    if tokens[0] == ")" {
+                        Ok((AstFactor::Expression(Box::new(inner)), remaining_tokens))
+                    } else {
+                        Err(format!("expecting closing parenthesis. found {}", tokens[0]))
+                    }
+                } else {
+                     Err(format!("missing closing parenthesis"))
+                }
+            })
         } else {
             match tokens[0] {
                 "-" => Ok((AstUnaryOperator::Negation, remaining_tokens)),
