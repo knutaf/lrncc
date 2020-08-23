@@ -721,6 +721,33 @@ r"int main() {{
     }
 
     #[test]
+    fn test_parse_multi_binary_expression_operation() {
+        assert_eq!(
+            parse_program(&lex_all_tokens("int main() { return 3 + 4 - 5; }").unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression {
+                            term : make_constant_term(3),
+                            binary_ops : vec![
+                                AstExpressionBinaryOperation {
+                                    operator : AstExpressionBinaryOperator::Plus,
+                                    rhs : make_constant_term(4),
+                                },
+                                AstExpressionBinaryOperation {
+                                    operator : AstExpressionBinaryOperator::Minus,
+                                    rhs : make_constant_term(5),
+                                },
+                            ],
+                        }
+                    )
+                },
+            })
+        );
+    }
+
+    #[test]
     fn test_parse_single_binary_term_operation() {
         assert_eq!(
             parse_program(&lex_all_tokens("int main() { return 3 * 4; }").unwrap()),
@@ -775,23 +802,59 @@ r"int main() {{
     }
 
     #[test]
-    fn test_parse_multi_binary_expression_operation() {
+    fn test_parse_multi_binary_expression_and_term_operations() {
         assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 + 4 - 5; }").unwrap()),
+            parse_program(&lex_all_tokens("int main() { return 3 * 4 / 5 + 6 * 7 / 8 - 11 / 10 * 9 ; }").unwrap()),
             Ok(AstProgram {
                 main_function: AstFunction {
                     name: "main",
                     body: AstStatement::Return(
                         AstExpression {
-                            term : make_constant_term(3),
+                            term : AstTerm {
+                                factor : AstFactor::Constant(3),
+                                binary_ops : vec![
+                                    AstTermBinaryOperation {
+                                        operator : AstTermBinaryOperator::Multiply,
+                                        rhs : AstFactor::Constant(4)
+                                    },
+                                    AstTermBinaryOperation {
+                                        operator : AstTermBinaryOperator::Divide,
+                                        rhs : AstFactor::Constant(5)
+                                    },
+                                ],
+                            },
                             binary_ops : vec![
                                 AstExpressionBinaryOperation {
                                     operator : AstExpressionBinaryOperator::Plus,
-                                    rhs : make_constant_term(4),
+                                    rhs : AstTerm {
+                                        factor : AstFactor::Constant(6),
+                                        binary_ops : vec![
+                                            AstTermBinaryOperation {
+                                                operator : AstTermBinaryOperator::Multiply,
+                                                rhs : AstFactor::Constant(7)
+                                            },
+                                            AstTermBinaryOperation {
+                                                operator : AstTermBinaryOperator::Divide,
+                                                rhs : AstFactor::Constant(8)
+                                            },
+                                        ],
+                                    },
                                 },
                                 AstExpressionBinaryOperation {
                                     operator : AstExpressionBinaryOperator::Minus,
-                                    rhs : make_constant_term(5),
+                                    rhs : AstTerm {
+                                        factor : AstFactor::Constant(11),
+                                        binary_ops : vec![
+                                            AstTermBinaryOperation {
+                                                operator : AstTermBinaryOperator::Divide,
+                                                rhs : AstFactor::Constant(10)
+                                            },
+                                            AstTermBinaryOperation {
+                                                operator : AstTermBinaryOperator::Multiply,
+                                                rhs : AstFactor::Constant(9)
+                                            },
+                                        ],
+                                    },
                                 },
                             ],
                         }
