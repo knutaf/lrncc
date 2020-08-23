@@ -550,6 +550,13 @@ r"int main(){return 2;}";
         AstExpression::new(AstTerm::new(factor))
     }
 
+    fn make_constant_term(value : u32) -> AstTerm {
+        AstTerm {
+            factor : AstFactor::Constant(value),
+            binary_ops : vec![],
+        }
+    }
+
     fn test_parse_simple(value : u32) {
         let input = format!(
 r"int main() {{
@@ -684,6 +691,56 @@ r"int main() {{
                                 ))
                             )
                         )
+                    )
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_single_binary_expression_operation() {
+        assert_eq!(
+            parse_program(&lex_all_tokens("int main() { return 3 + 4; }").unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression {
+                            term : make_constant_term(3),
+                            binary_ops : vec![
+                                AstExpressionBinaryOperation {
+                                    operator : AstExpressionBinaryOperator::Plus,
+                                    rhs : make_constant_term(4),
+                                },
+                            ],
+                        }
+                    )
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_multi_binary_expression_operation() {
+        assert_eq!(
+            parse_program(&lex_all_tokens("int main() { return 3 + 4 - 5; }").unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression {
+                            term : make_constant_term(3),
+                            binary_ops : vec![
+                                AstExpressionBinaryOperation {
+                                    operator : AstExpressionBinaryOperator::Plus,
+                                    rhs : make_constant_term(4),
+                                },
+                                AstExpressionBinaryOperation {
+                                    operator : AstExpressionBinaryOperator::Minus,
+                                    rhs : make_constant_term(5),
+                                },
+                            ],
+                        }
                     )
                 },
             })
