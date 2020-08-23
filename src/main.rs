@@ -804,7 +804,7 @@ r"int main() {{
     #[test]
     fn test_parse_multi_binary_expression_and_term_operations() {
         assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 * 4 / 5 + 6 * 7 / 8 - 11 / 10 * 9 ; }").unwrap()),
+            parse_program(&lex_all_tokens("int main() { return 3 * 4 / 5 + 6 * 7 / 8 - 11 / 10 * 9; }").unwrap()),
             Ok(AstProgram {
                 main_function: AstFunction {
                     name: "main",
@@ -857,6 +857,42 @@ r"int main() {{
                                     },
                                 },
                             ],
+                        }
+                    )
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_operator_grouping() {
+        assert_eq!(
+            parse_program(&lex_all_tokens("int main() { return 3 * (4 + 5); }").unwrap()),
+            Ok(AstProgram {
+                main_function: AstFunction {
+                    name: "main",
+                    body: AstStatement::Return(
+                        AstExpression {
+                            term : AstTerm {
+                                factor : AstFactor::Constant(3),
+                                binary_ops : vec![
+                                    AstTermBinaryOperation {
+                                        operator : AstTermBinaryOperator::Multiply,
+                                        rhs : AstFactor::Expression(
+                                             Box::new(AstExpression {
+                                                 term : make_constant_term(4),
+                                                 binary_ops : vec![
+                                                     AstExpressionBinaryOperation {
+                                                         operator : AstExpressionBinaryOperator::Plus,
+                                                         rhs : make_constant_term(5)
+                                                     },
+                                                 ],
+                                             })
+                                        )
+                                    },
+                                ],
+                            },
+                            binary_ops : vec![]
                         }
                     )
                 },
