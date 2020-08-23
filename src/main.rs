@@ -130,39 +130,85 @@ impl AstToString for AstStatement {
     }
 }
 
+impl AstToString for AstUnaryOperator {
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        String::from(match self {
+            AstUnaryOperator::Negation => "-",
+            AstUnaryOperator::BitwiseNot => "~",
+            AstUnaryOperator::LogicalNot => "!",
+        })
+    }
+}
+
+impl AstToString for AstExpressionBinaryOperator {
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        String::from(match self {
+            AstExpressionBinaryOperator::Plus => "+",
+            AstExpressionBinaryOperator::Minus => "-",
+        })
+    }
+}
+
+impl AstToString for AstTermBinaryOperator {
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        String::from(match self {
+            AstTermBinaryOperator::Multiply => "*",
+            AstTermBinaryOperator::Divide => "/",
+        })
+    }
+}
+
 impl AstToString for AstFactor {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
-        if let AstFactor::Constant(val) = self {
-            format!("{}", val)
-        } else {
-            format!("err {:?}", self)
+        match self {
+            AstFactor::Constant(val) => format!("{}", val),
+            AstFactor::UnaryOperator(operator, factor) => {
+                format!("{}{}", operator.ast_to_string(0), factor.ast_to_string(0))
+            },
+            AstFactor::Expression(expr) => format!("({})", expr.ast_to_string(0)),
         }
+    }
+}
+
+impl AstToString for AstTermBinaryOperation {
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        format!("{} {}", self.operator.ast_to_string(0), self.rhs.ast_to_string(0))
     }
 }
 
 impl AstToString for AstTerm {
-    fn ast_to_string(&self, indent_levels : u32) -> String {
-        format!("term")
-        /* TODO implement
-        if let AstTerm::Factor(val) = self {
-            format!("{}", val.ast_to_string(indent_levels))
-        } else {
-            format!("err {:?}", self)
-        }
-        */
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        let format_binary_ops = || -> String {
+            let mut result = String::new();
+            for binop in &self.binary_ops {
+                result += " ";
+                result += &binop.ast_to_string(0);
+            }
+            result
+        };
+
+        self.factor.ast_to_string(0) + &format_binary_ops()
+    }
+}
+
+impl AstToString for AstExpressionBinaryOperation {
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        format!("{} {}", self.operator.ast_to_string(0), self.rhs.ast_to_string(0))
     }
 }
 
 impl AstToString for AstExpression {
-    fn ast_to_string(&self, indent_levels : u32) -> String {
-        format!("expr")
-        /* TODO fix
-        if let AstExpression::Term(val) = self {
-            format!("{}", val.ast_to_string(indent_levels))
-        } else {
-            format!("err {:?}", self)
-        }
-        */
+    fn ast_to_string(&self, _indent_levels : u32) -> String {
+        let format_binary_ops = || -> String {
+            let mut result = String::new();
+            for binop in &self.binary_ops {
+                result += " ";
+                result += &binop.ast_to_string(0);
+            }
+            result
+        };
+
+        self.term.ast_to_string(0) + &format_binary_ops()
     }
 }
 
@@ -317,32 +363,6 @@ fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, 
         Err(format!("not enough tokens for factor"))
     }
 }
-
-/* TODO remove
-fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
-    parse_factor(remaining_tokens).and_then(|(mut factor1, mut remaining_tokens)| {
-        while remaining_tokens.len() > 0 {
-            let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(1);
-            let binary_op = match tokens[0] {
-                "*" => Some(AstTermBinaryOperator::Multiply),
-                "/" => Some(AstTermBinaryOperator::Divide),
-                _ => None,
-            };
-
-            if let Some(operator) = binary_op {
-                parse_factor(remaining_expression_tokens).and_then(|(factor2, remaining_expression_tokens)| {
-                    factor1 = AstTerm::BinaryOperator(operator, factor1, factor2);
-                    remaining_tokens = remaining_expression_tokens;
-                })
-            } else {
-                return Ok((AstTerm::Factor(factor1), remaining_tokens));
-            }
-        }
-
-        Ok((AstTerm::Factor(factor1), remaining_tokens))
-    })
-}
-*/
 
 fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
     parse_factor(remaining_tokens).and_then(|(factor1, mut remaining_tokens)| {
