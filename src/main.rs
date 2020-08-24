@@ -451,13 +451,35 @@ fn generate_factor_code(ast_factor : &AstFactor, target_register : &str) -> Resu
                 }
             })
         },
-        AstFactor::Expression(box_expr) => panic!("not ready or box expr"),
+        AstFactor::Expression(box_expr) => generate_expression_code(&box_expr, target_register),
     }
 }
 
+fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<String, String> {
+    generate_factor_code(&ast_term.factor, target_register)
+    // TODO handle mul and div
+}
+
 fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
-    // TODO implement
-    Ok(format!("blah"))
+    generate_term_code(&ast_expression.term, target_register).and_then(|mut code| {
+        let reg64 = get_register_name(target_register, 64);
+        for binop in &ast_expression.binary_ops {
+            let term_code_result = generate_term_code(&binop.rhs, "c");
+            if let Ok(term_code) = term_code_result {
+                code += &format!("\n    push {}\n{}\n    pop {}", reg64, term_code, reg64);
+
+                let operator_code = match binop.operator {
+                    AstExpressionBinaryOperator::Plus => format!("\n    add {}, rcx", reg64),
+                    AstExpressionBinaryOperator::Minus => format!("\n    sub {},rcx", reg64),
+                };
+                code += &operator_code;
+            } else {
+                return term_code_result;
+            }
+        }
+
+        Ok(code)
+    })
 }
 
 fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, String> {
