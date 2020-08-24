@@ -456,8 +456,36 @@ fn generate_factor_code(ast_factor : &AstFactor, target_register : &str) -> Resu
 }
 
 fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<String, String> {
-    generate_factor_code(&ast_term.factor, target_register)
-    // TODO handle mul and div
+    generate_factor_code(&ast_term.factor, target_register).and_then(|mut code| {
+        let reg64 = get_register_name(target_register, 64);
+        for binop in &ast_term.binary_ops {
+            let factor_code_result = generate_factor_code(&binop.rhs, "c");
+            if let Ok(factor_code) = factor_code_result {
+                code += &format!("\n    push {}\n{}\n    pop {}", reg64, factor_code, reg64);
+
+                match binop.operator {
+                    AstTermBinaryOperator::Multiply => {
+                        code += &format!("\n    imul {}, rcx", reg64);
+                    },
+                    AstTermBinaryOperator::Divide => {
+                        if target_register != "a" {
+                            code += &format!("\n    mov rax,{}", reg64);
+                        }
+
+                        code += &format!("\n    cdq\n    idiv ecx");
+
+                        if target_register != "a" {
+                            code += &format!("\n    mov {},rax", reg64);
+                        }
+                    },
+                };
+            } else {
+                return factor_code_result;
+            }
+        }
+
+        Ok(code)
+    })
 }
 
 fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
