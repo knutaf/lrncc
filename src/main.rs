@@ -543,7 +543,7 @@ r"END
     })
 }
 
-fn compile_and_link(code : &str, exe_path : &str) {
+fn assemble_and_link(code : &str, exe_path : &str) -> Option<i32> {
     const temp_path : &str = "temp.asm";
 
     std::fs::write(temp_path, &code);
@@ -559,6 +559,29 @@ fn compile_and_link(code : &str, exe_path : &str) {
         std::fs::remove_file("temp.obj");
         std::fs::remove_file("mllink$.lnk");
     }
+
+    status.code()
+}
+
+fn compile_and_link(input : &str, output_exe : &str) -> Result<i32, String> {
+    lex_all_tokens(&input).and_then(|tokens| {
+        for token in tokens.iter() {
+            println!("{}", token);
+        }
+
+        println!();
+
+        parse_program(&tokens).and_then(|ast| {
+            println!("AST:\n{}\n", ast);
+
+            generate_program_code(&ast).and_then(|asm| {
+                println!("assembly:\n{}", asm);
+                let exit_code = assemble_and_link(&asm, output_exe).expect("programs should always have an exit code");
+                println!("assemble status: {:?}", exit_code);
+                Ok(exit_code)
+            })
+        })
+    })
 }
 
 fn main() {
@@ -567,31 +590,15 @@ fn main() {
     let input = std::fs::read_to_string(&args[1]).unwrap();
     //println!("input: {}", input);
 
-    match lex_all_tokens(&input) {
-        Ok(tokens) => {
-            for token in tokens.iter() {
-                println!("{}", token);
-            }
-
-            println!();
-
-            match parse_program(&tokens) {
-                Ok(program) => {
-                    println!("AST:\n{}\n", program);
-
-                    match generate_program_code(&program) {
-                        Ok(code) => {
-                            println!("code:\n{}", code);
-                            compile_and_link(&code, &args[2])
-                        }
-                        Err(msg) => println!("{}", msg),
-                    }
-                },
-                Err(msg) => println!("{}", msg)
-            }
+    let exit_code = match compile_and_link(&input, &args[2]) {
+        Ok(inner_exit_code) => inner_exit_code,
+        Err(msg) => {
+            println!("error! {}", msg);
+            1
         },
-        Err(msg) => println!("{}", msg)
-    }
+    };
+
+    std::process::exit(exit_code)
 }
 
 #[cfg(test)]
