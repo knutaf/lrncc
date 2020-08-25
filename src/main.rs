@@ -1,6 +1,6 @@
 use std::env;
 use std::fmt;
-use std::process::Command;
+use std::process::*;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
@@ -543,15 +543,20 @@ r"END
     })
 }
 
-fn assemble_and_link(code : &str, exe_path : &str) -> Option<i32> {
+fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool) -> Option<i32> {
     const temp_path : &str = "temp.asm";
 
     std::fs::write(temp_path, &code);
 
-    let status = Command::new("ml64.exe")
-        .args(&[&format!("/Fe{}", exe_path), temp_path])
-        .status()
-        .expect("failed to run ml64.exe");
+    let mut command = Command::new("ml64.exe");
+    command.args(&[&format!("/Fe{}", exe_path), temp_path]);
+
+    if should_suppress_output {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+
+    let status = command.status()
+    .expect("failed to run ml64.exe");
 
     println!("assembly status: {:?}", status);
     if status.success() {
@@ -563,7 +568,7 @@ fn assemble_and_link(code : &str, exe_path : &str) -> Option<i32> {
     status.code()
 }
 
-fn compile_and_link(input : &str, output_exe : &str) -> Result<i32, String> {
+fn compile_and_link(input : &str, output_exe : &str, should_suppress_output : bool) -> Result<i32, String> {
     lex_all_tokens(&input).and_then(|tokens| {
         for token in tokens.iter() {
             println!("{}", token);
@@ -576,7 +581,7 @@ fn compile_and_link(input : &str, output_exe : &str) -> Result<i32, String> {
 
             generate_program_code(&ast).and_then(|asm| {
                 println!("assembly:\n{}", asm);
-                let exit_code = assemble_and_link(&asm, output_exe).expect("programs should always have an exit code");
+                let exit_code = assemble_and_link(&asm, output_exe, should_suppress_output).expect("programs should always have an exit code");
                 println!("assemble status: {:?}", exit_code);
                 Ok(exit_code)
             })
@@ -590,7 +595,7 @@ fn main() {
     let input = std::fs::read_to_string(&args[1]).unwrap();
     //println!("input: {}", input);
 
-    let exit_code = match compile_and_link(&input, &args[2]) {
+    let exit_code = match compile_and_link(&input, &args[2], false) {
         Ok(inner_exit_code) => inner_exit_code,
         Err(msg) => {
             println!("error! {}", msg);
@@ -988,5 +993,33 @@ r"int main() {{
                 },
             })
         );
+    }
+
+    fn codegen_run_and_check_exit_code(input : &str, expected_exit_code : i32) {
+        compile_and_link(input, "test.exe", true).expect("expecting compile and link to succeed");
+
+        let actual_exit_code = Command::new("test.exe")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("failed to run test.exe")
+            .code()
+            .expect("all processes must have exit code");
+
+        assert_eq!(expected_exit_code, actual_exit_code);
+    }
+
+    fn test_codegen_expression(expression : &str, expected_exit_code : i32) {
+        codegen_run_and_check_exit_code(&format!("int main() {{ return {}; }}", expression), expected_exit_code);
+    }
+
+    #[test]
+    fn test_codegen_unary_operator() {
+        test_codegen_expression("-5", -5);
+    }
+
+    #[test]
+    fn test_codegen_expression_binary_operation() {
+        test_codegen_expression("5 + 6", 11);
     }
 }
