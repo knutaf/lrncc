@@ -459,19 +459,15 @@ fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<Str
     generate_factor_code(&ast_term.factor, target_register).and_then(|mut code| {
         let reg64 = get_register_name(target_register, 64);
         for binop in &ast_term.binary_ops {
-            let factor_code_result = generate_factor_code(&binop.rhs, "c");
+            let factor_code_result = generate_factor_code(&binop.rhs, "a");
             if let Ok(factor_code) = factor_code_result {
-                code += &format!("\n    push {}\n{}\n    pop {}", reg64, factor_code, reg64);
+                code += &format!("\n    push {}\n{}\n    mov rcx,rax\n    pop rax", reg64, factor_code);
 
                 match binop.operator {
                     AstTermBinaryOperator::Multiply => {
                         code += &format!("\n    imul {}, rcx", reg64);
                     },
                     AstTermBinaryOperator::Divide => {
-                        if target_register != "a" {
-                            code += &format!("\n    mov rax,{}", reg64);
-                        }
-
                         code += &format!("\n    cdq\n    idiv ecx");
 
                         if target_register != "a" {
@@ -492,13 +488,13 @@ fn generate_expression_code(ast_expression : &AstExpression, target_register : &
     generate_term_code(&ast_expression.term, target_register).and_then(|mut code| {
         let reg64 = get_register_name(target_register, 64);
         for binop in &ast_expression.binary_ops {
-            let term_code_result = generate_term_code(&binop.rhs, "c");
+            let term_code_result = generate_term_code(&binop.rhs, "a");
             if let Ok(term_code) = term_code_result {
-                code += &format!("\n    push {}\n{}\n    pop {}", reg64, term_code, reg64);
+                code += &format!("\n    push {}\n{}\n    pop rcx", reg64, term_code);
 
                 let operator_code = match binop.operator {
                     AstExpressionBinaryOperator::Plus => format!("\n    add {}, rcx", reg64),
-                    AstExpressionBinaryOperator::Minus => format!("\n    sub {},rcx", reg64),
+                    AstExpressionBinaryOperator::Minus => format!("\n    sub rcx,{}\n    mov {},rcx", reg64, reg64),
                 };
                 code += &operator_code;
             } else {
@@ -1021,5 +1017,20 @@ r"int main() {{
     #[test]
     fn test_codegen_expression_binary_operation() {
         test_codegen_expression("5 + 6", 11);
+    }
+
+    #[test]
+    fn test_codegen_expression_negative_divide() {
+        test_codegen_expression("-110 / 10", -11);
+    }
+
+    #[test]
+    fn test_codegen_expression_negative_multiply() {
+        test_codegen_expression("10 * -11", -110);
+    }
+
+    #[test]
+    fn test_codegen_expression_factors_and_terms() {
+        test_codegen_expression("(1 + 2 + 3 + 4) * (10 - 21)", -110);
     }
 }
