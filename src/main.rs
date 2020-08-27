@@ -2,7 +2,6 @@ use std::env;
 use std::fmt;
 use std::process::*;
 use std::path::*;
-use std::io::prelude::*;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
@@ -11,23 +10,6 @@ use regex::Regex;
 extern crate rand;
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
-
-extern crate path_clean;
-use path_clean::PathClean;
-
-pub fn get_absolute_path<P>(path: P) -> std::io::Result<PathBuf>
-where
-    P: AsRef<Path>,
-{
-    let path = path.as_ref();
-    let absolute_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()?.join(path)
-    }.clean();
-
-    Ok(absolute_path)
-}
 
 fn generate_random_string(len : usize) -> String {
     thread_rng()
@@ -553,25 +535,23 @@ fn generate_function_code(ast_function : &AstFunction) -> Result<String, String>
 }
 
 fn generate_program_code(ast_program : &AstProgram) -> Result<String, String> {
-    const header : &str =
+    const HEADER : &str =
 r"INCLUDELIB msvcrt.lib
 .DATA
 
 .CODE
 start:
 ";
-    const footer : &str =
+    const FOOTER : &str =
 r"END
 ";
 
     generate_function_code(&ast_program.main_function).and_then(|main_code| {
-        Ok(String::from(header) + &main_code + "\n" + footer)
+        Ok(String::from(HEADER) + &main_code + "\n" + FOOTER)
     })
 }
 
 fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool) -> Option<i32> {
-    let exe_abs_path = get_absolute_path(exe_path).unwrap();
-
     let temp_dir = Path::new(&format!("testrun_{}", generate_random_string(8))).to_path_buf();
     std::fs::create_dir_all(&temp_dir);
 
