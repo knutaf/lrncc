@@ -1,10 +1,40 @@
 use std::env;
 use std::fmt;
 use std::process::*;
+use std::path::*;
+use std::io::prelude::*;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
 use regex::Regex;
+
+extern crate rand;
+use rand::{thread_rng, Rng};
+use rand::distributions::Alphanumeric;
+
+extern crate path_clean;
+use path_clean::PathClean;
+
+pub fn get_absolute_path<P>(path: P) -> std::io::Result<PathBuf>
+where
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    }.clean();
+
+    Ok(absolute_path)
+}
+
+fn generate_random_string(len : usize) -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .collect()
+}
 
 trait AstToString {
     fn ast_to_string(&self, indent_levels : u32) -> String;
@@ -540,12 +570,21 @@ r"END
 }
 
 fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool) -> Option<i32> {
-    const temp_path : &str = "temp.asm";
+    let exe_abs_path = get_absolute_path(exe_path).unwrap();
 
-    std::fs::write(temp_path, &code);
+    let temp_dir = Path::new(&format!("testrun_{}", generate_random_string(8))).to_path_buf();
+    println!("path {}", temp_dir.to_string_lossy());
+    std::fs::create_dir_all(&temp_dir);
+
+    let asm_path = temp_dir.join("code.asm");
+
+    std::fs::write(&asm_path, &code);
 
     let mut command = Command::new("ml64.exe");
-    command.args(&[&format!("/Fe{}", exe_path), temp_path]);
+    let args = [String::from("/Feoutput.exe"), String::from("code.asm")];
+    println!("ml64.exe {} {}", args[0], args[1]);
+    command.args(&args);
+    command.current_dir(&temp_dir);
 
     if should_suppress_output {
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -556,9 +595,7 @@ fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool
 
     println!("assembly status: {:?}", status);
     if status.success() {
-        std::fs::remove_file(temp_path);
-        std::fs::remove_file("temp.obj");
-        std::fs::remove_file("mllink$.lnk");
+        std::fs::remove_dir_all(&temp_dir);
     }
 
     status.code()

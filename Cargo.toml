@@ -9,3 +9,5 @@ edition = "2018"
 [dependencies]
 regex = "*"
 lazy_static = "*"
+rand = "*"
+path-clean = "*"
