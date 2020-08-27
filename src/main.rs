@@ -573,15 +573,15 @@ fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool
     let exe_abs_path = get_absolute_path(exe_path).unwrap();
 
     let temp_dir = Path::new(&format!("testrun_{}", generate_random_string(8))).to_path_buf();
-    println!("path {}", temp_dir.to_string_lossy());
     std::fs::create_dir_all(&temp_dir);
 
     let asm_path = temp_dir.join("code.asm");
+    let exe_temp_output_path = temp_dir.join("output.exe");
 
     std::fs::write(&asm_path, &code);
 
     let mut command = Command::new("ml64.exe");
-    let args = [String::from("/Feoutput.exe"), String::from("code.asm")];
+    let args = ["/Feoutput.exe", "code.asm"];
     println!("ml64.exe {} {}", args[0], args[1]);
     command.args(&args);
     command.current_dir(&temp_dir);
@@ -595,6 +595,8 @@ fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool
 
     println!("assembly status: {:?}", status);
     if status.success() {
+        std::fs::rename(&exe_temp_output_path, &Path::new(exe_path));
+        println!("cleaning up temp dir {}", temp_dir.to_string_lossy());
         std::fs::remove_dir_all(&temp_dir);
     }
 
@@ -1029,9 +1031,10 @@ r"int main() {{
     }
 
     fn codegen_run_and_check_exit_code(input : &str, expected_exit_code : i32) {
-        compile_and_link(input, "test.exe", true).expect("expecting compile and link to succeed");
+        let exe_name = format!("test_{}.exe", generate_random_string(8));
+        compile_and_link(input, &exe_name, true).expect("expecting compile and link to succeed");
 
-        let actual_exit_code = Command::new("test.exe")
+        let actual_exit_code = Command::new(&exe_name)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -1040,6 +1043,7 @@ r"int main() {{
             .expect("all processes must have exit code");
 
         assert_eq!(expected_exit_code, actual_exit_code);
+        std::fs::remove_file(exe_name);
     }
 
     fn test_codegen_expression(expression : &str, expected_exit_code : i32) {
