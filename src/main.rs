@@ -72,11 +72,13 @@ enum AstFactor {
     Expression(Box<AstExpression>),
 }
 
+/*
 #[derive(PartialEq, Clone, Debug)]
 struct AstTermBinaryOperation {
     operator : AstTermBinaryOperator,
     rhs : AstFactor,
 }
+*/
 
 #[derive(PartialEq, Clone, Debug)]
 struct AstTerm {
@@ -85,10 +87,13 @@ struct AstTerm {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-struct AstExpressionBinaryOperation {
-    operator : AstExpressionBinaryOperator,
-    rhs : AstTerm,
+struct AstBinaryOperation<TOperator, TRhs> {
+    operator : TOperator,
+    rhs : TRhs
 }
+
+type AstExpressionBinaryOperation = AstBinaryOperation<AstExpressionBinaryOperator, AstTerm>;
+type AstTermBinaryOperation = AstBinaryOperation<AstTermBinaryOperator, AstFactor>;
 
 #[derive(PartialEq, Clone, Debug)]
 struct AstExpression {
@@ -182,12 +187,6 @@ impl AstToString for AstFactor {
     }
 }
 
-impl AstToString for AstTermBinaryOperation {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        format!("{} {}", self.operator.ast_to_string(0), self.rhs.ast_to_string(0))
-    }
-}
-
 impl AstToString for AstTerm {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
         let format_binary_ops = || -> String {
@@ -203,7 +202,8 @@ impl AstToString for AstTerm {
     }
 }
 
-impl AstToString for AstExpressionBinaryOperation {
+impl<TOperator, TRhs> AstToString for AstBinaryOperation<TOperator, TRhs>
+    where TOperator : AstToString, TRhs : AstToString {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
         format!("{} {}", self.operator.ast_to_string(0), self.rhs.ast_to_string(0))
     }
@@ -238,6 +238,14 @@ fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
             Regex::new(r"^\+").expect("failed to compile regex"),
             Regex::new(r"^/").expect("failed to compile regex"),
             Regex::new(r"^\*").expect("failed to compile regex"),
+            Regex::new(r"^&&").expect("failed to compile regex"),
+            Regex::new(r"^\|\|").expect("failed to compile regex"),
+            Regex::new(r"^==").expect("failed to compile regex"),
+            Regex::new(r"^!=").expect("failed to compile regex"),
+            Regex::new(r"^<=").expect("failed to compile regex"),
+            Regex::new(r"^>=").expect("failed to compile regex"),
+            Regex::new(r"^<").expect("failed to compile regex"),
+            Regex::new(r"^>").expect("failed to compile regex"),
             Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
             Regex::new(r"^[0-9]+").expect("failed to compile regex"),
         ];
