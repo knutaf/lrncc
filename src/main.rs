@@ -72,20 +72,6 @@ enum AstFactor {
     Expression(Box<AstExpression>),
 }
 
-/*
-#[derive(PartialEq, Clone, Debug)]
-struct AstTermBinaryOperation {
-    operator : AstTermBinaryOperator,
-    rhs : AstFactor,
-}
-*/
-
-#[derive(PartialEq, Clone, Debug)]
-struct AstTerm {
-    factor : AstFactor,
-    binary_ops : Vec<AstTermBinaryOperation>,
-}
-
 #[derive(PartialEq, Clone, Debug)]
 struct AstBinaryOperation<TOperator, TRhs> {
     operator : TOperator,
@@ -96,24 +82,18 @@ type AstExpressionBinaryOperation = AstBinaryOperation<AstExpressionBinaryOperat
 type AstTermBinaryOperation = AstBinaryOperation<AstTermBinaryOperator, AstFactor>;
 
 #[derive(PartialEq, Clone, Debug)]
-struct AstExpression {
-    term : AstTerm,
-    binary_ops : Vec<AstExpressionBinaryOperation>,
+struct AstExpressionLevel<TOperator, TInner> {
+    inner : TInner,
+    binary_ops : Vec<AstBinaryOperation<TOperator, TInner>>,
 }
 
-impl AstTerm {
-    fn new(factor : AstFactor) -> AstTerm {
-        AstTerm {
-            factor,
-            binary_ops : vec![],
-        }
-    }
-}
+type AstExpression = AstExpressionLevel<AstExpressionBinaryOperator, AstTerm>;
+type AstTerm = AstExpressionLevel<AstTermBinaryOperator, AstFactor>;
 
-impl AstExpression {
-    fn new(term : AstTerm) -> AstExpression {
-        AstExpression {
-            term,
+impl<TOperator, TInner> AstExpressionLevel<TOperator, TInner> {
+    fn new(inner : TInner) -> AstExpressionLevel<TOperator, TInner> {
+        AstExpressionLevel {
+            inner,
             binary_ops : vec![],
         }
     }
@@ -187,21 +167,6 @@ impl AstToString for AstFactor {
     }
 }
 
-impl AstToString for AstTerm {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        let format_binary_ops = || -> String {
-            let mut result = String::new();
-            for binop in &self.binary_ops {
-                result += " ";
-                result += &binop.ast_to_string(0);
-            }
-            result
-        };
-
-        self.factor.ast_to_string(0) + &format_binary_ops()
-    }
-}
-
 impl<TOperator, TRhs> AstToString for AstBinaryOperation<TOperator, TRhs>
     where TOperator : AstToString, TRhs : AstToString {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
@@ -209,7 +174,8 @@ impl<TOperator, TRhs> AstToString for AstBinaryOperation<TOperator, TRhs>
     }
 }
 
-impl AstToString for AstExpression {
+impl<TOperator, TInner> AstToString for AstExpressionLevel<TOperator, TInner>
+    where TOperator : AstToString, TInner : AstToString {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
         let format_binary_ops = || -> String {
             let mut result = String::new();
@@ -220,7 +186,7 @@ impl AstToString for AstExpression {
             result
         };
 
-        self.term.ast_to_string(0) + &format_binary_ops()
+        self.inner.ast_to_string(0) + &format_binary_ops()
     }
 }
 
@@ -384,53 +350,39 @@ fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, 
     }
 }
 
-fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
-    parse_factor(remaining_tokens).and_then(|(factor1, mut remaining_tokens)| {
-        let mut term = AstTerm::new(factor1);
-        while remaining_tokens.len() > 0 {
-            let (tokens, remaining_term_tokens) = remaining_tokens.split_at(1);
-            let binary_op = match tokens[0] {
-                "*" => Some(AstTermBinaryOperator::Multiply),
-                "/" => Some(AstTermBinaryOperator::Divide),
-                _ => None,
-            };
-
-            if let Some(operator) = binary_op {
-                if let Ok((factor2, remaining_term_tokens)) = parse_factor(remaining_term_tokens) {
-                    term.binary_ops.push(AstTermBinaryOperation {
-                        operator,
-                        rhs : factor2,
-                    });
-
-                    remaining_tokens = remaining_term_tokens;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        Ok((term, remaining_tokens))
-    })
+fn parse_term_binary_operator(token : &str) -> Option<AstTermBinaryOperator> {
+    match token {
+        "*" => Some(AstTermBinaryOperator::Multiply),
+        "/" => Some(AstTermBinaryOperator::Divide),
+        _ => None,
+    }
 }
 
-fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
-    parse_term(remaining_tokens).and_then(|(term1, mut remaining_tokens)| {
-        let mut expr = AstExpression::new(term1);
+fn parse_expression_binary_operator(token : &str) -> Option<AstExpressionBinaryOperator> {
+    match token {
+        "+" => Some(AstExpressionBinaryOperator::Plus),
+        "-" => Some(AstExpressionBinaryOperator::Minus),
+        _ => None,
+    }
+}
+
+fn parse_expression_level<'a, 'b, TOperator, TInner>(
+    remaining_tokens : &'b [&'a str],
+    parse_inner : fn(&'b [&'a str]) -> Result<(TInner, &'b [&'a str]), String>,
+    parse_binary_operator : fn(&str) -> Option<TOperator>
+    )
+    -> Result<(AstExpressionLevel<TOperator, TInner>, &'b [&'a str]), String> {
+    parse_inner(remaining_tokens).and_then(|(inner1, mut remaining_tokens)| {
+        let mut expr = AstExpressionLevel::<TOperator, TInner>::new(inner1);
         while remaining_tokens.len() > 0 {
             let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(1);
-            let binary_op = match tokens[0] {
-                "+" => Some(AstExpressionBinaryOperator::Plus),
-                "-" => Some(AstExpressionBinaryOperator::Minus),
-                _ => None,
-            };
+            let binary_op = parse_binary_operator(tokens[0]);
 
             if let Some(operator) = binary_op {
-                if let Ok((term2, remaining_expression_tokens)) = parse_term(remaining_expression_tokens) {
-                    expr.binary_ops.push(AstExpressionBinaryOperation {
+                if let Ok((inner2, remaining_expression_tokens)) = parse_inner(remaining_expression_tokens) {
+                    expr.binary_ops.push(AstBinaryOperation {
                         operator,
-                        rhs : term2,
+                        rhs : inner2,
                     });
 
                     remaining_tokens = remaining_expression_tokens;
@@ -444,6 +396,14 @@ fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpr
 
         Ok((expr, remaining_tokens))
     })
+}
+
+fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
+    parse_expression_level::<AstTermBinaryOperator, AstFactor>(remaining_tokens, parse_factor, parse_term_binary_operator)
+}
+
+fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
+    parse_expression_level::<AstExpressionBinaryOperator, AstTerm>(remaining_tokens, parse_term, parse_expression_binary_operator)
 }
 
 fn get_register_name(register_name : &str, width : u32) -> String {
@@ -476,7 +436,7 @@ fn generate_factor_code(ast_factor : &AstFactor, target_register : &str) -> Resu
 }
 
 fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<String, String> {
-    generate_factor_code(&ast_term.factor, target_register).and_then(|mut code| {
+    generate_factor_code(&ast_term.inner, target_register).and_then(|mut code| {
         let reg64 = get_register_name(target_register, 64);
         for binop in &ast_term.binary_ops {
             let factor_code_result = generate_factor_code(&binop.rhs, "a");
@@ -505,7 +465,7 @@ fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<Str
 }
 
 fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
-    generate_term_code(&ast_expression.term, target_register).and_then(|mut code| {
+    generate_term_code(&ast_expression.inner, target_register).and_then(|mut code| {
         let reg64 = get_register_name(target_register, 64);
         for binop in &ast_expression.binary_ops {
             let term_code_result = generate_term_code(&binop.rhs, "a");
@@ -670,7 +630,7 @@ r"int main(){return 2;}";
 
     fn make_constant_term(value : u32) -> AstTerm {
         AstTerm {
-            factor : AstFactor::Constant(value),
+            inner : AstFactor::Constant(value),
             binary_ops : vec![],
         }
     }
@@ -824,7 +784,7 @@ r"int main() {{
                     name: "main",
                     body: AstStatement::Return(
                         AstExpression {
-                            term : make_constant_term(3),
+                            inner : make_constant_term(3),
                             binary_ops : vec![
                                 AstExpressionBinaryOperation {
                                     operator : AstExpressionBinaryOperator::Plus,
@@ -847,7 +807,7 @@ r"int main() {{
                     name: "main",
                     body: AstStatement::Return(
                         AstExpression {
-                            term : make_constant_term(3),
+                            inner : make_constant_term(3),
                             binary_ops : vec![
                                 AstExpressionBinaryOperation {
                                     operator : AstExpressionBinaryOperator::Plus,
@@ -875,7 +835,7 @@ r"int main() {{
                     body: AstStatement::Return(
                         AstExpression::new(
                             AstTerm {
-                                factor : AstFactor::Constant(3),
+                                inner : AstFactor::Constant(3),
                                 binary_ops : vec![
                                     AstTermBinaryOperation {
                                         operator : AstTermBinaryOperator::Multiply,
@@ -900,7 +860,7 @@ r"int main() {{
                     body: AstStatement::Return(
                         AstExpression::new(
                             AstTerm {
-                                factor : AstFactor::Constant(3),
+                                inner : AstFactor::Constant(3),
                                 binary_ops : vec![
                                     AstTermBinaryOperation {
                                         operator : AstTermBinaryOperator::Multiply,
@@ -928,8 +888,8 @@ r"int main() {{
                     name: "main",
                     body: AstStatement::Return(
                         AstExpression {
-                            term : AstTerm {
-                                factor : AstFactor::Constant(3),
+                            inner : AstTerm {
+                                inner : AstFactor::Constant(3),
                                 binary_ops : vec![
                                     AstTermBinaryOperation {
                                         operator : AstTermBinaryOperator::Multiply,
@@ -945,7 +905,7 @@ r"int main() {{
                                 AstExpressionBinaryOperation {
                                     operator : AstExpressionBinaryOperator::Plus,
                                     rhs : AstTerm {
-                                        factor : AstFactor::Constant(6),
+                                        inner : AstFactor::Constant(6),
                                         binary_ops : vec![
                                             AstTermBinaryOperation {
                                                 operator : AstTermBinaryOperator::Multiply,
@@ -961,7 +921,7 @@ r"int main() {{
                                 AstExpressionBinaryOperation {
                                     operator : AstExpressionBinaryOperator::Minus,
                                     rhs : AstTerm {
-                                        factor : AstFactor::Constant(11),
+                                        inner : AstFactor::Constant(11),
                                         binary_ops : vec![
                                             AstTermBinaryOperation {
                                                 operator : AstTermBinaryOperator::Divide,
@@ -991,14 +951,14 @@ r"int main() {{
                     name: "main",
                     body: AstStatement::Return(
                         AstExpression {
-                            term : AstTerm {
-                                factor : AstFactor::Constant(3),
+                            inner : AstTerm {
+                                inner : AstFactor::Constant(3),
                                 binary_ops : vec![
                                     AstTermBinaryOperation {
                                         operator : AstTermBinaryOperator::Multiply,
                                         rhs : AstFactor::Expression(
                                              Box::new(AstExpression {
-                                                 term : make_constant_term(4),
+                                                 inner : make_constant_term(4),
                                                  binary_ops : vec![
                                                      AstExpressionBinaryOperation {
                                                          operator : AstExpressionBinaryOperator::Plus,
