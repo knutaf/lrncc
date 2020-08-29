@@ -167,6 +167,28 @@ impl AstToString for AstFactor {
     }
 }
 
+impl std::str::FromStr for AstExpressionBinaryOperator {
+    type Err = String;
+    fn from_str(s : &str) -> Result<Self, Self::Err> {
+        match s {
+            "+" => Ok(AstExpressionBinaryOperator::Plus),
+            "-" => Ok(AstExpressionBinaryOperator::Minus),
+            _ => Err(format!("unknown operator {}", s)),
+        }
+    }
+}
+
+impl std::str::FromStr for AstTermBinaryOperator {
+    type Err = String;
+    fn from_str(s : &str) -> Result<Self, Self::Err> {
+        match s {
+            "*" => Ok(AstTermBinaryOperator::Multiply),
+            "/" => Ok(AstTermBinaryOperator::Divide),
+            _ => Err(format!("unknown operator {}", s)),
+        }
+    }
+}
+
 impl<TOperator, TRhs> AstToString for AstBinaryOperation<TOperator, TRhs>
     where TOperator : AstToString, TRhs : AstToString {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
@@ -350,35 +372,20 @@ fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, 
     }
 }
 
-fn parse_term_binary_operator(token : &str) -> Option<AstTermBinaryOperator> {
-    match token {
-        "*" => Some(AstTermBinaryOperator::Multiply),
-        "/" => Some(AstTermBinaryOperator::Divide),
-        _ => None,
-    }
-}
-
-fn parse_expression_binary_operator(token : &str) -> Option<AstExpressionBinaryOperator> {
-    match token {
-        "+" => Some(AstExpressionBinaryOperator::Plus),
-        "-" => Some(AstExpressionBinaryOperator::Minus),
-        _ => None,
-    }
-}
-
 fn parse_expression_level<'a, 'b, TOperator, TInner>(
     remaining_tokens : &'b [&'a str],
-    parse_inner : fn(&'b [&'a str]) -> Result<(TInner, &'b [&'a str]), String>,
-    parse_binary_operator : fn(&str) -> Option<TOperator>
+    parse_inner : fn(&'b [&'a str]) -> Result<(TInner, &'b [&'a str]), String>
     )
-    -> Result<(AstExpressionLevel<TOperator, TInner>, &'b [&'a str]), String> {
+    -> Result<(AstExpressionLevel<TOperator, TInner>, &'b [&'a str]), String>
+    where TOperator : std::str::FromStr
+    {
     parse_inner(remaining_tokens).and_then(|(inner1, mut remaining_tokens)| {
         let mut expr = AstExpressionLevel::<TOperator, TInner>::new(inner1);
         while remaining_tokens.len() > 0 {
             let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(1);
-            let binary_op = parse_binary_operator(tokens[0]);
+            let binary_op = tokens[0].parse::<TOperator>();
 
-            if let Some(operator) = binary_op {
+            if let Ok(operator) = binary_op {
                 if let Ok((inner2, remaining_expression_tokens)) = parse_inner(remaining_expression_tokens) {
                     expr.binary_ops.push(AstBinaryOperation {
                         operator,
@@ -399,11 +406,11 @@ fn parse_expression_level<'a, 'b, TOperator, TInner>(
 }
 
 fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
-    parse_expression_level::<AstTermBinaryOperator, AstFactor>(remaining_tokens, parse_factor, parse_term_binary_operator)
+    parse_expression_level::<AstTermBinaryOperator, AstFactor>(remaining_tokens, parse_factor)
 }
 
 fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
-    parse_expression_level::<AstExpressionBinaryOperator, AstTerm>(remaining_tokens, parse_term, parse_expression_binary_operator)
+    parse_expression_level::<AstExpressionBinaryOperator, AstTerm>(remaining_tokens, parse_term)
 }
 
 fn get_register_name(register_name : &str, width : u32) -> String {
