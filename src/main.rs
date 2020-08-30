@@ -551,43 +551,35 @@ fn get_register_name(register_name : &str, width : u32) -> String {
     }
 }
 
-fn generate_factor_code(ast_factor : &AstFactor, target_register : &str) -> Result<String, String> {
-    let reg64 = get_register_name(target_register, 64);
-    let reg8 = get_register_name(target_register, 8);
-
+fn generate_factor_code(ast_factor : &AstFactor) -> Result<String, String> {
     match ast_factor {
-        AstFactor::Constant(val) => Ok(format!("    mov {},{}", reg64, val)),
+        AstFactor::Constant(val) => Ok(format!("    mov rax,{}", val)),
         AstFactor::UnaryOperator(operator, box_factor) => {
-            generate_factor_code(box_factor, target_register).and_then(|inner_factor_code| {
+            generate_factor_code(box_factor).and_then(|inner_factor_code| {
                 match operator {
-                    AstUnaryOperator::Negation => Ok(format!("{}\n    neg {}", inner_factor_code, reg64)),
-                    AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not {}", inner_factor_code, reg64)),
-                    AstUnaryOperator::LogicalNot => Ok(format!("{}\n    cmp {},0\n    mov {},0\n    sete {}", inner_factor_code, reg64, reg64, reg8)),
+                    AstUnaryOperator::Negation => Ok(format!("{}\n    neg rax", inner_factor_code)),
+                    AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not rax", inner_factor_code)),
+                    AstUnaryOperator::LogicalNot => Ok(format!("{}\n    cmp rax,0\n    mov rax,0\n    sete al", inner_factor_code)),
                 }
             })
         },
-        AstFactor::Expression(box_expr) => generate_expression_code(&box_expr, target_register),
+        AstFactor::Expression(box_expr) => generate_expression_code(&box_expr),
     }
 }
 
-fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<String, String> {
-    generate_factor_code(&ast_term.inner, target_register).and_then(|mut code| {
-        let reg64 = get_register_name(target_register, 64);
+fn generate_term_code(ast_term : &AstTerm) -> Result<String, String> {
+    generate_factor_code(&ast_term.inner).and_then(|mut code| {
         for binop in &ast_term.binary_ops {
-            let factor_code_result = generate_factor_code(&binop.rhs, "a");
+            let factor_code_result = generate_factor_code(&binop.rhs);
             if let Ok(factor_code) = factor_code_result {
-                code += &format!("\n    push {}\n{}\n    mov rcx,rax\n    pop rax", reg64, factor_code);
+                code += &format!("\n    push rax\n{}\n    mov rcx,rax\n    pop rax", factor_code);
 
                 match binop.operator {
                     AstTermBinaryOperator::Multiply => {
-                        code += &format!("\n    imul {}, rcx", reg64);
+                        code += &format!("\n    imul rax,rcx");
                     },
                     AstTermBinaryOperator::Divide => {
                         code += &format!("\n    cdq\n    idiv ecx");
-
-                        if target_register != "a" {
-                            code += &format!("\n    mov {},rax", reg64);
-                        }
                     },
                 };
             } else {
@@ -599,17 +591,16 @@ fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<Str
     })
 }
 
-fn generate_additive_expression_code(expr : &AstAdditiveExpression, target_register : &str) -> Result<String, String> {
-    generate_term_code(&expr.inner, target_register).and_then(|mut code| {
-        let reg64 = get_register_name(target_register, 64);
+fn generate_additive_expression_code(expr : &AstAdditiveExpression) -> Result<String, String> {
+    generate_term_code(&expr.inner).and_then(|mut code| {
         for binop in &expr.binary_ops {
-            let term_code_result = generate_term_code(&binop.rhs, "a");
+            let term_code_result = generate_term_code(&binop.rhs);
             if let Ok(term_code) = term_code_result {
-                code += &format!("\n    push {}\n{}\n    pop rcx", reg64, term_code);
+                code += &format!("\n    push rax\n{}\n    pop rcx", term_code);
 
                 let operator_code = match binop.operator {
-                    AstAdditiveExpressionBinaryOperator::Plus => format!("\n    add {}, rcx", reg64),
-                    AstAdditiveExpressionBinaryOperator::Minus => format!("\n    sub rcx,{}\n    mov {},rcx", reg64, reg64),
+                    AstAdditiveExpressionBinaryOperator::Plus => format!("\n    add rax,rcx"),
+                    AstAdditiveExpressionBinaryOperator::Minus => format!("\n    sub rcx,rax\n    mov rax,rcx"),
                 };
                 code += &operator_code;
             } else {
@@ -621,14 +612,14 @@ fn generate_additive_expression_code(expr : &AstAdditiveExpression, target_regis
     })
 }
 
-fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
+fn generate_expression_code(ast_expression : &AstExpression) -> Result<String, String> {
     let additive_expression = &ast_expression.inner.inner.inner.inner;
-    generate_additive_expression_code(additive_expression, target_register)
+    generate_additive_expression_code(additive_expression)
 }
 
 fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, String> {
     if let AstStatement::Return(expr) = ast_statement {
-        generate_expression_code(expr, "a").and_then(|expr_code| {
+        generate_expression_code(expr).and_then(|expr_code| {
             Ok(format!("{}\n    ret", expr_code))
         })
     } else {
