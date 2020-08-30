@@ -570,7 +570,6 @@ fn generate_factor_code(ast_factor : &AstFactor, target_register : &str) -> Resu
     }
 }
 
-/*
 fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<String, String> {
     generate_factor_code(&ast_term.inner, target_register).and_then(|mut code| {
         let reg64 = get_register_name(target_register, 64);
@@ -600,10 +599,10 @@ fn generate_term_code(ast_term : &AstTerm, target_register : &str) -> Result<Str
     })
 }
 
-fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
-    generate_term_code(&ast_expression.inner, target_register).and_then(|mut code| {
+fn generate_additive_expression_code(expr : &AstAdditiveExpression, target_register : &str) -> Result<String, String> {
+    generate_term_code(&expr.inner, target_register).and_then(|mut code| {
         let reg64 = get_register_name(target_register, 64);
-        for binop in &ast_expression.binary_ops {
+        for binop in &expr.binary_ops {
             let term_code_result = generate_term_code(&binop.rhs, "a");
             if let Ok(term_code) = term_code_result {
                 code += &format!("\n    push {}\n{}\n    pop rcx", reg64, term_code);
@@ -621,10 +620,10 @@ fn generate_expression_code(ast_expression : &AstExpression, target_register : &
         Ok(code)
     })
 }
-*/
 
 fn generate_expression_code(ast_expression : &AstExpression, target_register : &str) -> Result<String, String> {
-   Ok(String::new())
+    let additive_expression = &ast_expression.inner.inner.inner.inner;
+    generate_additive_expression_code(additive_expression, target_register)
 }
 
 fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, String> {
