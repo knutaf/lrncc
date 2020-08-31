@@ -30,6 +30,10 @@ trait AstToString {
     }
 }
 
+trait CodeGenerator {
+    fn generate_code(&self) -> String;
+}
+
 #[derive(PartialEq, Clone, Debug)]
 struct AstProgram<'a> {
     main_function : AstFunction<'a>,
@@ -301,6 +305,48 @@ impl std::str::FromStr for AstTermBinaryOperator {
     }
 }
 
+impl CodeGenerator for AstExpressionBinaryOperator {
+    fn generate_code(&self) -> String {
+        String::new()
+    }
+}
+
+impl CodeGenerator for AstLogicalAndExpressionBinaryOperator {
+    fn generate_code(&self) -> String {
+        String::new()
+    }
+}
+
+impl CodeGenerator for AstEqualityExpressionBinaryOperator {
+    fn generate_code(&self) -> String {
+        String::new()
+    }
+}
+
+impl CodeGenerator for AstRelationalExpressionBinaryOperator {
+    fn generate_code(&self) -> String {
+        String::new()
+    }
+}
+
+impl CodeGenerator for AstAdditiveExpressionBinaryOperator {
+    fn generate_code(&self) -> String {
+        match &self {
+            AstAdditiveExpressionBinaryOperator::Plus => format!("\n    pop rcx\n    add rax,rcx"),
+            AstAdditiveExpressionBinaryOperator::Minus => format!("\n    pop rcx\n    sub rcx,rax\n    mov rax,rcx"),
+        }
+    }
+}
+
+impl CodeGenerator for AstTermBinaryOperator {
+    fn generate_code(&self) -> String {
+        match &self {
+            AstTermBinaryOperator::Multiply => format!("\n    mov rcx,rax\n    pop rax\n    imul rax,rcx"),
+            AstTermBinaryOperator::Divide => format!("\n    mov rcx,rax\n    pop rax\n    cdq\n    idiv ecx"),
+        }
+    }
+}
+
 impl<TOperator, TRhs> AstToString for AstBinaryOperation<TOperator, TRhs>
     where TOperator : AstToString, TRhs : AstToString {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
@@ -567,44 +613,19 @@ fn generate_factor_code(ast_factor : &AstFactor) -> Result<String, String> {
     }
 }
 
-fn generate_term_code(ast_term : &AstTerm) -> Result<String, String> {
-    generate_factor_code(&ast_term.inner).and_then(|mut code| {
-        for binop in &ast_term.binary_ops {
-            let factor_code_result = generate_factor_code(&binop.rhs);
-            if let Ok(factor_code) = factor_code_result {
-                code += &format!("\n    push rax\n{}\n    mov rcx,rax\n    pop rax", factor_code);
-
-                match binop.operator {
-                    AstTermBinaryOperator::Multiply => {
-                        code += &format!("\n    imul rax,rcx");
-                    },
-                    AstTermBinaryOperator::Divide => {
-                        code += &format!("\n    cdq\n    idiv ecx");
-                    },
-                };
-            } else {
-                return factor_code_result;
-            }
-        }
-
-        Ok(code)
-    })
-}
-
-fn generate_additive_expression_code(expr : &AstAdditiveExpression) -> Result<String, String> {
-    generate_term_code(&expr.inner).and_then(|mut code| {
+fn generate_expression_level_code<TOperator, TInner>(
+    expr : &AstExpressionLevel<TOperator, TInner>,
+    generate_inner : fn(&TInner) -> Result<String, String>
+    ) -> Result<String, String>
+    where TOperator : CodeGenerator {
+    generate_inner(&expr.inner).and_then(|mut code| {
         for binop in &expr.binary_ops {
-            let term_code_result = generate_term_code(&binop.rhs);
-            if let Ok(term_code) = term_code_result {
-                code += &format!("\n    push rax\n{}\n    pop rcx", term_code);
-
-                let operator_code = match binop.operator {
-                    AstAdditiveExpressionBinaryOperator::Plus => format!("\n    add rax,rcx"),
-                    AstAdditiveExpressionBinaryOperator::Minus => format!("\n    sub rcx,rax\n    mov rax,rcx"),
-                };
-                code += &operator_code;
+            let inner_code_result = generate_inner(&binop.rhs);
+            if let Ok(inner_code) = inner_code_result {
+                code += &format!("\n    push rax\n{}", inner_code);
+                code += &binop.operator.generate_code();
             } else {
-                return term_code_result;
+                return inner_code_result;
             }
         }
 
@@ -612,9 +633,16 @@ fn generate_additive_expression_code(expr : &AstAdditiveExpression) -> Result<St
     })
 }
 
-fn generate_expression_code(ast_expression : &AstExpression) -> Result<String, String> {
-    let additive_expression = &ast_expression.inner.inner.inner.inner;
-    generate_additive_expression_code(additive_expression)
+fn generate_expression_code(ast_node : &AstExpression) -> Result<String, String> {
+    generate_additive_expression_code(&ast_node.inner.inner.inner.inner)
+}
+
+fn generate_additive_expression_code(ast_node : &AstAdditiveExpression) -> Result<String, String> {
+    generate_expression_level_code(ast_node, generate_term_code)
+}
+
+fn generate_term_code(ast_node : &AstTerm) -> Result<String, String> {
+    generate_expression_level_code(ast_node, generate_factor_code)
 }
 
 fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, String> {
