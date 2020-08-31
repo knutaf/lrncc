@@ -319,7 +319,10 @@ impl CodeGenerator for AstLogicalAndExpressionBinaryOperator {
 
 impl CodeGenerator for AstEqualityExpressionBinaryOperator {
     fn generate_code(&self) -> String {
-        String::new()
+        match &self {
+            AstEqualityExpressionBinaryOperator::Equals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    sete al"),
+            AstEqualityExpressionBinaryOperator::NotEquals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setne al"),
+        }
     }
 }
 
@@ -378,6 +381,12 @@ impl<TOperator, TInner> AstToString for AstExpressionLevel<TOperator, TInner>
 fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
     lazy_static! {
         static ref TOKEN_REGEXES : Vec<regex::Regex> = vec![
+            Regex::new(r"^&&").expect("failed to compile regex"),
+            Regex::new(r"^\|\|").expect("failed to compile regex"),
+            Regex::new(r"^==").expect("failed to compile regex"),
+            Regex::new(r"^!=").expect("failed to compile regex"),
+            Regex::new(r"^<=").expect("failed to compile regex"),
+            Regex::new(r"^>=").expect("failed to compile regex"),
             Regex::new(r"^\{").expect("failed to compile regex"),
             Regex::new(r"^\}").expect("failed to compile regex"),
             Regex::new(r"^\(").expect("failed to compile regex"),
@@ -389,12 +398,6 @@ fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
             Regex::new(r"^\+").expect("failed to compile regex"),
             Regex::new(r"^/").expect("failed to compile regex"),
             Regex::new(r"^\*").expect("failed to compile regex"),
-            Regex::new(r"^&&").expect("failed to compile regex"),
-            Regex::new(r"^\|\|").expect("failed to compile regex"),
-            Regex::new(r"^==").expect("failed to compile regex"),
-            Regex::new(r"^!=").expect("failed to compile regex"),
-            Regex::new(r"^<=").expect("failed to compile regex"),
-            Regex::new(r"^>=").expect("failed to compile regex"),
             Regex::new(r"^<").expect("failed to compile regex"),
             Regex::new(r"^>").expect("failed to compile regex"),
             Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
@@ -1228,5 +1231,17 @@ r"int main() {{
     fn test_codegen_relational_ge() {
         test_codegen_expression("1234 >= 1234", 1);
         test_codegen_expression("1234 >= 1235", 0);
+    }
+
+    #[test]
+    fn test_codegen_equality_eq() {
+        test_codegen_expression("1234 == 1234", 1);
+        test_codegen_expression("1234 == 1235", 0);
+    }
+
+    #[test]
+    fn test_codegen_equality_ne() {
+        test_codegen_expression("1234 != 1234", 0);
+        test_codegen_expression("1234 != 1235", 1);
     }
 }
