@@ -325,7 +325,12 @@ impl CodeGenerator for AstEqualityExpressionBinaryOperator {
 
 impl CodeGenerator for AstRelationalExpressionBinaryOperator {
     fn generate_code(&self) -> String {
-        String::new()
+        match &self {
+            AstRelationalExpressionBinaryOperator::LessThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setl al"),
+            AstRelationalExpressionBinaryOperator::GreaterThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setg al"),
+            AstRelationalExpressionBinaryOperator::LessThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setle al"),
+            AstRelationalExpressionBinaryOperator::GreaterThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setge al"),
+        }
     }
 }
 
@@ -634,7 +639,19 @@ fn generate_expression_level_code<TOperator, TInner>(
 }
 
 fn generate_expression_code(ast_node : &AstExpression) -> Result<String, String> {
-    generate_additive_expression_code(&ast_node.inner.inner.inner.inner)
+    generate_expression_level_code(ast_node, generate_logical_and_expression_code)
+}
+
+fn generate_logical_and_expression_code(ast_node : &AstLogicalAndExpression) -> Result<String, String> {
+    generate_expression_level_code(ast_node, generate_equality_expression_code)
+}
+
+fn generate_equality_expression_code(ast_node : &AstEqualityExpression) -> Result<String, String> {
+    generate_expression_level_code(ast_node, generate_relational_expression_code)
+}
+
+fn generate_relational_expression_code(ast_node : &AstRelationalExpression) -> Result<String, String> {
+    generate_expression_level_code(ast_node, generate_additive_expression_code)
 }
 
 fn generate_additive_expression_code(ast_node : &AstAdditiveExpression) -> Result<String, String> {
@@ -684,11 +701,12 @@ fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool
 
     let asm_path = temp_dir.join("code.asm");
     let exe_temp_output_path = temp_dir.join("output.exe");
+    let pdb_temp_output_path = temp_dir.join("output.pdb");
 
     std::fs::write(&asm_path, &code);
 
     let mut command = Command::new("ml64.exe");
-    let args = ["/Feoutput.exe", "code.asm"];
+    let args = ["/Zi", "/Feoutput.exe", "code.asm", "/link", "/pdb:output.pdb"];
     println!("ml64.exe {} {}", args[0], args[1]);
     command.args(&args);
     command.current_dir(&temp_dir);
@@ -703,6 +721,10 @@ fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool
     println!("assembly status: {:?}", status);
     if status.success() {
         std::fs::rename(&exe_temp_output_path, &Path::new(exe_path));
+
+        let mut pdb_path = Path::new(exe_path).to_path_buf();
+        pdb_path.set_extension("pdb");
+        std::fs::rename(&pdb_temp_output_path, &pdb_path);
         println!("cleaning up temp dir {}", temp_dir.to_string_lossy());
         std::fs::remove_dir_all(&temp_dir);
     }
@@ -1182,5 +1204,29 @@ r"int main() {{
     #[test]
     fn test_codegen_expression_factors_and_terms() {
         test_codegen_expression("(1 + 2 + 3 + 4) * (10 - 21)", -110);
+    }
+
+    #[test]
+    fn test_codegen_relational_lt() {
+        test_codegen_expression("1234 < 1234", 0);
+        test_codegen_expression("1234 < 1235", 1);
+    }
+
+    #[test]
+    fn test_codegen_relational_gt() {
+        test_codegen_expression("1234 > 1234", 0);
+        test_codegen_expression("1234 > 1233", 1);
+    }
+
+    #[test]
+    fn test_codegen_relational_le() {
+        test_codegen_expression("1234 <= 1234", 1);
+        test_codegen_expression("1234 <= 1233", 0);
+    }
+
+    #[test]
+    fn test_codegen_relational_ge() {
+        test_codegen_expression("1234 >= 1234", 1);
+        test_codegen_expression("1234 >= 1235", 0);
     }
 }
