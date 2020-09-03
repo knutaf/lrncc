@@ -42,7 +42,7 @@ struct AstProgram<'a> {
 #[derive(PartialEq, Clone, Debug)]
 struct AstFunction<'a> {
     name : &'a str,
-    body : AstStatement,
+    body : Vec<AstStatement>,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -166,7 +166,14 @@ impl<'a> fmt::Display for AstProgram<'a> {
 
 impl<'a> AstToString for AstFunction<'a> {
     fn ast_to_string(&self, indent_levels : u32) -> String {
-        format!("{}FUNC {}:\n{}", Self::get_indent_string(indent_levels), self.name, self.body.ast_to_string(indent_levels + 1))
+        let mut body_str = String::new();
+        for statement in &self.body {
+            body_str += "\n";
+            body_str += &statement.ast_to_string(indent_levels + 1);
+            body_str += ";";
+        }
+
+        format!("{}FUNC {}:{}", Self::get_indent_string(indent_levels), self.name, &body_str)
     }
 }
 
@@ -485,7 +492,7 @@ fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFuncti
                     if tokens[0] == "}" {
                         Ok((AstFunction {
                             name,
-                            body,
+                            body : vec![body],
                         }, remaining_tokens))
                     } else {
                         Err(format!("function body missing closing brace"))
@@ -699,7 +706,7 @@ fn generate_statement_code(state : &mut CodegenState, ast_statement : &AstStatem
 }
 
 fn generate_function_code(state : &mut CodegenState, ast_function : &AstFunction) -> Result<String, String> {
-    generate_statement_code(state, &ast_function.body).and_then(|function_code| {
+    generate_statement_code(state, &ast_function.body[0]).and_then(|function_code| {
         Ok(format!("{} PROC\n{}\n{} ENDP", ast_function.name, function_code, ast_function.name))
     })
 }
