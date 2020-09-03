@@ -30,8 +30,8 @@ trait AstToString {
     }
 }
 
-trait CodeGenerator {
-    fn generate_code(&self) -> String;
+trait BinaryOperatorCodeGenerator {
+    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String;
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -126,12 +126,29 @@ type AstRelationalExpression = AstExpressionLevel<AstRelationalExpressionBinaryO
 type AstAdditiveExpression = AstExpressionLevel<AstAdditiveExpressionBinaryOperator, AstTerm>;
 type AstTerm = AstExpressionLevel<AstTermBinaryOperator, AstFactor>;
 
+struct CodegenState {
+    next_label : u32,
+}
+
 impl<TOperator, TInner> AstExpressionLevel<TOperator, TInner> {
     fn new(inner : TInner) -> AstExpressionLevel<TOperator, TInner> {
         AstExpressionLevel {
             inner,
             binary_ops : vec![],
         }
+    }
+}
+
+impl CodegenState {
+    fn new() -> CodegenState {
+        CodegenState {
+            next_label : 0,
+        }
+    }
+
+    fn consume_jump_label(&mut self) -> u32 {
+        self.next_label += 1;
+        self.next_label - 1
     }
 }
 
@@ -305,30 +322,33 @@ impl std::str::FromStr for AstTermBinaryOperator {
     }
 }
 
-impl CodeGenerator for AstExpressionBinaryOperator {
-    fn generate_code(&self) -> String {
+impl BinaryOperatorCodeGenerator for AstExpressionBinaryOperator {
+    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
         String::new()
     }
 }
 
-impl CodeGenerator for AstLogicalAndExpressionBinaryOperator {
-    fn generate_code(&self) -> String {
-        String::new()
+impl BinaryOperatorCodeGenerator for AstLogicalAndExpressionBinaryOperator {
+    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+        let label = state.consume_jump_label();
+        format!("\n    cmp rax,0\n    je _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
     }
 }
 
-impl CodeGenerator for AstEqualityExpressionBinaryOperator {
-    fn generate_code(&self) -> String {
-        match &self {
+impl BinaryOperatorCodeGenerator for AstEqualityExpressionBinaryOperator {
+    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+        format!("\n    push rax\n{}", rhs_code) +
+        &match &self {
             AstEqualityExpressionBinaryOperator::Equals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    sete al"),
             AstEqualityExpressionBinaryOperator::NotEquals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setne al"),
         }
     }
 }
 
-impl CodeGenerator for AstRelationalExpressionBinaryOperator {
-    fn generate_code(&self) -> String {
-        match &self {
+impl BinaryOperatorCodeGenerator for AstRelationalExpressionBinaryOperator {
+    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+        format!("\n    push rax\n{}", rhs_code) +
+        &match &self {
             AstRelationalExpressionBinaryOperator::LessThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setl al"),
             AstRelationalExpressionBinaryOperator::GreaterThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setg al"),
             AstRelationalExpressionBinaryOperator::LessThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setle al"),
@@ -337,18 +357,20 @@ impl CodeGenerator for AstRelationalExpressionBinaryOperator {
     }
 }
 
-impl CodeGenerator for AstAdditiveExpressionBinaryOperator {
-    fn generate_code(&self) -> String {
-        match &self {
+impl BinaryOperatorCodeGenerator for AstAdditiveExpressionBinaryOperator {
+    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+        format!("\n    push rax\n{}", rhs_code) +
+        &match &self {
             AstAdditiveExpressionBinaryOperator::Plus => format!("\n    pop rcx\n    add rax,rcx"),
             AstAdditiveExpressionBinaryOperator::Minus => format!("\n    pop rcx\n    sub rcx,rax\n    mov rax,rcx"),
         }
     }
 }
 
-impl CodeGenerator for AstTermBinaryOperator {
-    fn generate_code(&self) -> String {
-        match &self {
+impl BinaryOperatorCodeGenerator for AstTermBinaryOperator {
+    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+        format!("\n    push rax\n{}", rhs_code) +
+        &match &self {
             AstTermBinaryOperator::Multiply => format!("\n    mov rcx,rax\n    pop rax\n    imul rax,rcx"),
             AstTermBinaryOperator::Divide => format!("\n    mov rcx,rax\n    pop rax\n    cdq\n    idiv ecx"),
         }
@@ -605,11 +627,11 @@ fn get_register_name(register_name : &str, width : u32) -> String {
     }
 }
 
-fn generate_factor_code(ast_factor : &AstFactor) -> Result<String, String> {
+fn generate_factor_code(state : &mut CodegenState, ast_factor : &AstFactor) -> Result<String, String> {
     match ast_factor {
         AstFactor::Constant(val) => Ok(format!("    mov rax,{}", val)),
         AstFactor::UnaryOperator(operator, box_factor) => {
-            generate_factor_code(box_factor).and_then(|inner_factor_code| {
+            generate_factor_code(state, box_factor).and_then(|inner_factor_code| {
                 match operator {
                     AstUnaryOperator::Negation => Ok(format!("{}\n    neg rax", inner_factor_code)),
                     AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not rax", inner_factor_code)),
@@ -617,21 +639,21 @@ fn generate_factor_code(ast_factor : &AstFactor) -> Result<String, String> {
                 }
             })
         },
-        AstFactor::Expression(box_expr) => generate_expression_code(&box_expr),
+        AstFactor::Expression(box_expr) => generate_expression_code(state, &box_expr),
     }
 }
 
 fn generate_expression_level_code<TOperator, TInner>(
+    state : &mut CodegenState,
     expr : &AstExpressionLevel<TOperator, TInner>,
-    generate_inner : fn(&TInner) -> Result<String, String>
+    generate_inner : fn(&mut CodegenState, &TInner) -> Result<String, String>
     ) -> Result<String, String>
-    where TOperator : CodeGenerator {
-    generate_inner(&expr.inner).and_then(|mut code| {
+    where TOperator : BinaryOperatorCodeGenerator {
+    generate_inner(state, &expr.inner).and_then(|mut code| {
         for binop in &expr.binary_ops {
-            let inner_code_result = generate_inner(&binop.rhs);
+            let inner_code_result = generate_inner(state, &binop.rhs);
             if let Ok(inner_code) = inner_code_result {
-                code += &format!("\n    push rax\n{}", inner_code);
-                code += &binop.operator.generate_code();
+                code += &binop.operator.generate_code(state, &inner_code);
             } else {
                 return inner_code_result;
             }
@@ -641,33 +663,33 @@ fn generate_expression_level_code<TOperator, TInner>(
     })
 }
 
-fn generate_expression_code(ast_node : &AstExpression) -> Result<String, String> {
-    generate_expression_level_code(ast_node, generate_logical_and_expression_code)
+fn generate_expression_code(state : &mut CodegenState, ast_node : &AstExpression) -> Result<String, String> {
+    generate_expression_level_code(state, ast_node, generate_logical_and_expression_code)
 }
 
-fn generate_logical_and_expression_code(ast_node : &AstLogicalAndExpression) -> Result<String, String> {
-    generate_expression_level_code(ast_node, generate_equality_expression_code)
+fn generate_logical_and_expression_code(state : &mut CodegenState, ast_node : &AstLogicalAndExpression) -> Result<String, String> {
+    generate_expression_level_code(state, ast_node, generate_equality_expression_code)
 }
 
-fn generate_equality_expression_code(ast_node : &AstEqualityExpression) -> Result<String, String> {
-    generate_expression_level_code(ast_node, generate_relational_expression_code)
+fn generate_equality_expression_code(state : &mut CodegenState, ast_node : &AstEqualityExpression) -> Result<String, String> {
+    generate_expression_level_code(state, ast_node, generate_relational_expression_code)
 }
 
-fn generate_relational_expression_code(ast_node : &AstRelationalExpression) -> Result<String, String> {
-    generate_expression_level_code(ast_node, generate_additive_expression_code)
+fn generate_relational_expression_code(state : &mut CodegenState, ast_node : &AstRelationalExpression) -> Result<String, String> {
+    generate_expression_level_code(state, ast_node, generate_additive_expression_code)
 }
 
-fn generate_additive_expression_code(ast_node : &AstAdditiveExpression) -> Result<String, String> {
-    generate_expression_level_code(ast_node, generate_term_code)
+fn generate_additive_expression_code(state : &mut CodegenState, ast_node : &AstAdditiveExpression) -> Result<String, String> {
+    generate_expression_level_code(state, ast_node, generate_term_code)
 }
 
-fn generate_term_code(ast_node : &AstTerm) -> Result<String, String> {
-    generate_expression_level_code(ast_node, generate_factor_code)
+fn generate_term_code(state : &mut CodegenState, ast_node : &AstTerm) -> Result<String, String> {
+    generate_expression_level_code(state, ast_node, generate_factor_code)
 }
 
-fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, String> {
+fn generate_statement_code(state : &mut CodegenState, ast_statement : &AstStatement) -> Result<String, String> {
     if let AstStatement::Return(expr) = ast_statement {
-        generate_expression_code(expr).and_then(|expr_code| {
+        generate_expression_code(state, expr).and_then(|expr_code| {
             Ok(format!("{}\n    ret", expr_code))
         })
     } else {
@@ -675,8 +697,8 @@ fn generate_statement_code(ast_statement : &AstStatement) -> Result<String, Stri
     }
 }
 
-fn generate_function_code(ast_function : &AstFunction) -> Result<String, String> {
-    generate_statement_code(&ast_function.body).and_then(|function_code| {
+fn generate_function_code(state : &mut CodegenState, ast_function : &AstFunction) -> Result<String, String> {
+    generate_statement_code(state, &ast_function.body).and_then(|function_code| {
         Ok(format!("{} PROC\n{}\n{} ENDP", ast_function.name, function_code, ast_function.name))
     })
 }
@@ -693,7 +715,8 @@ start:
 r"END
 ";
 
-    generate_function_code(&ast_program.main_function).and_then(|main_code| {
+    let mut codegen_state = CodegenState::new();
+    generate_function_code(&mut codegen_state, &ast_program.main_function).and_then(|main_code| {
         Ok(String::from(HEADER) + &main_code + "\n" + FOOTER)
     })
 }

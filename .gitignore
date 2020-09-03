@@ -1,5 +1,6 @@
 Cargo.lock
 *.exe
+*.pdb
 *.asm
 *.obj
 *.lnk
