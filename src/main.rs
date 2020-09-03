@@ -1286,4 +1286,9 @@ r"int main() {{
         test_codegen_expression("1 || 0 || 0", 1);
         test_codegen_expression("0 || 0 || 0", 0);
     }
+
+    #[test]
+    fn test_codegen_operator_precedence() {
+        test_codegen_expression("-1 * -2 + 3 >= 5 == 1 && (6 - 6) || 7", 1);
+    }
 }
