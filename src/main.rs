@@ -1267,4 +1267,11 @@ r"int main() {{
         test_codegen_expression("1234 != 1234", 0);
         test_codegen_expression("1234 != 1235", 1);
     }
+
+    #[test]
+    fn test_codegen_logical_and() {
+        test_codegen_expression("0 && 1 && 2", 0);
+        test_codegen_expression("5 && 6 && 7", 1);
+        test_codegen_expression("5 && 6 && 0", 0);
+    }
 }
