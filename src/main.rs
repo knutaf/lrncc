@@ -1190,6 +1190,9 @@ r"int main() {{
 
     fn codegen_run_and_check_exit_code(input : &str, expected_exit_code : i32) {
         let exe_name = format!("test_{}.exe", generate_random_string(8));
+        let mut pdb_path = Path::new(&exe_name).to_path_buf();
+        pdb_path.set_extension("pdb");
+
         compile_and_link(input, &exe_name, true).expect("expecting compile and link to succeed");
 
         let actual_exit_code = Command::new(&exe_name)
@@ -1202,6 +1205,7 @@ r"int main() {{
 
         assert_eq!(expected_exit_code, actual_exit_code);
         std::fs::remove_file(exe_name);
+        std::fs::remove_file(&pdb_path);
     }
 
     fn test_codegen_expression(expression : &str, expected_exit_code : i32) {
