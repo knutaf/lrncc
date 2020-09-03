@@ -324,7 +324,8 @@ impl std::str::FromStr for AstTermBinaryOperator {
 
 impl BinaryOperatorCodeGenerator for AstExpressionBinaryOperator {
     fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
-        String::new()
+        let label = state.consume_jump_label();
+        format!("\n    cmp rax,0\n    mov rax,0\n    setne al\n    jne _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
     }
 }
 
@@ -1273,5 +1274,12 @@ r"int main() {{
         test_codegen_expression("0 && 1 && 2", 0);
         test_codegen_expression("5 && 6 && 7", 1);
         test_codegen_expression("5 && 6 && 0", 0);
+    }
+
+    #[test]
+    fn test_codegen_logical_or() {
+        test_codegen_expression("0 || 0 || 1", 1);
+        test_codegen_expression("1 || 0 || 0", 1);
+        test_codegen_expression("0 || 0 || 0", 0);
     }
 }
