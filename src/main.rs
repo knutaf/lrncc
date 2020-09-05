@@ -45,9 +45,11 @@ struct AstFunction<'a> {
     body : Vec<AstStatement>,
 }
 
+// TODO: use a string slice instead of a string
 #[derive(PartialEq, Clone, Debug)]
 enum AstStatement {
     Return(AstExpression),
+    DeclareVar(String, Option<AstExpression>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -170,7 +172,6 @@ impl<'a> AstToString for AstFunction<'a> {
         for statement in &self.body {
             body_str += "\n";
             body_str += &statement.ast_to_string(indent_levels + 1);
-            body_str += ";";
         }
 
         format!("{}FUNC {}:{}", Self::get_indent_string(indent_levels), self.name, &body_str)
@@ -180,7 +181,9 @@ impl<'a> AstToString for AstFunction<'a> {
 impl AstToString for AstStatement {
     fn ast_to_string(&self, indent_levels : u32) -> String {
         if let AstStatement::Return(expr) = self {
-            format!("{}return {}", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
+            format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
+        } else if let AstStatement::DeclareVar(name, expr_opt) = self {
+            format!("{}int {};", Self::get_indent_string(indent_levels), &name)
         } else {
             format!("{}err {:?}", Self::get_indent_string(indent_levels), self)
         }
@@ -479,28 +482,38 @@ fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Result<AstProgram<'a>, St
 
 fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFunction<'a>, &'b [&'a str]), String> {
     if remaining_tokens.len() >= 5 {
-        let (tokens, remaining_tokens) = remaining_tokens.split_at(5);
+        let (tokens, mut remaining_tokens) = remaining_tokens.split_at(5);
         if tokens[0] == "int" &&
            tokens[2] == "(" &&
            tokens[3] == ")" &&
            tokens[4] == "{" {
             let name = tokens[1];
 
-            parse_statement(remaining_tokens).and_then(|(body, remaining_tokens)| {
-                if remaining_tokens.len() >= 1 {
-                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-                    if tokens[0] == "}" {
-                        Ok((AstFunction {
-                            name,
-                            body : vec![body],
-                        }, remaining_tokens))
-                    } else {
-                        Err(format!("function body missing closing brace"))
-                    }
+            // Parse out all the statements possible.
+            let mut statements = vec![];
+            loop {
+                let result = parse_statement(remaining_tokens);
+                if let Ok((statement, remaining)) = result {
+                    remaining_tokens = remaining;
+                    statements.push(statement);
                 } else {
-                    Err(format!("not enough tokens for function body closing brace"))
+                    break;
                 }
-            })
+            }
+
+            if remaining_tokens.len() >= 1 {
+                let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                if tokens[0] == "}" {
+                    Ok((AstFunction {
+                        name,
+                        body : statements,
+                    }, remaining_tokens))
+                } else {
+                    Err(format!("function body missing closing brace"))
+                }
+            } else {
+                Err(format!("not enough tokens for function body closing brace"))
+            }
         } else {
             Err(format!("failed to find function declaration"))
         }
@@ -525,6 +538,23 @@ fn parse_statement<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstState
                     Err(format!("not enough tokens for ending semicolon"))
                 }
             })
+        } else if tokens[0] == "int" {
+            if remaining_tokens.len() >= 1 {
+                let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                let var_name = tokens[0];
+                if remaining_tokens.len() >= 1 {
+                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                    if tokens[0] == ";" {
+                        Ok((AstStatement::DeclareVar(String::from(var_name), None), remaining_tokens))
+                    } else {
+                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
+                    }
+                } else {
+                    Err(format!("not enough tokens for ending semicolon"))
+                }
+            } else {
+                Err(format!("not enough tokens for variable name."))
+            }
         } else {
             Err(format!("unrecognized statement starting with {}", tokens[0]))
         }
