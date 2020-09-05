@@ -54,7 +54,7 @@ enum AstStatement {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-enum AstExpressionBinaryOperator {
+enum AstLogicalOrExpressionBinaryOperator {
     Or,
 }
 
@@ -109,7 +109,13 @@ struct AstBinaryOperation<TOperator, TRhs> {
     rhs : TRhs
 }
 
-type AstExpressionBinaryOperation = AstBinaryOperation<AstExpressionBinaryOperator, AstLogicalAndExpressionBinaryOperation>;
+#[derive(PartialEq, Clone, Debug)]
+enum AstExpression {
+    Assign(String, Box<AstExpression>),
+    Or(AstLogicalOrExpression),
+}
+
+type AstLogicalOrExpressionBinaryOperation = AstBinaryOperation<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpressionBinaryOperation>;
 type AstLogicalAndExpressionBinaryOperation = AstBinaryOperation<AstLogicalAndExpressionBinaryOperator, AstEqualityExpressionBinaryOperation>;
 type AstEqualityExpressionBinaryOperation = AstBinaryOperation<AstEqualityExpressionBinaryOperator, AstRelationalExpressionBinaryOperation>;
 type AstRelationalExpressionBinaryOperation = AstBinaryOperation<AstAdditiveExpressionBinaryOperator, AstAdditiveExpressionBinaryOperation>;
@@ -122,7 +128,7 @@ struct AstExpressionLevel<TOperator, TInner> {
     binary_ops : Vec<AstBinaryOperation<TOperator, TInner>>,
 }
 
-type AstExpression = AstExpressionLevel<AstExpressionBinaryOperator, AstLogicalAndExpression>;
+type AstLogicalOrExpression = AstExpressionLevel<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpression>;
 type AstLogicalAndExpression = AstExpressionLevel<AstLogicalAndExpressionBinaryOperator, AstEqualityExpression>;
 type AstEqualityExpression = AstExpressionLevel<AstEqualityExpressionBinaryOperator, AstRelationalExpression>;
 type AstRelationalExpression = AstExpressionLevel<AstRelationalExpressionBinaryOperator, AstAdditiveExpression>;
@@ -197,10 +203,19 @@ impl AstToString for AstStatement {
     }
 }
 
-impl AstToString for AstExpressionBinaryOperator {
+impl AstToString for AstExpression {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
+        match self {
+            AstExpression::Assign(name, expr) => format!("{} = {}", name, expr.ast_to_string(indent_levels)),
+            AstExpression::Or(expr) => expr.ast_to_string(indent_levels),
+        }
+    }
+}
+
+impl AstToString for AstLogicalOrExpressionBinaryOperator {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
         String::from(match self {
-            AstExpressionBinaryOperator::Or => "||",
+            AstLogicalOrExpressionBinaryOperator::Or => "||",
         })
     }
 }
@@ -273,11 +288,11 @@ impl AstToString for AstFactor {
     }
 }
 
-impl std::str::FromStr for AstExpressionBinaryOperator {
+impl std::str::FromStr for AstLogicalOrExpressionBinaryOperator {
     type Err = String;
     fn from_str(s : &str) -> Result<Self, Self::Err> {
         match s {
-            "||" => Ok(AstExpressionBinaryOperator::Or),
+            "||" => Ok(AstLogicalOrExpressionBinaryOperator::Or),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -339,7 +354,7 @@ impl std::str::FromStr for AstTermBinaryOperator {
     }
 }
 
-impl BinaryOperatorCodeGenerator for AstExpressionBinaryOperator {
+impl BinaryOperatorCodeGenerator for AstLogicalOrExpressionBinaryOperator {
     fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
         let label = state.consume_jump_label();
         format!("\n    cmp rax,0\n    mov rax,0\n    setne al\n    jne _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
@@ -665,7 +680,26 @@ fn parse_expression_level<'a, 'b, TOperator, TInner>(
 }
 
 fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
-    parse_expression_level::<AstExpressionBinaryOperator, AstLogicalAndExpression>(remaining_tokens, parse_logical_and_expression)
+    if remaining_tokens.len() >= 2 {
+        lazy_static! {
+            static ref VAR_REGEX : Regex = Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
+        }
+
+        let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(2);
+        if tokens[1] == "=" && VAR_REGEX.find(tokens[0]).is_some() {
+            if let Ok((expr, remaining_expression_tokens)) = parse_expression(remaining_expression_tokens) {
+                return Ok((AstExpression::Assign(String::from(tokens[0]), Box::new(expr)), remaining_expression_tokens));
+            }
+        }
+    }
+
+    parse_logical_or_expression(remaining_tokens).and_then(|(expr, remaining_tokens)| {
+        Ok((AstExpression::Or(expr), remaining_tokens))
+    })
+}
+
+fn parse_logical_or_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstLogicalOrExpression, &'b [&'a str]), String> {
+    parse_expression_level::<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpression>(remaining_tokens, parse_logical_and_expression)
 }
 
 fn parse_logical_and_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstLogicalAndExpression, &'b [&'a str]), String> {
@@ -735,6 +769,14 @@ fn generate_expression_level_code<TOperator, TInner>(
 }
 
 fn generate_expression_code(state : &mut CodegenState, ast_node : &AstExpression) -> Result<String, String> {
+    if let AstExpression::Or(expr) = ast_node {
+        generate_logical_or_expression_code(state, expr)
+    } else {
+        Err(format!("TODO impl"))
+    }
+}
+
+fn generate_logical_or_expression_code(state : &mut CodegenState, ast_node : &AstLogicalOrExpression) -> Result<String, String> {
     generate_expression_level_code(state, ast_node, generate_logical_and_expression_code)
 }
 
