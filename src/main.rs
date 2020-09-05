@@ -816,7 +816,7 @@ fn generate_term_code(state : &mut CodegenState, ast_node : &AstTerm) -> Result<
 fn generate_statement_code(state : &mut CodegenState, ast_statement : &AstStatement) -> Result<String, String> {
     if let AstStatement::Return(expr) = ast_statement {
         generate_expression_code(state, expr).and_then(|expr_code| {
-            Ok(format!("{}\n    ret", expr_code))
+            Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
         })
     } else {
         Err(format!("unsupported statement {:?}", ast_statement))
@@ -825,7 +825,7 @@ fn generate_statement_code(state : &mut CodegenState, ast_statement : &AstStatem
 
 fn generate_function_code(state : &mut CodegenState, ast_function : &AstFunction) -> Result<String, String> {
     generate_statement_code(state, &ast_function.body[0]).and_then(|function_code| {
-        Ok(format!("{} PROC\n{}\n{} ENDP", ast_function.name, function_code, ast_function.name))
+        Ok(format!("{} PROC\n    push rbp\n    mov rbp,rsp\n{}\n{} ENDP", ast_function.name, function_code, ast_function.name))
     })
 }
 
