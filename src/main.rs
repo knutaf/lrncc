@@ -183,7 +183,11 @@ impl AstToString for AstStatement {
         if let AstStatement::Return(expr) = self {
             format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
         } else if let AstStatement::DeclareVar(name, expr_opt) = self {
-            format!("{}int {};", Self::get_indent_string(indent_levels), &name)
+            if let Some(expr) = expr_opt {
+                format!("{}int {} = {};", Self::get_indent_string(indent_levels), &name, expr.ast_to_string(indent_levels + 1))
+            } else {
+                format!("{}int {};", Self::get_indent_string(indent_levels), &name)
+            }
         } else {
             format!("{}err {:?}", Self::get_indent_string(indent_levels), self)
         }
@@ -433,6 +437,7 @@ fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
             Regex::new(r"^\*").expect("failed to compile regex"),
             Regex::new(r"^<").expect("failed to compile regex"),
             Regex::new(r"^>").expect("failed to compile regex"),
+            Regex::new(r"^=").expect("failed to compile regex"),
             Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
             Regex::new(r"^[0-9]+").expect("failed to compile regex"),
         ];
@@ -543,9 +548,23 @@ fn parse_statement<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstState
                 let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
                 let var_name = tokens[0];
                 if remaining_tokens.len() >= 1 {
-                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                    let (mut tokens, mut remaining_tokens) = remaining_tokens.split_at(1);
+                    let mut expr_opt = None;
+                    if tokens[0] == "=" {
+                        if let Ok((expr, remaining)) = parse_expression(remaining_tokens) {
+                            expr_opt = Some(expr);
+                            remaining_tokens = remaining;
+
+                            if remaining_tokens.len() >= 1 {
+                                let (t, r) = remaining_tokens.split_at(1);
+                                tokens = t;
+                                remaining_tokens = r;
+                            }
+                        }
+                    }
+
                     if tokens[0] == ";" {
-                        Ok((AstStatement::DeclareVar(String::from(var_name), None), remaining_tokens))
+                        Ok((AstStatement::DeclareVar(String::from(var_name), expr_opt), remaining_tokens))
                     } else {
                         Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
                     }
