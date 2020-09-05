@@ -18,6 +18,14 @@ fn generate_random_string(len : usize) -> String {
         .collect()
 }
 
+fn is_token_variable_name(token : &str) -> bool {
+    lazy_static! {
+        static ref VAR_REGEX : Regex = Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
+    }
+
+    VAR_REGEX.find(token).is_some()
+}
+
 trait AstToString {
     fn ast_to_string(&self, indent_levels : u32) -> String;
 
@@ -99,6 +107,7 @@ enum AstUnaryOperator {
 #[derive(PartialEq, Clone, Debug)]
 enum AstFactor {
     Constant(u32),
+    Variable(String), // TODO use a string slice
     UnaryOperator(AstUnaryOperator, Box<AstFactor>),
     Expression(Box<AstExpression>),
 }
@@ -280,6 +289,7 @@ impl AstToString for AstFactor {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
         match self {
             AstFactor::Constant(val) => format!("{}", val),
+            AstFactor::Variable(name) => name.clone(),
             AstFactor::UnaryOperator(operator, factor) => {
                 format!("{}{}", operator.ast_to_string(0), factor.ast_to_string(0))
             },
@@ -639,6 +649,12 @@ fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, 
                 parse_factor(remaining_tokens).and_then(|(inner, remaining_tokens)| {
                     Ok((AstFactor::UnaryOperator(operator, Box::new(inner)), remaining_tokens))
                 })
+            }).or_else(|_err| {
+                if is_token_variable_name(tokens[0]) {
+                    Ok((AstFactor::Variable(String::from(tokens[0])), remaining_tokens))
+                } else {
+                    Err(format!("unknown operator or variable name {}", tokens[0]))
+                }
             })
         }
     } else {
@@ -681,12 +697,8 @@ fn parse_expression_level<'a, 'b, TOperator, TInner>(
 
 fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
     if remaining_tokens.len() >= 2 {
-        lazy_static! {
-            static ref VAR_REGEX : Regex = Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
-        }
-
         let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(2);
-        if tokens[1] == "=" && VAR_REGEX.find(tokens[0]).is_some() {
+        if tokens[1] == "=" && is_token_variable_name(tokens[0]) {
             if let Ok((expr, remaining_expression_tokens)) = parse_expression(remaining_expression_tokens) {
                 return Ok((AstExpression::Assign(String::from(tokens[0]), Box::new(expr)), remaining_expression_tokens));
             }
@@ -735,6 +747,7 @@ fn get_register_name(register_name : &str, width : u32) -> String {
 fn generate_factor_code(state : &mut CodegenState, ast_factor : &AstFactor) -> Result<String, String> {
     match ast_factor {
         AstFactor::Constant(val) => Ok(format!("    mov rax,{}", val)),
+        AstFactor::Variable(name) => Err(format!("TODO impl")),
         AstFactor::UnaryOperator(operator, box_factor) => {
             generate_factor_code(state, box_factor).and_then(|inner_factor_code| {
                 match operator {
