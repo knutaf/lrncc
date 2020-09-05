@@ -50,6 +50,7 @@ struct AstFunction<'a> {
 enum AstStatement {
     Return(AstExpression),
     DeclareVar(String, Option<AstExpression>),
+    Expression(AstExpression),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -188,6 +189,8 @@ impl AstToString for AstStatement {
             } else {
                 format!("{}int {};", Self::get_indent_string(indent_levels), &name)
             }
+        } else if let AstStatement::Expression(expr) = self {
+            format!("{}{};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
         } else {
             format!("{}err {:?}", Self::get_indent_string(indent_levels), self)
         }
@@ -527,9 +530,9 @@ fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFuncti
     }
 }
 
-fn parse_statement<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstStatement, &'b [&'a str]), String> {
-    if remaining_tokens.len() >= 1 {
-        let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+fn parse_statement<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstStatement, &'b [&'a str]), String> {
+    if original_remaining_tokens.len() >= 1 {
+        let (tokens, remaining_tokens) = original_remaining_tokens.split_at(1);
         if tokens[0] == "return" {
             parse_expression(remaining_tokens).and_then(|(expr, remaining_tokens)| {
                 if remaining_tokens.len() >= 1 {
@@ -575,7 +578,18 @@ fn parse_statement<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstState
                 Err(format!("not enough tokens for variable name."))
             }
         } else {
-            Err(format!("unrecognized statement starting with {}", tokens[0]))
+            parse_expression(original_remaining_tokens).and_then(|(expr, remaining_tokens)| {
+                if remaining_tokens.len() >= 1 {
+                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                    if tokens[0] == ";" {
+                        Ok((AstStatement::Expression(expr), remaining_tokens))
+                    } else {
+                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
+                    }
+                } else {
+                    Err(format!("not enough tokens for ending semicolon"))
+                }
+            })
         }
     } else {
         Err(format!("not enough tokens for statement"))
