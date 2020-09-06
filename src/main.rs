@@ -907,7 +907,8 @@ fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function :
         }
     }
 
-    Ok(code + &format!("\n{} ENDP", ast_function.name))
+    // Add a default return of 0 in case the code in the function body didn't put a return statement.
+    Ok(code + &format!("\n    mov rsp,rbp\n    pop rbp\n    ret\n{} ENDP", ast_function.name))
 }
 
 fn generate_program_code(ast_program : &AstProgram) -> Result<String, String> {
