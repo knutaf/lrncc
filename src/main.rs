@@ -2,6 +2,7 @@ use std::env;
 use std::fmt;
 use std::process::*;
 use std::path::*;
+use std::collections::HashMap;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
@@ -10,6 +11,8 @@ use regex::Regex;
 extern crate rand;
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
+
+const VARIABLE_SIZE : u32 = 8;
 
 fn generate_random_string(len : usize) -> String {
     thread_rng()
@@ -39,7 +42,7 @@ trait AstToString {
 }
 
 trait BinaryOperatorCodeGenerator {
-    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String;
+    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String;
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -144,8 +147,14 @@ type AstRelationalExpression = AstExpressionLevel<AstRelationalExpressionBinaryO
 type AstAdditiveExpression = AstExpressionLevel<AstAdditiveExpressionBinaryOperator, AstTerm>;
 type AstTerm = AstExpressionLevel<AstTermBinaryOperator, AstFactor>;
 
-struct CodegenState {
+struct CodegenGlobalState {
     next_label : u32,
+}
+
+#[derive(Clone)]
+struct CodegenFunctionState {
+    variables : HashMap<String, u32>,
+    next_offset : u32,
 }
 
 impl<TOperator, TInner> AstExpressionLevel<TOperator, TInner> {
@@ -157,9 +166,9 @@ impl<TOperator, TInner> AstExpressionLevel<TOperator, TInner> {
     }
 }
 
-impl CodegenState {
-    fn new() -> CodegenState {
-        CodegenState {
+impl CodegenGlobalState {
+    fn new() -> CodegenGlobalState {
+        CodegenGlobalState {
             next_label : 0,
         }
     }
@@ -167,6 +176,31 @@ impl CodegenState {
     fn consume_jump_label(&mut self) -> u32 {
         self.next_label += 1;
         self.next_label - 1
+    }
+}
+
+impl CodegenFunctionState {
+    fn new() -> CodegenFunctionState {
+        CodegenFunctionState {
+            variables : HashMap::new(),
+            next_offset : VARIABLE_SIZE,
+        }
+    }
+
+    fn add_var(&mut self, name : &str) -> bool {
+        if !self.variables.contains_key(name) {
+            self.variables.insert(String::from(name), self.next_offset);
+            self.next_offset += VARIABLE_SIZE;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn get_var_offset(&self, name : &str) -> Option<u32> {
+        self.variables.get(name).map(|value| {
+            *value
+        })
     }
 }
 
@@ -365,21 +399,21 @@ impl std::str::FromStr for AstTermBinaryOperator {
 }
 
 impl BinaryOperatorCodeGenerator for AstLogicalOrExpressionBinaryOperator {
-    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
-        let label = state.consume_jump_label();
+    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
+        let label = global_state.consume_jump_label();
         format!("\n    cmp rax,0\n    mov rax,0\n    setne al\n    jne _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
     }
 }
 
 impl BinaryOperatorCodeGenerator for AstLogicalAndExpressionBinaryOperator {
-    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
-        let label = state.consume_jump_label();
+    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
+        let label = global_state.consume_jump_label();
         format!("\n    cmp rax,0\n    je _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
     }
 }
 
 impl BinaryOperatorCodeGenerator for AstEqualityExpressionBinaryOperator {
-    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
         format!("\n    push rax\n{}", rhs_code) +
         &match &self {
             AstEqualityExpressionBinaryOperator::Equals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    sete al"),
@@ -389,7 +423,7 @@ impl BinaryOperatorCodeGenerator for AstEqualityExpressionBinaryOperator {
 }
 
 impl BinaryOperatorCodeGenerator for AstRelationalExpressionBinaryOperator {
-    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
         format!("\n    push rax\n{}", rhs_code) +
         &match &self {
             AstRelationalExpressionBinaryOperator::LessThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setl al"),
@@ -401,7 +435,7 @@ impl BinaryOperatorCodeGenerator for AstRelationalExpressionBinaryOperator {
 }
 
 impl BinaryOperatorCodeGenerator for AstAdditiveExpressionBinaryOperator {
-    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
         format!("\n    push rax\n{}", rhs_code) +
         &match &self {
             AstAdditiveExpressionBinaryOperator::Plus => format!("\n    pop rcx\n    add rax,rcx"),
@@ -411,7 +445,7 @@ impl BinaryOperatorCodeGenerator for AstAdditiveExpressionBinaryOperator {
 }
 
 impl BinaryOperatorCodeGenerator for AstTermBinaryOperator {
-    fn generate_code(&self, state : &mut CodegenState, rhs_code : &str) -> String {
+    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
         format!("\n    push rax\n{}", rhs_code) +
         &match &self {
             AstTermBinaryOperator::Multiply => format!("\n    mov rcx,rax\n    pop rax\n    imul rax,rcx"),
@@ -744,12 +778,16 @@ fn get_register_name(register_name : &str, width : u32) -> String {
     }
 }
 
-fn generate_factor_code(state : &mut CodegenState, ast_factor : &AstFactor) -> Result<String, String> {
+fn generate_factor_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_factor : &AstFactor) -> Result<String, String> {
     match ast_factor {
         AstFactor::Constant(val) => Ok(format!("    mov rax,{}", val)),
-        AstFactor::Variable(name) => Err(format!("TODO impl")),
+        AstFactor::Variable(name) => {
+            func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
+                Ok(format!("    mov rax,[rbp-{}]", offset))
+            })
+        },
         AstFactor::UnaryOperator(operator, box_factor) => {
-            generate_factor_code(state, box_factor).and_then(|inner_factor_code| {
+            generate_factor_code(global_state, func_state, box_factor).and_then(|inner_factor_code| {
                 match operator {
                     AstUnaryOperator::Negation => Ok(format!("{}\n    neg rax", inner_factor_code)),
                     AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not rax", inner_factor_code)),
@@ -757,21 +795,22 @@ fn generate_factor_code(state : &mut CodegenState, ast_factor : &AstFactor) -> R
                 }
             })
         },
-        AstFactor::Expression(box_expr) => generate_expression_code(state, &box_expr),
+        AstFactor::Expression(box_expr) => generate_expression_code(global_state, func_state, &box_expr),
     }
 }
 
 fn generate_expression_level_code<TOperator, TInner>(
-    state : &mut CodegenState,
+    global_state : &mut CodegenGlobalState,
+    func_state : &CodegenFunctionState,
     expr : &AstExpressionLevel<TOperator, TInner>,
-    generate_inner : fn(&mut CodegenState, &TInner) -> Result<String, String>
+    generate_inner : fn(&mut CodegenGlobalState, &CodegenFunctionState, &TInner) -> Result<String, String>
     ) -> Result<String, String>
     where TOperator : BinaryOperatorCodeGenerator {
-    generate_inner(state, &expr.inner).and_then(|mut code| {
+    generate_inner(global_state, func_state, &expr.inner).and_then(|mut code| {
         for binop in &expr.binary_ops {
-            let inner_code_result = generate_inner(state, &binop.rhs);
+            let inner_code_result = generate_inner(global_state, func_state, &binop.rhs);
             if let Ok(inner_code) = inner_code_result {
-                code += &binop.operator.generate_code(state, &inner_code);
+                code += &binop.operator.generate_code(global_state, &inner_code);
             } else {
                 return inner_code_result;
             }
@@ -781,52 +820,94 @@ fn generate_expression_level_code<TOperator, TInner>(
     })
 }
 
-fn generate_expression_code(state : &mut CodegenState, ast_node : &AstExpression) -> Result<String, String> {
-    if let AstExpression::Or(expr) = ast_node {
-        generate_logical_or_expression_code(state, expr)
-    } else {
-        Err(format!("TODO impl"))
+fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstExpression) -> Result<String, String> {
+    match ast_node {
+        AstExpression::Or(expr) => {
+            generate_logical_or_expression_code(global_state, func_state, expr)
+        },
+        AstExpression::Assign(name, expr) => {
+            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
+                func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
+                    Ok(format!("{}\n    mov [rbp-{}],rax", expr_code, offset))
+                })
+            })
+        },
     }
 }
 
-fn generate_logical_or_expression_code(state : &mut CodegenState, ast_node : &AstLogicalOrExpression) -> Result<String, String> {
-    generate_expression_level_code(state, ast_node, generate_logical_and_expression_code)
+fn generate_logical_or_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstLogicalOrExpression) -> Result<String, String> {
+    generate_expression_level_code(global_state, func_state, ast_node, generate_logical_and_expression_code)
 }
 
-fn generate_logical_and_expression_code(state : &mut CodegenState, ast_node : &AstLogicalAndExpression) -> Result<String, String> {
-    generate_expression_level_code(state, ast_node, generate_equality_expression_code)
+fn generate_logical_and_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstLogicalAndExpression) -> Result<String, String> {
+    generate_expression_level_code(global_state, func_state, ast_node, generate_equality_expression_code)
 }
 
-fn generate_equality_expression_code(state : &mut CodegenState, ast_node : &AstEqualityExpression) -> Result<String, String> {
-    generate_expression_level_code(state, ast_node, generate_relational_expression_code)
+fn generate_equality_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstEqualityExpression) -> Result<String, String> {
+    generate_expression_level_code(global_state, func_state, ast_node, generate_relational_expression_code)
 }
 
-fn generate_relational_expression_code(state : &mut CodegenState, ast_node : &AstRelationalExpression) -> Result<String, String> {
-    generate_expression_level_code(state, ast_node, generate_additive_expression_code)
+fn generate_relational_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstRelationalExpression) -> Result<String, String> {
+    generate_expression_level_code(global_state, func_state, ast_node, generate_additive_expression_code)
 }
 
-fn generate_additive_expression_code(state : &mut CodegenState, ast_node : &AstAdditiveExpression) -> Result<String, String> {
-    generate_expression_level_code(state, ast_node, generate_term_code)
+fn generate_additive_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstAdditiveExpression) -> Result<String, String> {
+    generate_expression_level_code(global_state, func_state, ast_node, generate_term_code)
 }
 
-fn generate_term_code(state : &mut CodegenState, ast_node : &AstTerm) -> Result<String, String> {
-    generate_expression_level_code(state, ast_node, generate_factor_code)
+fn generate_term_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstTerm) -> Result<String, String> {
+    generate_expression_level_code(global_state, func_state, ast_node, generate_factor_code)
 }
 
-fn generate_statement_code(state : &mut CodegenState, ast_statement : &AstStatement) -> Result<String, String> {
-    if let AstStatement::Return(expr) = ast_statement {
-        generate_expression_code(state, expr).and_then(|expr_code| {
-            Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
-        })
-    } else {
-        Err(format!("unsupported statement {:?}", ast_statement))
+fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_statement : &AstStatement) -> Result<String, String> {
+    match ast_statement {
+        AstStatement::Return(expr) => {
+            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
+                Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
+            })
+        },
+        AstStatement::DeclareVar(name, expr_opt) => {
+            if !func_state.add_var(&name) {
+                return Err(format!("variable {} already defined", name));
+            }
+
+            let mut code = String::new();
+            if let Some(expr) = expr_opt {
+                let result = generate_expression_code(global_state, func_state, expr);
+                if let Ok(expr_code) = result {
+                    code += &expr_code;
+                } else {
+                    return result;
+                }
+            }
+
+            // The assignment expression (or junk data, if no expression was used) is in rax and should be stored at the
+            // variable's location on the stack.
+            code += "\n    push rax";
+            Ok(code)
+        },
+        AstStatement::Expression(expr) => {
+            generate_expression_code(global_state, func_state, expr)
+        },
+        _ => Err(format!("unsupported statement {:?}", ast_statement)),
     }
 }
 
-fn generate_function_code(state : &mut CodegenState, ast_function : &AstFunction) -> Result<String, String> {
-    generate_statement_code(state, &ast_function.body[0]).and_then(|function_code| {
-        Ok(format!("{} PROC\n    push rbp\n    mov rbp,rsp\n{}\n{} ENDP", ast_function.name, function_code, ast_function.name))
-    })
+fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function : &AstFunction) -> Result<String, String> {
+    let mut func_state = CodegenFunctionState::new();
+    let mut code = format!("{} PROC\n    push rbp\n    mov rbp,rsp", ast_function.name);
+
+    for statement in &ast_function.body {
+        let result = generate_statement_code(global_state, &mut func_state, statement);
+        if let Ok(statement_code) = result {
+            code += "\n";
+            code += &statement_code;
+        } else {
+            return result;
+        }
+    }
+
+    Ok(code + &format!("\n{} ENDP", ast_function.name))
 }
 
 fn generate_program_code(ast_program : &AstProgram) -> Result<String, String> {
@@ -841,7 +922,7 @@ start:
 r"END
 ";
 
-    let mut codegen_state = CodegenState::new();
+    let mut codegen_state = CodegenGlobalState::new();
     generate_function_code(&mut codegen_state, &ast_program.main_function).and_then(|main_code| {
         Ok(String::from(HEADER) + &main_code + "\n" + FOOTER)
     })
@@ -1313,28 +1394,52 @@ r"int main() {{
     }
     */
 
-    fn codegen_run_and_check_exit_code(input : &str, expected_exit_code : i32) {
+    fn codegen_run_and_check_exit_code_or_compile_failure(input : &str, expected_result : Option<i32>) {
         let exe_name = format!("test_{}.exe", generate_random_string(8));
         let mut pdb_path = Path::new(&exe_name).to_path_buf();
         pdb_path.set_extension("pdb");
 
-        compile_and_link(input, &exe_name, true).expect("expecting compile and link to succeed");
+        let compile_result = compile_and_link(input, &exe_name, true);
 
-        let actual_exit_code = Command::new(&exe_name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("failed to run test.exe")
-            .code()
-            .expect("all processes must have exit code");
+        if compile_result.is_ok() {
+            if let Some(expected_exit_code) = expected_result {
+                let actual_exit_code = Command::new(&exe_name)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .expect("failed to run test.exe")
+                    .code()
+                    .expect("all processes must have exit code");
 
-        assert_eq!(expected_exit_code, actual_exit_code);
-        std::fs::remove_file(exe_name);
-        std::fs::remove_file(&pdb_path);
+                assert_eq!(expected_exit_code, actual_exit_code);
+                std::fs::remove_file(exe_name);
+                std::fs::remove_file(&pdb_path);
+            } else {
+                assert!(false, "compile succeeded but expected failure");
+            }
+        } else {
+            assert!(expected_result.is_none());
+        }
+    }
+
+    fn codegen_run_and_check_exit_code(input : &str, expected_exit_code : i32) {
+        codegen_run_and_check_exit_code_or_compile_failure(input, Some(expected_exit_code))
+    }
+
+    fn codegen_run_and_expect_compile_failure(input : &str) {
+        codegen_run_and_check_exit_code_or_compile_failure(input, None)
     }
 
     fn test_codegen_expression(expression : &str, expected_exit_code : i32) {
         codegen_run_and_check_exit_code(&format!("int main() {{ return {}; }}", expression), expected_exit_code);
+    }
+
+    fn test_codegen_mainfunc(body : &str, expected_exit_code : i32) {
+        codegen_run_and_check_exit_code(&format!("int main() {{ {} }}", body), expected_exit_code);
+    }
+
+    fn test_codegen_mainfunc_failure(body : &str) {
+        codegen_run_and_expect_compile_failure(&format!("int main() {{ {} }}", body))
     }
 
     #[test]
@@ -1415,5 +1520,25 @@ r"int main() {{
     #[test]
     fn test_codegen_operator_precedence() {
         test_codegen_expression("-1 * -2 + 3 >= 5 == 1 && (6 - 6) || 7", 1);
+    }
+
+    #[test]
+    fn test_codegen_var_use() {
+        test_codegen_mainfunc("int x = 5; int y = 6; int z; x = 1; z = 3; return x + y + z;", 10);
+    }
+
+    #[test]
+    fn test_codegen_assign_expr() {
+        test_codegen_mainfunc("int x = 5; int y = x = 3 + 1; return x + y;", 8);
+    }
+
+    #[test]
+    fn test_codegen_duplicate_variable() {
+        test_codegen_mainfunc_failure("int x = 5; int x = 4; return x;");
+    }
+
+    #[test]
+    fn test_codegen_unknown_variable() {
+        test_codegen_mainfunc_failure("return x;");
     }
 }
