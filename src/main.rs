@@ -46,13 +46,13 @@ trait BinaryOperatorCodeGenerator {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-struct AstProgram<'a> {
-    main_function : AstFunction<'a>,
+struct AstProgram<'i> {
+    main_function : AstFunction<'i>,
 }
 
 #[derive(PartialEq, Clone, Debug)]
-struct AstFunction<'a> {
-    name : &'a str,
+struct AstFunction<'i> {
+    name : &'i str,
     body : Vec<AstBlockItem>,
 }
 
@@ -215,19 +215,19 @@ impl CodegenFunctionState {
     }
 }
 
-impl<'a> AstToString for AstProgram<'a> {
+impl<'i> AstToString for AstProgram<'i> {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
         format!("{}", self.main_function.ast_to_string(0))
     }
 }
 
-impl<'a> fmt::Display for AstProgram<'a> {
+impl<'i> fmt::Display for AstProgram<'i> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.ast_to_string(0))
     }
 }
 
-impl<'a> AstToString for AstFunction<'a> {
+impl<'i> AstToString for AstFunction<'i> {
     fn ast_to_string(&self, indent_levels : u32) -> String {
         let mut body_str = String::new();
         for statement in &self.body {
@@ -509,7 +509,7 @@ impl<TOperator, TInner> AstToString for AstExpressionLevel<TOperator, TInner>
     }
 }
 
-fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
+fn lex_next_token<'i>(input : &'i str)  -> Result<(&'i str, &'i str), String> {
     lazy_static! {
         static ref TOKEN_REGEXES : Vec<regex::Regex> = vec![
             Regex::new(r"^&&").expect("failed to compile regex"),
@@ -548,8 +548,8 @@ fn lex_next_token<'a>(input : &'a str)  -> Result<(&'a str, &'a str), String> {
     Err(format!("unrecognized token starting at {}", input))
 }
 
-fn lex_all_tokens<'a>(input : &'a str) -> Result<Vec<&'a str>, String> {
-    let mut tokens : Vec<&'a str> = vec![];
+fn lex_all_tokens<'i>(input : &'i str) -> Result<Vec<&'i str>, String> {
+    let mut tokens : Vec<&'i str> = vec![];
 
     let mut remaining_input = input.trim();
     while remaining_input.len() > 0 {
@@ -567,7 +567,7 @@ fn lex_all_tokens<'a>(input : &'a str) -> Result<Vec<&'a str>, String> {
     Ok(tokens)
 }
 
-fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Result<AstProgram<'a>, String> {
+fn parse_program<'i>(remaining_tokens : &[&'i str]) -> Result<AstProgram<'i>, String> {
     parse_function(remaining_tokens).and_then(|(function, remaining_tokens)| {
         if remaining_tokens.len() == 0 {
             Ok(AstProgram {
@@ -579,7 +579,7 @@ fn parse_program<'a>(remaining_tokens : &[&'a str]) -> Result<AstProgram<'a>, St
     })
 }
 
-fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFunction<'a>, &'b [&'a str]), String> {
+fn parse_function<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFunction<'i>, &'t [&'i str]), String> {
     if remaining_tokens.len() >= 5 {
         let (tokens, mut remaining_tokens) = remaining_tokens.split_at(5);
         if tokens[0] == "int" &&
@@ -621,7 +621,7 @@ fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFuncti
     }
 }
 
-fn parse_block_item<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstBlockItem, &'b [&'a str]), String> {
+fn parse_block_item<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstBlockItem, &'t [&'i str]), String> {
     if let Ok((declaration, remaining_tokens)) = parse_declaration(original_remaining_tokens) {
         Ok((AstBlockItem::Declaration(declaration), remaining_tokens))
     } else {
@@ -631,7 +631,7 @@ fn parse_block_item<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result
     }
 }
 
-fn parse_declaration<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstDeclaration, &'b [&'a str]), String> {
+fn parse_declaration<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstDeclaration, &'t [&'i str]), String> {
     if original_remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = original_remaining_tokens.split_at(1);
         if tokens[0] == "int" {
@@ -673,7 +673,7 @@ fn parse_declaration<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Resul
     }
 }
 
-fn parse_statement<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstStatement, &'b [&'a str]), String> {
+fn parse_statement<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstStatement, &'t [&'i str]), String> {
     if original_remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = original_remaining_tokens.split_at(1);
         if tokens[0] == "return" {
@@ -708,7 +708,7 @@ fn parse_statement<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<
     }
 }
 
-fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, &'b [&'a str]), String> {
+fn parse_factor<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFactor, &'t [&'i str]), String> {
     if remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
         if let Ok(integer_literal) = tokens[0].parse::<u32>() {
@@ -749,11 +749,11 @@ fn parse_factor<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFactor, 
     }
 }
 
-fn parse_expression_level<'a, 'b, TOperator, TInner>(
-    remaining_tokens : &'b [&'a str],
-    parse_inner : fn(&'b [&'a str]) -> Result<(TInner, &'b [&'a str]), String>
+fn parse_expression_level<'i, 't, TOperator, TInner>(
+    remaining_tokens : &'t [&'i str],
+    parse_inner : fn(&'t [&'i str]) -> Result<(TInner, &'t [&'i str]), String>
     )
-    -> Result<(AstExpressionLevel<TOperator, TInner>, &'b [&'a str]), String>
+    -> Result<(AstExpressionLevel<TOperator, TInner>, &'t [&'i str]), String>
     where TOperator : std::str::FromStr
     {
     parse_inner(remaining_tokens).and_then(|(inner1, mut remaining_tokens)| {
@@ -782,7 +782,7 @@ fn parse_expression_level<'a, 'b, TOperator, TInner>(
     })
 }
 
-fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpression, &'b [&'a str]), String> {
+fn parse_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstExpression, &'t [&'i str]), String> {
     if remaining_tokens.len() >= 2 {
         let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(2);
         if tokens[1] == "=" && is_token_variable_name(tokens[0]) {
@@ -797,27 +797,27 @@ fn parse_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstExpr
     })
 }
 
-fn parse_logical_or_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstLogicalOrExpression, &'b [&'a str]), String> {
+fn parse_logical_or_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstLogicalOrExpression, &'t [&'i str]), String> {
     parse_expression_level::<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpression>(remaining_tokens, parse_logical_and_expression)
 }
 
-fn parse_logical_and_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstLogicalAndExpression, &'b [&'a str]), String> {
+fn parse_logical_and_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstLogicalAndExpression, &'t [&'i str]), String> {
     parse_expression_level::<AstLogicalAndExpressionBinaryOperator, AstEqualityExpression>(remaining_tokens, parse_equality_expression)
 }
 
-fn parse_equality_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstEqualityExpression, &'b [&'a str]), String> {
+fn parse_equality_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstEqualityExpression, &'t [&'i str]), String> {
     parse_expression_level::<AstEqualityExpressionBinaryOperator, AstRelationalExpression>(remaining_tokens, parse_relational_expression)
 }
 
-fn parse_relational_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstRelationalExpression, &'b [&'a str]), String> {
+fn parse_relational_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstRelationalExpression, &'t [&'i str]), String> {
     parse_expression_level::<AstRelationalExpressionBinaryOperator, AstAdditiveExpression>(remaining_tokens, parse_additive_expression)
 }
 
-fn parse_additive_expression<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstAdditiveExpression, &'b [&'a str]), String> {
+fn parse_additive_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstAdditiveExpression, &'t [&'i str]), String> {
     parse_expression_level::<AstAdditiveExpressionBinaryOperator, AstTerm>(remaining_tokens, parse_term)
 }
 
-fn parse_term<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstTerm, &'b [&'a str]), String> {
+fn parse_term<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstTerm, &'t [&'i str]), String> {
     parse_expression_level::<AstTermBinaryOperator, AstFactor>(remaining_tokens, parse_factor)
 }
 
