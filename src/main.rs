@@ -53,14 +53,24 @@ struct AstProgram<'a> {
 #[derive(PartialEq, Clone, Debug)]
 struct AstFunction<'a> {
     name : &'a str,
-    body : Vec<AstStatement>,
+    body : Vec<AstBlockItem>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AstBlockItem {
+    Declaration(AstDeclaration),
+    Statement(AstStatement),
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AstDeclaration {
+    DeclareVar(String, Option<AstExpression>),
 }
 
 // TODO: use a string slice instead of a string
 #[derive(PartialEq, Clone, Debug)]
 enum AstStatement {
     Return(AstExpression),
-    DeclareVar(String, Option<AstExpression>),
     Expression(AstExpression),
 }
 
@@ -228,16 +238,33 @@ impl<'a> AstToString for AstFunction<'a> {
     }
 }
 
-impl AstToString for AstStatement {
+impl AstToString for AstBlockItem {
     fn ast_to_string(&self, indent_levels : u32) -> String {
-        if let AstStatement::Return(expr) = self {
-            format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
-        } else if let AstStatement::DeclareVar(name, expr_opt) = self {
+        match self {
+            AstBlockItem::Statement(statement) => statement.ast_to_string(indent_levels),
+            AstBlockItem::Declaration(declaration) => declaration.ast_to_string(indent_levels),
+        }
+    }
+}
+
+impl AstToString for AstDeclaration {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
+        if let AstDeclaration::DeclareVar(name, expr_opt) = self {
             if let Some(expr) = expr_opt {
                 format!("{}int {} = {};", Self::get_indent_string(indent_levels), &name, expr.ast_to_string(indent_levels + 1))
             } else {
                 format!("{}int {};", Self::get_indent_string(indent_levels), &name)
             }
+        } else {
+            format!("{}err {:?}", Self::get_indent_string(indent_levels), self)
+        }
+    }
+}
+
+impl AstToString for AstStatement {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
+        if let AstStatement::Return(expr) = self {
+            format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
         } else if let AstStatement::Expression(expr) = self {
             format!("{}{};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
         } else {
@@ -556,13 +583,13 @@ fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFuncti
            tokens[4] == "{" {
             let name = tokens[1];
 
-            // Parse out all the statements possible.
-            let mut statements = vec![];
+            // Parse out all the block items possible.
+            let mut block_items = vec![];
             loop {
-                let result = parse_statement(remaining_tokens);
-                if let Ok((statement, remaining)) = result {
+                let result = parse_block_item(remaining_tokens);
+                if let Ok((block_item, remaining)) = result {
                     remaining_tokens = remaining;
-                    statements.push(statement);
+                    block_items.push(block_item);
                 } else {
                     break;
                 }
@@ -573,7 +600,7 @@ fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFuncti
                 if tokens[0] == "}" {
                     Ok((AstFunction {
                         name,
-                        body : statements,
+                        body : block_items,
                     }, remaining_tokens))
                 } else {
                     Err(format!("function body missing closing brace"))
@@ -589,23 +616,20 @@ fn parse_function<'a, 'b>(remaining_tokens : &'b [&'a str]) -> Result<(AstFuncti
     }
 }
 
-fn parse_statement<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstStatement, &'b [&'a str]), String> {
+fn parse_block_item<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstBlockItem, &'b [&'a str]), String> {
+    if let Ok((declaration, remaining_tokens)) = parse_declaration(original_remaining_tokens) {
+        Ok((AstBlockItem::Declaration(declaration), remaining_tokens))
+    } else {
+        parse_statement(original_remaining_tokens).map(|(statement, remaining_tokens)| {
+            (AstBlockItem::Statement(statement), remaining_tokens)
+        })
+    }
+}
+
+fn parse_declaration<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstDeclaration, &'b [&'a str]), String> {
     if original_remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = original_remaining_tokens.split_at(1);
-        if tokens[0] == "return" {
-            parse_expression(remaining_tokens).and_then(|(expr, remaining_tokens)| {
-                if remaining_tokens.len() >= 1 {
-                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-                    if tokens[0] == ";" {
-                        Ok((AstStatement::Return(expr), remaining_tokens))
-                    } else {
-                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
-                    }
-                } else {
-                    Err(format!("not enough tokens for ending semicolon"))
-                }
-            })
-        } else if tokens[0] == "int" {
+        if tokens[0] == "int" {
             if remaining_tokens.len() >= 1 {
                 let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
                 let var_name = tokens[0];
@@ -626,7 +650,7 @@ fn parse_statement<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<
                     }
 
                     if tokens[0] == ";" {
-                        Ok((AstStatement::DeclareVar(String::from(var_name), expr_opt), remaining_tokens))
+                        Ok((AstDeclaration::DeclareVar(String::from(var_name), expr_opt), remaining_tokens))
                     } else {
                         Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
                     }
@@ -636,6 +660,30 @@ fn parse_statement<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<
             } else {
                 Err(format!("not enough tokens for variable name."))
             }
+        } else {
+            Err(format!("incorrect token \"{}\" to start declaration", tokens[0]))
+        }
+    } else {
+        Err(format!("not enough tokens for statement"))
+    }
+}
+
+fn parse_statement<'a, 'b>(original_remaining_tokens : &'b [&'a str]) -> Result<(AstStatement, &'b [&'a str]), String> {
+    if original_remaining_tokens.len() >= 1 {
+        let (tokens, remaining_tokens) = original_remaining_tokens.split_at(1);
+        if tokens[0] == "return" {
+            parse_expression(remaining_tokens).and_then(|(expr, remaining_tokens)| {
+                if remaining_tokens.len() >= 1 {
+                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
+                    if tokens[0] == ";" {
+                        Ok((AstStatement::Return(expr), remaining_tokens))
+                    } else {
+                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
+                    }
+                } else {
+                    Err(format!("not enough tokens for ending semicolon"))
+                }
+            })
         } else {
             parse_expression(original_remaining_tokens).and_then(|(expr, remaining_tokens)| {
                 if remaining_tokens.len() >= 1 {
@@ -859,14 +907,16 @@ fn generate_term_code(global_state : &mut CodegenGlobalState, func_state : &Code
     generate_expression_level_code(global_state, func_state, ast_node, generate_factor_code)
 }
 
-fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_statement : &AstStatement) -> Result<String, String> {
-    match ast_statement {
-        AstStatement::Return(expr) => {
-            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
-                Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
-            })
-        },
-        AstStatement::DeclareVar(name, expr_opt) => {
+fn generate_block_item_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_block_item : &AstBlockItem) -> Result<String, String> {
+    match ast_block_item {
+        AstBlockItem::Statement(statement) => generate_statement_code(global_state, func_state, statement),
+        AstBlockItem::Declaration(declaration) => generate_declaration_code(global_state, func_state, declaration),
+    }
+}
+
+fn generate_declaration_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_declaration : &AstDeclaration) -> Result<String, String> {
+    match ast_declaration {
+        AstDeclaration::DeclareVar(name, expr_opt) => {
             if !func_state.add_var(&name) {
                 return Err(format!("variable {} already defined", name));
             }
@@ -886,6 +936,16 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : 
             code += "\n    push rax";
             Ok(code)
         },
+    }
+}
+
+fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_statement : &AstStatement) -> Result<String, String> {
+    match ast_statement {
+        AstStatement::Return(expr) => {
+            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
+                Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
+            })
+        },
         AstStatement::Expression(expr) => {
             generate_expression_code(global_state, func_state, expr)
         },
@@ -897,11 +957,11 @@ fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function :
     let mut func_state = CodegenFunctionState::new();
     let mut code = format!("{} PROC\n    push rbp\n    mov rbp,rsp", ast_function.name);
 
-    for statement in &ast_function.body {
-        let result = generate_statement_code(global_state, &mut func_state, statement);
-        if let Ok(statement_code) = result {
+    for block_item in &ast_function.body {
+        let result = generate_block_item_code(global_state, &mut func_state, block_item);
+        if let Ok(block_item_code) = result {
             code += "\n";
-            code += &statement_code;
+            code += &block_item_code;
         } else {
             return result;
         }
