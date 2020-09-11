@@ -72,6 +72,7 @@ enum AstDeclaration {
 enum AstStatement {
     Return(AstExpression),
     Expression(AstExpression),
+    Conditional(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -263,12 +264,16 @@ impl AstToString for AstDeclaration {
 
 impl AstToString for AstStatement {
     fn ast_to_string(&self, indent_levels : u32) -> String {
-        if let AstStatement::Return(expr) = self {
-            format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
-        } else if let AstStatement::Expression(expr) = self {
-            format!("{}{};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1))
-        } else {
-            format!("{}err {:?}", Self::get_indent_string(indent_levels), self)
+        match self {
+            AstStatement::Return(expr) => format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1)),
+            AstStatement::Expression(expr) => format!("{}{};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1)),
+            AstStatement::Conditional(expr, positive, negative_opt) => {
+                let mut result = format!("{}if ({})\n{}", Self::get_indent_string(indent_levels), expr.ast_to_string(0), positive.ast_to_string(indent_levels + 1));
+                if let Some(negative) = negative_opt {
+                    result += &format!("{}else\n{}", Self::get_indent_string(indent_levels), negative.ast_to_string(indent_levels + 1));
+                }
+                result
+            },
         }
     }
 }
