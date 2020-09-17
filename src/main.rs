@@ -579,45 +579,55 @@ fn parse_program<'i>(remaining_tokens : &[&'i str]) -> Result<AstProgram<'i>, St
     })
 }
 
-fn parse_function<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFunction<'i>, &'t [&'i str]), String> {
-    if remaining_tokens.len() >= 5 {
-        let (tokens, mut remaining_tokens) = remaining_tokens.split_at(5);
-        if tokens[0] == "int" &&
-           tokens[2] == "(" &&
-           tokens[3] == ")" &&
-           tokens[4] == "{" {
-            let name = tokens[1];
+fn consume_tokens<'i, 't>(remaining_tokens : &'t [&'i str], num_tokens : usize) -> Option<(&'t [&'i str], &'t [&'i str])> {
+    if remaining_tokens.len() >= num_tokens {
+        Some(remaining_tokens.split_at(num_tokens))
+    } else {
+        None
+    }
+}
 
-            // Parse out all the block items possible.
-            let mut block_items = vec![];
-            loop {
-                let result = parse_block_item(remaining_tokens);
-                if let Ok((block_item, remaining)) = result {
-                    remaining_tokens = remaining;
-                    block_items.push(block_item);
-                } else {
-                    break;
-                }
-            }
-
-            if remaining_tokens.len() >= 1 {
-                let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-                if tokens[0] == "}" {
-                    Ok((AstFunction {
-                        name,
-                        body : block_items,
-                    }, remaining_tokens))
-                } else {
-                    Err(format!("function body missing closing brace"))
-                }
-            } else {
-                Err(format!("not enough tokens for function body closing brace"))
-            }
+fn consume_next_token<'i, 't>(remaining_tokens : &'t [&'i str], next_token : &str) -> Result<&'t [&'i str], String> {
+    if let Some((tokens, remaining_tokens)) = consume_tokens(remaining_tokens, 1) {
+        if tokens[0] == next_token {
+            Ok(remaining_tokens)
         } else {
-            Err(format!("failed to find function declaration"))
+            Err(format!("expected next token \"{}\" but found \"{}\"", next_token, tokens[0]))
         }
     } else {
-        Err(format!("not enough tokens for function declaration"))
+        Err(format!("not enough tokens left to find expected token \"{}\"", next_token))
+    }
+}
+
+fn parse_function<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFunction<'i>, &'t [&'i str]), String> {
+    let (tokens, mut remaining_tokens) = consume_tokens(remaining_tokens, 5).ok_or(format!("not enough tokens for function declaration"))?;
+
+    if tokens[0] == "int" &&
+       tokens[2] == "(" &&
+       tokens[3] == ")" &&
+       tokens[4] == "{" {
+        let name = tokens[1];
+
+        // Parse out all the block items possible.
+        let mut block_items = vec![];
+        loop {
+            let result = parse_block_item(remaining_tokens);
+            if let Ok((block_item, remaining)) = result {
+                remaining_tokens = remaining;
+                block_items.push(block_item);
+            } else {
+                break;
+            }
+        }
+
+        let remaining_tokens = consume_next_token(remaining_tokens, "}")?;
+
+        Ok((AstFunction {
+            name,
+            body : block_items,
+        }, remaining_tokens))
+    } else {
+        Err(format!("failed to find function declaration"))
     }
 }
 
@@ -632,8 +642,7 @@ fn parse_block_item<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result
 }
 
 fn parse_declaration<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstDeclaration, &'t [&'i str]), String> {
-    if original_remaining_tokens.len() >= 1 {
-        let (tokens, remaining_tokens) = original_remaining_tokens.split_at(1);
+    if let Some((tokens, remaining_tokens)) = consume_tokens(original_remaining_tokens, 1) {
         if tokens[0] == "int" {
             if remaining_tokens.len() >= 1 {
                 let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
