@@ -670,8 +670,7 @@ fn parse_function<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFu
 }
 
 fn parse_block_item<'i, 't>(tokens : &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
-    if let Ok((declaration, remaining_tokens)) = parse_declaration(tokens.0) {
-        *tokens = Tokens(remaining_tokens);
+    if let Ok(declaration) = parse_declaration(tokens) {
         Ok(AstBlockItem::Declaration(declaration))
     } else {
         parse_statement(tokens).map(|statement| {
@@ -680,21 +679,23 @@ fn parse_block_item<'i, 't>(tokens : &mut Tokens<'i, 't>) -> Result<AstBlockItem
     }
 }
 
-fn parse_declaration<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstDeclaration, &'t [&'i str]), String> {
-    let mut remaining_tokens = Tokens(original_remaining_tokens);
+fn parse_declaration<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstDeclaration, String> {
+    let mut tokens = original_tokens.clone();
 
-    remaining_tokens.consume_expected_next_token("int")?;
-    let var_name = remaining_tokens.consume_next_token()?;
+    tokens.consume_expected_next_token("int")?;
+    let var_name = tokens.consume_next_token()?;
 
     let mut expr_opt = None;
-    if remaining_tokens.consume_expected_next_token("=").is_ok() {
-        let (expr, remaining) = parse_expression(remaining_tokens.0)?;
+    if tokens.consume_expected_next_token("=").is_ok() {
+        let (expr, remaining) = parse_expression(tokens.0)?;
         expr_opt = Some(expr);
-        remaining_tokens = Tokens(remaining);
+        tokens = Tokens(remaining);
     }
 
-    remaining_tokens.consume_expected_next_token(";")?;
-    Ok((AstDeclaration::DeclareVar(String::from(var_name), expr_opt), remaining_tokens.0))
+    tokens.consume_expected_next_token(";")?;
+
+    *original_tokens = tokens;
+    Ok(AstDeclaration::DeclareVar(String::from(var_name), expr_opt))
 }
 
 fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
