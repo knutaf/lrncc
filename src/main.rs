@@ -3,6 +3,7 @@ use std::fmt;
 use std::process::*;
 use std::path::*;
 use std::collections::HashMap;
+use std::ops::Deref;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
@@ -38,6 +39,46 @@ trait AstToString {
             result += "    ";
         }
         result
+    }
+}
+
+// A wrapper around a slice of tokens with convenience functions useful for parsing.
+#[derive(PartialEq, Clone, Debug)]
+struct Tokens<'i, 't>(&'t [&'i str]);
+
+impl<'i, 't> Tokens<'i, 't> {
+    fn consume_tokens(&self, num_tokens : usize) -> Result<(Tokens<'i, 't>, Tokens<'i, 't>), String> {
+        if self.0.len() >= num_tokens {
+            let (tokens, remaining_tokens) = self.0.split_at(num_tokens);
+            Ok((Tokens(tokens), Tokens(remaining_tokens)))
+        } else {
+            Err(format!("could not find {} more token(s)", num_tokens))
+        }
+    }
+
+    fn consume_expected_next_token(&mut self, expected_token : &str) -> Result<&mut Self, String> {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        if tokens[0] == expected_token {
+            *self = remaining_tokens;
+            Ok(self)
+        } else {
+            Err(format!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]))
+        }
+    }
+
+    fn consume_next_token(&mut self) -> Result<&'i str, String> {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+        *self = remaining_tokens;
+        Ok(tokens[0])
+    }
+}
+
+impl<'i, 't> Deref for Tokens<'i, 't> {
+    type Target = &'t [&'i str];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -567,18 +608,18 @@ fn lex_all_tokens<'i>(input : &'i str) -> Result<Vec<&'i str>, String> {
     Ok(tokens)
 }
 
-fn parse_program<'i>(remaining_tokens : &[&'i str]) -> Result<AstProgram<'i>, String> {
-    parse_function(remaining_tokens).and_then(|(function, remaining_tokens)| {
-        if remaining_tokens.len() == 0 {
-            Ok(AstProgram {
-                main_function: function,
-            })
-        } else {
-            Err(format!("extra tokens after main function end: {:?}", remaining_tokens))
-        }
-    })
+fn parse_program<'i, 't>(mut tokens : Tokens<'i, 't>) -> Result<AstProgram<'i>, String> {
+    let function = parse_function(&mut tokens)?;
+    if tokens.0.len() == 0 {
+        Ok(AstProgram {
+            main_function: function,
+        })
+    } else {
+        Err(format!("extra tokens after main function end: {:?}", tokens))
+    }
 }
 
+// TODO remove
 fn consume_tokens<'i, 't>(remaining_tokens : &'t [&'i str], num_tokens : usize) -> Option<(&'t [&'i str], &'t [&'i str])> {
     if remaining_tokens.len() >= num_tokens {
         Some(remaining_tokens.split_at(num_tokens))
@@ -587,6 +628,7 @@ fn consume_tokens<'i, 't>(remaining_tokens : &'t [&'i str], num_tokens : usize) 
     }
 }
 
+// TODO remove
 fn consume_next_token<'i, 't>(remaining_tokens : &'t [&'i str], next_token : &str) -> Result<&'t [&'i str], String> {
     if let Some((tokens, remaining_tokens)) = consume_tokens(remaining_tokens, 1) {
         if tokens[0] == next_token {
@@ -599,121 +641,81 @@ fn consume_next_token<'i, 't>(remaining_tokens : &'t [&'i str], next_token : &st
     }
 }
 
-fn parse_function<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFunction<'i>, &'t [&'i str]), String> {
-    let (tokens, mut remaining_tokens) = consume_tokens(remaining_tokens, 5).ok_or(format!("not enough tokens for function declaration"))?;
+fn parse_function<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFunction<'i>, String> {
+    let mut tokens = original_tokens.clone();
 
-    if tokens[0] == "int" &&
-       tokens[2] == "(" &&
-       tokens[3] == ")" &&
-       tokens[4] == "{" {
-        let name = tokens[1];
+    tokens.consume_expected_next_token("int")?;
+    let name = tokens.consume_next_token()?;
+    tokens.consume_expected_next_token("(")?;
+    tokens.consume_expected_next_token(")")?;
+    tokens.consume_expected_next_token("{")?;
 
-        // Parse out all the block items possible.
-        let mut block_items = vec![];
-        loop {
-            let result = parse_block_item(remaining_tokens);
-            if let Ok((block_item, remaining)) = result {
-                remaining_tokens = remaining;
-                block_items.push(block_item);
-            } else {
-                break;
-            }
+    // Parse out all the block items possible.
+    let mut block_items = vec![];
+    loop {
+        if let Ok(block_item) = parse_block_item(&mut tokens) {
+            block_items.push(block_item);
+        } else {
+            break;
         }
-
-        let remaining_tokens = consume_next_token(remaining_tokens, "}")?;
-
-        Ok((AstFunction {
-            name,
-            body : block_items,
-        }, remaining_tokens))
-    } else {
-        Err(format!("failed to find function declaration"))
     }
+
+    tokens.consume_expected_next_token("}")?;
+
+    *original_tokens = tokens;
+    Ok(AstFunction {
+        name,
+        body : block_items,
+    })
 }
 
-fn parse_block_item<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstBlockItem, &'t [&'i str]), String> {
-    if let Ok((declaration, remaining_tokens)) = parse_declaration(original_remaining_tokens) {
-        Ok((AstBlockItem::Declaration(declaration), remaining_tokens))
+fn parse_block_item<'i, 't>(tokens : &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
+    if let Ok((declaration, remaining_tokens)) = parse_declaration(tokens.0) {
+        *tokens = Tokens(remaining_tokens);
+        Ok(AstBlockItem::Declaration(declaration))
     } else {
-        parse_statement(original_remaining_tokens).map(|(statement, remaining_tokens)| {
-            (AstBlockItem::Statement(statement), remaining_tokens)
+        parse_statement(tokens).map(|statement| {
+            AstBlockItem::Statement(statement)
         })
     }
 }
 
 fn parse_declaration<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstDeclaration, &'t [&'i str]), String> {
-    if let Some((tokens, remaining_tokens)) = consume_tokens(original_remaining_tokens, 1) {
-        if tokens[0] == "int" {
-            if remaining_tokens.len() >= 1 {
-                let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-                let var_name = tokens[0];
-                if remaining_tokens.len() >= 1 {
-                    let (mut tokens, mut remaining_tokens) = remaining_tokens.split_at(1);
-                    let mut expr_opt = None;
-                    if tokens[0] == "=" {
-                        if let Ok((expr, remaining)) = parse_expression(remaining_tokens) {
-                            expr_opt = Some(expr);
-                            remaining_tokens = remaining;
+    let mut remaining_tokens = Tokens(original_remaining_tokens);
 
-                            if remaining_tokens.len() >= 1 {
-                                let (t, r) = remaining_tokens.split_at(1);
-                                tokens = t;
-                                remaining_tokens = r;
-                            }
-                        }
-                    }
+    remaining_tokens.consume_expected_next_token("int")?;
+    let var_name = remaining_tokens.consume_next_token()?;
 
-                    if tokens[0] == ";" {
-                        Ok((AstDeclaration::DeclareVar(String::from(var_name), expr_opt), remaining_tokens))
-                    } else {
-                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
-                    }
-                } else {
-                    Err(format!("not enough tokens for ending semicolon"))
-                }
-            } else {
-                Err(format!("not enough tokens for variable name."))
-            }
-        } else {
-            Err(format!("incorrect token \"{}\" to start declaration", tokens[0]))
-        }
-    } else {
-        Err(format!("not enough tokens for statement"))
+    let mut expr_opt = None;
+    if remaining_tokens.consume_expected_next_token("=").is_ok() {
+        let (expr, remaining) = parse_expression(remaining_tokens.0)?;
+        expr_opt = Some(expr);
+        remaining_tokens = Tokens(remaining);
     }
+
+    remaining_tokens.consume_expected_next_token(";")?;
+    Ok((AstDeclaration::DeclareVar(String::from(var_name), expr_opt), remaining_tokens.0))
 }
 
-fn parse_statement<'i, 't>(original_remaining_tokens : &'t [&'i str]) -> Result<(AstStatement, &'t [&'i str]), String> {
-    if original_remaining_tokens.len() >= 1 {
-        let (tokens, remaining_tokens) = original_remaining_tokens.split_at(1);
-        if tokens[0] == "return" {
-            parse_expression(remaining_tokens).and_then(|(expr, remaining_tokens)| {
-                if remaining_tokens.len() >= 1 {
-                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-                    if tokens[0] == ";" {
-                        Ok((AstStatement::Return(expr), remaining_tokens))
-                    } else {
-                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
-                    }
-                } else {
-                    Err(format!("not enough tokens for ending semicolon"))
-                }
-            })
-        } else {
-            parse_expression(original_remaining_tokens).and_then(|(expr, remaining_tokens)| {
-                if remaining_tokens.len() >= 1 {
-                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-                    if tokens[0] == ";" {
-                        Ok((AstStatement::Expression(expr), remaining_tokens))
-                    } else {
-                        Err(format!("statement must end with semicolon. instead ends with {}", tokens[0]))
-                    }
-                } else {
-                    Err(format!("not enough tokens for ending semicolon"))
-                }
-            })
-        }
+fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
+    let mut tokens = original_tokens.clone();
+
+    if tokens.consume_expected_next_token("return").is_ok() {
+        parse_expression(tokens.0).and_then(|(expr, remaining_tokens)| {
+            tokens = Tokens(remaining_tokens);
+            tokens.consume_expected_next_token(";")?;
+
+            *original_tokens = tokens;
+            Ok(AstStatement::Return(expr))
+        })
     } else {
-        Err(format!("not enough tokens for statement"))
+        parse_expression(tokens.0).and_then(|(expr, remaining_tokens)| {
+            tokens = Tokens(remaining_tokens);
+            tokens.consume_expected_next_token(";")?;
+
+            *original_tokens = tokens;
+            Ok(AstStatement::Expression(expr))
+        })
     }
 }
 
@@ -1048,7 +1050,7 @@ fn compile_and_link(input : &str, output_exe : &str, should_suppress_output : bo
 
         println!();
 
-        parse_program(&tokens).and_then(|ast| {
+        parse_program(Tokens(&tokens)).and_then(|ast| {
             println!("AST:\n{}\n", ast);
 
             generate_program_code(&ast).and_then(|asm| {
