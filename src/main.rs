@@ -76,12 +76,25 @@ impl<'i, 't> Tokens<'i, 't> {
     fn consume_variable_name(&mut self) -> Result<&'i str, String> {
         let (tokens, remaining_tokens) = self.consume_tokens(1)?;
 
+        // TODO move is_token_variable_name into this impl
         if is_token_variable_name(tokens[0]) {
             *self = remaining_tokens;
             Ok(tokens[0])
         } else {
             Err(format!("token \"{}\" is not a variable name", tokens[0]))
         }
+    }
+
+    fn consume_integer_literal(&mut self) -> Result<u32, String> {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        let result = tokens[0].parse::<u32>().or(Err(format!("token \"{}\" is not a variable name", tokens[0])));
+
+        if result.is_ok() {
+            *self = remaining_tokens;
+        }
+
+        result
     }
 }
 
@@ -416,6 +429,18 @@ impl AstToString for AstFactor {
     }
 }
 
+impl std::str::FromStr for AstUnaryOperator {
+    type Err = String;
+    fn from_str(s : &str) -> Result<Self, Self::Err> {
+        match s {
+            "-" => Ok(AstUnaryOperator::Negation),
+            "~" => Ok(AstUnaryOperator::BitwiseNot),
+            "!" => Ok(AstUnaryOperator::LogicalNot),
+            _ => Err(format!("unknown operator {}", s)),
+        }
+    }
+}
+
 impl std::str::FromStr for AstLogicalOrExpressionBinaryOperator {
     type Err = String;
     fn from_str(s : &str) -> Result<Self, Self::Err> {
@@ -630,28 +655,6 @@ fn parse_program<'i, 't>(mut tokens : Tokens<'i, 't>) -> Result<AstProgram<'i>, 
     }
 }
 
-// TODO remove
-fn consume_tokens<'i, 't>(remaining_tokens : &'t [&'i str], num_tokens : usize) -> Option<(&'t [&'i str], &'t [&'i str])> {
-    if remaining_tokens.len() >= num_tokens {
-        Some(remaining_tokens.split_at(num_tokens))
-    } else {
-        None
-    }
-}
-
-// TODO remove
-fn consume_next_token<'i, 't>(remaining_tokens : &'t [&'i str], next_token : &str) -> Result<&'t [&'i str], String> {
-    if let Some((tokens, remaining_tokens)) = consume_tokens(remaining_tokens, 1) {
-        if tokens[0] == next_token {
-            Ok(remaining_tokens)
-        } else {
-            Err(format!("expected next token \"{}\" but found \"{}\"", next_token, tokens[0]))
-        }
-    } else {
-        Err(format!("not enough tokens left to find expected token \"{}\"", next_token))
-    }
-}
-
 fn parse_function<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFunction<'i>, String> {
     let mut tokens = original_tokens.clone();
 
@@ -723,44 +726,33 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
 }
 
 fn parse_factor<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFactor, String> {
-    // TODO convert
-    let remaining_tokens = original_tokens.0;
+    let mut tokens = original_tokens.clone();
 
-    if remaining_tokens.len() >= 1 {
-        let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-        if let Ok(integer_literal) = tokens[0].parse::<u32>() {
-            *original_tokens = Tokens(remaining_tokens);
-            Ok(AstFactor::Constant(integer_literal))
-        } else if tokens[0] == "(" {
-            let mut tokens = Tokens(remaining_tokens);
-            let inner = parse_expression(&mut tokens)?;
-            tokens.consume_expected_next_token(")")?;
+    if let Ok(integer_literal) = tokens.consume_integer_literal() {
+        *original_tokens = tokens;
+        Ok(AstFactor::Constant(integer_literal))
+    } else if tokens.consume_expected_next_token("(").is_ok() {
+        let inner = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
 
-            *original_tokens = tokens;
-            Ok(AstFactor::Expression(Box::new(inner)))
-        } else {
-            match tokens[0] {
-                "-" => Ok((AstUnaryOperator::Negation, remaining_tokens)),
-                "~" => Ok((AstUnaryOperator::BitwiseNot, remaining_tokens)),
-                "!" => Ok((AstUnaryOperator::LogicalNot, remaining_tokens)),
-                _ => Err(format!("unknown operator {}", tokens[0]))
-            }.and_then(|(operator, remaining_tokens)| {
-                let mut tokens = Tokens(remaining_tokens);
-                parse_factor(&mut tokens).and_then(|inner| {
-                    *original_tokens = tokens;
-                    Ok(AstFactor::UnaryOperator(operator, Box::new(inner)))
-                })
-            }).or_else(|_err| {
-                if is_token_variable_name(tokens[0]) {
-                    *original_tokens = Tokens(remaining_tokens);
-                    Ok(AstFactor::Variable(String::from(tokens[0])))
-                } else {
-                    Err(format!("unknown operator or variable name {}", tokens[0]))
-                }
-            })
-        }
+        *original_tokens = tokens;
+        Ok(AstFactor::Expression(Box::new(inner)))
     } else {
-        Err(format!("not enough tokens for factor"))
+        // TODO add a consume with FromStr
+        let token = tokens.consume_next_token()?;
+        if let Ok(operator) = token.parse::<AstUnaryOperator>() {
+            parse_factor(&mut tokens).map(|inner| {
+                *original_tokens = tokens;
+                AstFactor::UnaryOperator(operator, Box::new(inner))
+            })
+        } else {
+            if is_token_variable_name(token) {
+                *original_tokens = tokens;
+                Ok(AstFactor::Variable(String::from(token)))
+            } else {
+                Err(format!("unknown operator or variable name {}", token))
+            }
+        }
     }
 }
 
