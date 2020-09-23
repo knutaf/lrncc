@@ -72,6 +72,17 @@ impl<'i, 't> Tokens<'i, 't> {
         *self = remaining_tokens;
         Ok(tokens[0])
     }
+
+    fn consume_variable_name(&mut self) -> Result<&'i str, String> {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        if is_token_variable_name(tokens[0]) {
+            *self = remaining_tokens;
+            Ok(tokens[0])
+        } else {
+            Err(format!("token \"{}\" is not a variable name", tokens[0]))
+        }
+    }
 }
 
 impl<'i, 't> Deref for Tokens<'i, 't> {
@@ -687,9 +698,7 @@ fn parse_declaration<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<As
 
     let mut expr_opt = None;
     if tokens.consume_expected_next_token("=").is_ok() {
-        let (expr, remaining) = parse_expression(tokens.0)?;
-        expr_opt = Some(expr);
-        tokens = Tokens(remaining);
+        expr_opt = Some(parse_expression(&mut tokens)?);
     }
 
     tokens.consume_expected_next_token(";")?;
@@ -701,43 +710,34 @@ fn parse_declaration<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<As
 fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
     let mut tokens = original_tokens.clone();
 
+    let statement;
     if tokens.consume_expected_next_token("return").is_ok() {
-        parse_expression(tokens.0).and_then(|(expr, remaining_tokens)| {
-            tokens = Tokens(remaining_tokens);
-            tokens.consume_expected_next_token(";")?;
-
-            *original_tokens = tokens;
-            Ok(AstStatement::Return(expr))
-        })
+        statement = AstStatement::Return(parse_expression(&mut tokens)?)
     } else {
-        parse_expression(tokens.0).and_then(|(expr, remaining_tokens)| {
-            tokens = Tokens(remaining_tokens);
-            tokens.consume_expected_next_token(";")?;
-
-            *original_tokens = tokens;
-            Ok(AstStatement::Expression(expr))
-        })
+        statement = AstStatement::Expression(parse_expression(&mut tokens)?)
     }
+
+    tokens.consume_expected_next_token(";")?;
+    *original_tokens = tokens;
+    Ok(statement)
 }
 
-fn parse_factor<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFactor, &'t [&'i str]), String> {
+fn parse_factor<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFactor, String> {
+    // TODO convert
+    let remaining_tokens = original_tokens.0;
+
     if remaining_tokens.len() >= 1 {
         let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
         if let Ok(integer_literal) = tokens[0].parse::<u32>() {
-            Ok((AstFactor::Constant(integer_literal), remaining_tokens))
+            *original_tokens = Tokens(remaining_tokens);
+            Ok(AstFactor::Constant(integer_literal))
         } else if tokens[0] == "(" {
-            parse_expression(remaining_tokens).and_then(|(inner, remaining_tokens)| {
-                if remaining_tokens.len() >= 1 {
-                    let (tokens, remaining_tokens) = remaining_tokens.split_at(1);
-                    if tokens[0] == ")" {
-                        Ok((AstFactor::Expression(Box::new(inner)), remaining_tokens))
-                    } else {
-                        Err(format!("expecting closing parenthesis. found {}", tokens[0]))
-                    }
-                } else {
-                     Err(format!("missing closing parenthesis"))
-                }
-            })
+            let mut tokens = Tokens(remaining_tokens);
+            let inner = parse_expression(&mut tokens)?;
+            tokens.consume_expected_next_token(")")?;
+
+            *original_tokens = tokens;
+            Ok(AstFactor::Expression(Box::new(inner)))
         } else {
             match tokens[0] {
                 "-" => Ok((AstUnaryOperator::Negation, remaining_tokens)),
@@ -745,12 +745,15 @@ fn parse_factor<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFactor, 
                 "!" => Ok((AstUnaryOperator::LogicalNot, remaining_tokens)),
                 _ => Err(format!("unknown operator {}", tokens[0]))
             }.and_then(|(operator, remaining_tokens)| {
-                parse_factor(remaining_tokens).and_then(|(inner, remaining_tokens)| {
-                    Ok((AstFactor::UnaryOperator(operator, Box::new(inner)), remaining_tokens))
+                let mut tokens = Tokens(remaining_tokens);
+                parse_factor(&mut tokens).and_then(|inner| {
+                    *original_tokens = tokens;
+                    Ok(AstFactor::UnaryOperator(operator, Box::new(inner)))
                 })
             }).or_else(|_err| {
                 if is_token_variable_name(tokens[0]) {
-                    Ok((AstFactor::Variable(String::from(tokens[0])), remaining_tokens))
+                    *original_tokens = Tokens(remaining_tokens);
+                    Ok(AstFactor::Variable(String::from(tokens[0])))
                 } else {
                     Err(format!("unknown operator or variable name {}", tokens[0]))
                 }
@@ -762,26 +765,29 @@ fn parse_factor<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstFactor, 
 }
 
 fn parse_expression_level<'i, 't, TOperator, TInner>(
-    remaining_tokens : &'t [&'i str],
-    parse_inner : fn(&'t [&'i str]) -> Result<(TInner, &'t [&'i str]), String>
+    original_tokens : &mut Tokens<'i, 't>,
+    parse_inner : fn(&mut Tokens<'i, 't>) -> Result<TInner, String>
     )
-    -> Result<(AstExpressionLevel<TOperator, TInner>, &'t [&'i str]), String>
+    -> Result<AstExpressionLevel<TOperator, TInner>, String>
     where TOperator : std::str::FromStr
-    {
-    parse_inner(remaining_tokens).and_then(|(inner1, mut remaining_tokens)| {
+{
+    let mut tokens = original_tokens.clone();
+
+    parse_inner(&mut tokens).and_then(|inner1| {
+        let mut rhs_tokens = tokens.clone();
         let mut expr = AstExpressionLevel::<TOperator, TInner>::new(inner1);
-        while remaining_tokens.len() > 0 {
-            let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(1);
-            let binary_op = tokens[0].parse::<TOperator>();
+        // TODO convert
+        while let Ok(op_token) = rhs_tokens.consume_next_token() {
+            let binary_op = op_token.parse::<TOperator>();
 
             if let Ok(operator) = binary_op {
-                if let Ok((inner2, remaining_expression_tokens)) = parse_inner(remaining_expression_tokens) {
+                if let Ok(inner2) = parse_inner(&mut rhs_tokens) {
                     expr.binary_ops.push(AstBinaryOperation {
                         operator,
                         rhs : inner2,
                     });
 
-                    remaining_tokens = remaining_expression_tokens;
+                    tokens = rhs_tokens.clone();
                 } else {
                     break;
                 }
@@ -790,47 +796,54 @@ fn parse_expression_level<'i, 't, TOperator, TInner>(
             }
         }
 
-        Ok((expr, remaining_tokens))
+        *original_tokens = tokens;
+        Ok(expr)
     })
 }
 
-fn parse_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstExpression, &'t [&'i str]), String> {
-    if remaining_tokens.len() >= 2 {
-        let (tokens, remaining_expression_tokens) = remaining_tokens.split_at(2);
-        if tokens[1] == "=" && is_token_variable_name(tokens[0]) {
-            if let Ok((expr, remaining_expression_tokens)) = parse_expression(remaining_expression_tokens) {
-                return Ok((AstExpression::Assign(String::from(tokens[0]), Box::new(expr)), remaining_expression_tokens));
-            }
-        }
+fn parse_assignment_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+    let mut tokens = original_tokens.clone();
+
+    let variable_name = tokens.consume_variable_name()?;
+    tokens.consume_expected_next_token("=")?;
+
+    let expr = parse_expression(&mut tokens)?;
+    *original_tokens = tokens;
+    Ok(AstExpression::Assign(String::from(variable_name), Box::new(expr)))
+}
+
+fn parse_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+    if let Ok(assignment) = parse_assignment_expression(original_tokens) {
+        Ok(assignment)
+    } else {
+        parse_logical_or_expression(original_tokens).map(|expr| {
+            AstExpression::Or(expr)
+        })
     }
-
-    parse_logical_or_expression(remaining_tokens).and_then(|(expr, remaining_tokens)| {
-        Ok((AstExpression::Or(expr), remaining_tokens))
-    })
 }
 
-fn parse_logical_or_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstLogicalOrExpression, &'t [&'i str]), String> {
-    parse_expression_level::<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpression>(remaining_tokens, parse_logical_and_expression)
+fn parse_logical_or_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstLogicalOrExpression, String> {
+    parse_expression_level::<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpression>(original_tokens, parse_logical_and_expression)
 }
 
-fn parse_logical_and_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstLogicalAndExpression, &'t [&'i str]), String> {
-    parse_expression_level::<AstLogicalAndExpressionBinaryOperator, AstEqualityExpression>(remaining_tokens, parse_equality_expression)
+fn parse_logical_and_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstLogicalAndExpression, String> {
+    parse_expression_level::<AstLogicalAndExpressionBinaryOperator, AstEqualityExpression>(original_tokens, parse_equality_expression)
 }
 
-fn parse_equality_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstEqualityExpression, &'t [&'i str]), String> {
-    parse_expression_level::<AstEqualityExpressionBinaryOperator, AstRelationalExpression>(remaining_tokens, parse_relational_expression)
+fn parse_equality_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstEqualityExpression, String> {
+    parse_expression_level::<AstEqualityExpressionBinaryOperator, AstRelationalExpression>(original_tokens, parse_relational_expression)
 }
 
-fn parse_relational_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstRelationalExpression, &'t [&'i str]), String> {
-    parse_expression_level::<AstRelationalExpressionBinaryOperator, AstAdditiveExpression>(remaining_tokens, parse_additive_expression)
+fn parse_relational_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstRelationalExpression, String> {
+    parse_expression_level::<AstRelationalExpressionBinaryOperator, AstAdditiveExpression>(original_tokens, parse_additive_expression)
 }
 
-fn parse_additive_expression<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstAdditiveExpression, &'t [&'i str]), String> {
-    parse_expression_level::<AstAdditiveExpressionBinaryOperator, AstTerm>(remaining_tokens, parse_term)
+fn parse_additive_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstAdditiveExpression, String> {
+    parse_expression_level::<AstAdditiveExpressionBinaryOperator, AstTerm>(original_tokens, parse_term)
 }
 
-fn parse_term<'i, 't>(remaining_tokens : &'t [&'i str]) -> Result<(AstTerm, &'t [&'i str]), String> {
-    parse_expression_level::<AstTermBinaryOperator, AstFactor>(remaining_tokens, parse_factor)
+fn parse_term<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstTerm, String> {
+    parse_expression_level::<AstTermBinaryOperator, AstFactor>(original_tokens, parse_factor)
 }
 
 fn get_register_name(register_name : &str, width : u32) -> String {
