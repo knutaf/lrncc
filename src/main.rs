@@ -22,14 +22,6 @@ fn generate_random_string(len : usize) -> String {
         .collect()
 }
 
-fn is_token_variable_name(token : &str) -> bool {
-    lazy_static! {
-        static ref VAR_REGEX : Regex = Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
-    }
-
-    VAR_REGEX.find(token).is_some()
-}
-
 trait AstToString {
     fn ast_to_string(&self, indent_levels : u32) -> String;
 
@@ -74,9 +66,16 @@ impl<'i, 't> Tokens<'i, 't> {
     }
 
     fn consume_variable_name(&mut self) -> Result<&'i str, String> {
+        fn is_token_variable_name(token : &str) -> bool {
+            lazy_static! {
+                static ref VAR_REGEX : Regex = Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
+            }
+
+            VAR_REGEX.find(token).is_some()
+        }
+
         let (tokens, remaining_tokens) = self.consume_tokens(1)?;
 
-        // TODO move is_token_variable_name into this impl
         if is_token_variable_name(tokens[0]) {
             *self = remaining_tokens;
             Ok(tokens[0])
@@ -757,32 +756,20 @@ fn parse_expression_level<'i, 't, TOperator, TInner>(
 {
     let mut tokens = original_tokens.clone();
 
-    parse_inner(&mut tokens).and_then(|inner1| {
-        let mut rhs_tokens = tokens.clone();
-        let mut expr = AstExpressionLevel::<TOperator, TInner>::new(inner1);
-        // TODO convert
-        while let Ok(op_token) = rhs_tokens.consume_next_token() {
-            let binary_op = op_token.parse::<TOperator>();
+    let inner1 = parse_inner(&mut tokens)?;
+    let mut expr = AstExpressionLevel::<TOperator, TInner>::new(inner1);
 
-            if let Ok(operator) = binary_op {
-                if let Ok(inner2) = parse_inner(&mut rhs_tokens) {
-                    expr.binary_ops.push(AstBinaryOperation {
-                        operator,
-                        rhs : inner2,
-                    });
+    while let Ok(operator) = tokens.consume_and_parse_next_token::<TOperator>() {
+        let rhs = parse_inner(&mut tokens)?;
 
-                    tokens = rhs_tokens.clone();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+        expr.binary_ops.push(AstBinaryOperation {
+            operator,
+            rhs,
+        });
+    }
 
-        *original_tokens = tokens;
-        Ok(expr)
-    })
+    *original_tokens = tokens;
+    Ok(expr)
 }
 
 fn parse_assignment_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
