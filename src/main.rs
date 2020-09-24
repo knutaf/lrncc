@@ -85,10 +85,11 @@ impl<'i, 't> Tokens<'i, 't> {
         }
     }
 
-    fn consume_integer_literal(&mut self) -> Result<u32, String> {
+    fn consume_and_parse_next_token<T>(&mut self) -> Result<T, String>
+    where T : std::str::FromStr {
         let (tokens, remaining_tokens) = self.consume_tokens(1)?;
 
-        let result = tokens[0].parse::<u32>().or(Err(format!("token \"{}\" is not a variable name", tokens[0])));
+        let result = tokens[0].parse::<T>().or(Err(format!("token \"{}\" can't be parsed", tokens[0])));
 
         if result.is_ok() {
             *self = remaining_tokens;
@@ -728,31 +729,22 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
 fn parse_factor<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFactor, String> {
     let mut tokens = original_tokens.clone();
 
-    if let Ok(integer_literal) = tokens.consume_integer_literal() {
+    if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
         *original_tokens = tokens;
         Ok(AstFactor::Constant(integer_literal))
     } else if tokens.consume_expected_next_token("(").is_ok() {
         let inner = parse_expression(&mut tokens)?;
         tokens.consume_expected_next_token(")")?;
-
         *original_tokens = tokens;
         Ok(AstFactor::Expression(Box::new(inner)))
+    } else if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
+        let inner = parse_factor(&mut tokens)?;
+        *original_tokens = tokens;
+        Ok(AstFactor::UnaryOperator(operator, Box::new(inner)))
     } else {
-        // TODO add a consume with FromStr
-        let token = tokens.consume_next_token()?;
-        if let Ok(operator) = token.parse::<AstUnaryOperator>() {
-            parse_factor(&mut tokens).map(|inner| {
-                *original_tokens = tokens;
-                AstFactor::UnaryOperator(operator, Box::new(inner))
-            })
-        } else {
-            if is_token_variable_name(token) {
-                *original_tokens = tokens;
-                Ok(AstFactor::Variable(String::from(token)))
-            } else {
-                Err(format!("unknown operator or variable name {}", token))
-            }
-        }
+        let variable_name = tokens.consume_variable_name()?;
+        *original_tokens = tokens;
+        Ok(AstFactor::Variable(String::from(variable_name)))
     }
 }
 
