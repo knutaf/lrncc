@@ -335,7 +335,7 @@ impl AstToString for AstStatement {
             AstStatement::Conditional(expr, positive, negative_opt) => {
                 let mut result = format!("{}if ({})\n{}", Self::get_indent_string(indent_levels), expr.ast_to_string(0), positive.ast_to_string(indent_levels + 1));
                 if let Some(negative) = negative_opt {
-                    result += &format!("{}else\n{}", Self::get_indent_string(indent_levels), negative.ast_to_string(indent_levels + 1));
+                    result += &format!("\n{}else\n{}", Self::get_indent_string(indent_levels), negative.ast_to_string(indent_levels + 1));
                 }
                 result
             },
@@ -715,12 +715,27 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
 
     let statement;
     if tokens.consume_expected_next_token("return").is_ok() {
-        statement = AstStatement::Return(parse_expression(&mut tokens)?)
+        statement = AstStatement::Return(parse_expression(&mut tokens)?);
+        tokens.consume_expected_next_token(";")?;
+    } else if tokens.consume_expected_next_token("if").is_ok() {
+        tokens.consume_expected_next_token("(")?;
+        let expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+        let positive = parse_statement(&mut tokens)?;
+
+        let negative;
+        if tokens.consume_expected_next_token("else").is_ok() {
+            negative = Some(Box::new(parse_statement(&mut tokens)?));
+        } else {
+            negative = None;
+        }
+
+        statement = AstStatement::Conditional(expr, Box::new(positive), negative);
     } else {
-        statement = AstStatement::Expression(parse_expression(&mut tokens)?)
+        statement = AstStatement::Expression(parse_expression(&mut tokens)?);
+        tokens.consume_expected_next_token(";")?;
     }
 
-    tokens.consume_expected_next_token(";")?;
     *original_tokens = tokens;
     Ok(statement)
 }
