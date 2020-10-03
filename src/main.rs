@@ -98,6 +98,7 @@ enum AstExpression {
     UnaryOperator(AstUnaryOperator, Box<AstExpression>),
     BinaryOperator(AstBinaryOperator, Box<AstExpression>, Box<AstExpression>),
     Assign(String, Box<AstExpression>),
+    Conditional(Box<AstExpression>, Box<AstExpression>, Box<AstExpression>),
 }
 
 struct CodegenGlobalState {
@@ -312,6 +313,7 @@ impl AstToString for AstExpression {
             AstExpression::UnaryOperator(operator, expr) => format!("{}{}", operator.ast_to_string(0), expr.ast_to_string(0)),
             AstExpression::Assign(name, expr) => format!("{} = {}", name, expr.ast_to_string(indent_levels)),
             AstExpression::BinaryOperator(operator, left, right) => format!("({}) {} ({})", left.ast_to_string(0), operator.ast_to_string(0), right.ast_to_string(0)),
+            AstExpression::Conditional(condition, positive, negative) => format!("({}) ? ({}) : ({})", condition.ast_to_string(0), positive.ast_to_string(0), negative.ast_to_string(0)),
         }
     }
 }
@@ -600,7 +602,27 @@ fn parse_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<Ast
     if let Ok(assignment) = parse_assignment_expression(original_tokens) {
         Ok(assignment)
     } else {
-        parse_binary_operator_level(original_tokens, MAX_EXPRESSION_LEVEL)
+        parse_conditional_expression(original_tokens)
+    }
+}
+
+fn parse_conditional_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+    let mut tokens = original_tokens.clone();
+
+    // Parse logical-or expression
+    let expr1 = parse_binary_operator_level(&mut tokens, MAX_EXPRESSION_LEVEL)?;
+
+    if tokens.consume_expected_next_token("?").is_ok() {
+        // parse full expression
+        let expr2 = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(":")?;
+        let expr3 = parse_conditional_expression(&mut tokens)?;
+
+        *original_tokens = tokens;
+        Ok(AstExpression::Conditional(Box::new(expr1), Box::new(expr2), Box::new(expr3)))
+    } else {
+        *original_tokens = tokens;
+        Ok(expr1)
     }
 }
 
@@ -692,7 +714,39 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : 
         AstStatement::Expression(expr) => {
             generate_expression_code(global_state, func_state, expr)
         },
-        _ => Err(format!("unsupported statement {:?}", ast_statement)),
+        AstStatement::Conditional(condition, positive, negative_opt) => {
+            let after_pos_label = global_state.consume_jump_label();
+            let mut code = generate_expression_code(global_state, func_state, condition)?;
+
+            // Check if the conditional expression was true or false.
+            code += "\n    cmp rax,0";
+
+            // If it was false, jump to the section after the positive portion.
+            code += &format!("\n    je _j{}", after_pos_label);
+
+            // Otherwise, execute the positive section.
+            code += "\n    ";
+            code += &generate_statement_code(global_state, func_state, positive)?;
+
+            // Check if there is an else clause.
+            if let Some(negative) = negative_opt {
+                let negative_code = generate_statement_code(global_state, func_state, negative)?;
+                let after_neg_label = global_state.consume_jump_label();
+                // At the end of the positive section, jump over the negative section so that both aren't executed.
+                code += &format!("\n    jmp _j{}", after_neg_label);
+
+                // Start of the negative section.
+                code += &format!("\n    _j{}:", after_pos_label);
+                code += "\n    ";
+                code += &negative_code;
+                code += &format!("\n    _j{}:", after_neg_label);
+            } else {
+                // There was no else clause, so the label after the positive section is the end.
+                code += &format!("\n    _j{}:", after_pos_label);
+            }
+
+            Ok(code)
+        },
     }
 }
 
@@ -755,6 +809,8 @@ fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state :
                 })
             })
         },
+        // TODO implement
+        AstExpression::Conditional(condition, positive, negative) => panic!("not implemented"),
     }
 }
 
@@ -1248,6 +1304,7 @@ r"int main() {{
                 assert!(false, "compile succeeded but expected failure");
             }
         } else {
+            println!("compile failed! {:?}", compile_result);
             assert!(expected_result.is_none());
         }
     }
@@ -1370,5 +1427,15 @@ r"int main() {{
     #[test]
     fn test_codegen_unknown_variable() {
         test_codegen_mainfunc_failure("return x;");
+    }
+
+    #[test]
+    fn test_codegen_if_assign() {
+        test_codegen_mainfunc("int x = 5; if (x == 5) x = 4; return x;", 4);
+    }
+
+    #[test]
+    fn test_codegen_if_else_assign() {
+        test_codegen_mainfunc("int x = 5; if (x == 5) x = 4; else x == 6; if (x == 6) x = 7; else x = 8; return x;", 8);
     }
 }
