@@ -38,78 +38,6 @@ trait AstToString {
 #[derive(PartialEq, Clone, Debug)]
 struct Tokens<'i, 't>(&'t [&'i str]);
 
-impl<'i, 't> Tokens<'i, 't> {
-    fn consume_tokens(&self, num_tokens : usize) -> Result<(Tokens<'i, 't>, Tokens<'i, 't>), String> {
-        if self.0.len() >= num_tokens {
-            let (tokens, remaining_tokens) = self.0.split_at(num_tokens);
-            Ok((Tokens(tokens), Tokens(remaining_tokens)))
-        } else {
-            Err(format!("could not find {} more token(s)", num_tokens))
-        }
-    }
-
-    fn consume_expected_next_token(&mut self, expected_token : &str) -> Result<&mut Self, String> {
-        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
-
-        if tokens[0] == expected_token {
-            *self = remaining_tokens;
-            Ok(self)
-        } else {
-            Err(format!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]))
-        }
-    }
-
-    fn consume_next_token(&mut self) -> Result<&'i str, String> {
-        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
-        *self = remaining_tokens;
-        Ok(tokens[0])
-    }
-
-    fn consume_variable_name(&mut self) -> Result<&'i str, String> {
-        fn is_token_variable_name(token : &str) -> bool {
-            lazy_static! {
-                static ref VAR_REGEX : Regex = Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
-            }
-
-            VAR_REGEX.find(token).is_some()
-        }
-
-        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
-
-        if is_token_variable_name(tokens[0]) {
-            *self = remaining_tokens;
-            Ok(tokens[0])
-        } else {
-            Err(format!("token \"{}\" is not a variable name", tokens[0]))
-        }
-    }
-
-    fn consume_and_parse_next_token<T>(&mut self) -> Result<T, String>
-    where T : std::str::FromStr {
-        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
-
-        let result = tokens[0].parse::<T>().or(Err(format!("token \"{}\" can't be parsed", tokens[0])));
-
-        if result.is_ok() {
-            *self = remaining_tokens;
-        }
-
-        result
-    }
-}
-
-impl<'i, 't> Deref for Tokens<'i, 't> {
-    type Target = &'t [&'i str];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-trait BinaryOperatorCodeGenerator {
-    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String;
-}
-
 #[derive(PartialEq, Clone, Debug)]
 struct AstProgram<'i> {
     main_function : AstFunction<'i>,
@@ -141,42 +69,6 @@ enum AstStatement {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-enum AstLogicalOrExpressionBinaryOperator {
-    Or,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstLogicalAndExpressionBinaryOperator {
-    And,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstEqualityExpressionBinaryOperator {
-    Equals,
-    NotEquals,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstRelationalExpressionBinaryOperator {
-    LessThan,
-    GreaterThan,
-    LessThanEqual,
-    GreaterThanEqual,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstAdditiveExpressionBinaryOperator {
-    Plus,
-    Minus,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstTermBinaryOperator {
-    Multiply,
-    Divide,
-}
-
-#[derive(PartialEq, Clone, Debug)]
 enum AstUnaryOperator {
     Negation,
     BitwiseNot,
@@ -184,44 +76,29 @@ enum AstUnaryOperator {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-enum AstFactor {
-    Constant(u32),
-    Variable(String), // TODO use a string slice
-    UnaryOperator(AstUnaryOperator, Box<AstFactor>),
-    Expression(Box<AstExpression>),
-}
-
-#[derive(PartialEq, Clone, Debug)]
-struct AstBinaryOperation<TOperator, TRhs> {
-    operator : TOperator,
-    rhs : TRhs
+enum AstBinaryOperator {
+    Or,
+    And,
+    Equals,
+    NotEquals,
+    LessThan,
+    GreaterThan,
+    LessThanEqual,
+    GreaterThanEqual,
+    Plus,
+    Minus,
+    Multiply,
+    Divide,
 }
 
 #[derive(PartialEq, Clone, Debug)]
 enum AstExpression {
+    Constant(u32),
+    Variable(String), // TODO use a string slice
+    UnaryOperator(AstUnaryOperator, Box<AstExpression>),
+    BinaryOperator(AstBinaryOperator, Box<AstExpression>, Box<AstExpression>),
     Assign(String, Box<AstExpression>),
-    Or(AstLogicalOrExpression),
 }
-
-type AstLogicalOrExpressionBinaryOperation = AstBinaryOperation<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpressionBinaryOperation>;
-type AstLogicalAndExpressionBinaryOperation = AstBinaryOperation<AstLogicalAndExpressionBinaryOperator, AstEqualityExpressionBinaryOperation>;
-type AstEqualityExpressionBinaryOperation = AstBinaryOperation<AstEqualityExpressionBinaryOperator, AstRelationalExpressionBinaryOperation>;
-type AstRelationalExpressionBinaryOperation = AstBinaryOperation<AstAdditiveExpressionBinaryOperator, AstAdditiveExpressionBinaryOperation>;
-type AstAdditiveExpressionBinaryOperation = AstBinaryOperation<AstAdditiveExpressionBinaryOperator, AstTerm>;
-type AstTermBinaryOperation = AstBinaryOperation<AstTermBinaryOperator, AstFactor>;
-
-#[derive(PartialEq, Clone, Debug)]
-struct AstExpressionLevel<TOperator, TInner> {
-    inner : TInner,
-    binary_ops : Vec<AstBinaryOperation<TOperator, TInner>>,
-}
-
-type AstLogicalOrExpression = AstExpressionLevel<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpression>;
-type AstLogicalAndExpression = AstExpressionLevel<AstLogicalAndExpressionBinaryOperator, AstEqualityExpression>;
-type AstEqualityExpression = AstExpressionLevel<AstEqualityExpressionBinaryOperator, AstRelationalExpression>;
-type AstRelationalExpression = AstExpressionLevel<AstRelationalExpressionBinaryOperator, AstAdditiveExpression>;
-type AstAdditiveExpression = AstExpressionLevel<AstAdditiveExpressionBinaryOperator, AstTerm>;
-type AstTerm = AstExpressionLevel<AstTermBinaryOperator, AstFactor>;
 
 struct CodegenGlobalState {
     next_label : u32,
@@ -233,50 +110,105 @@ struct CodegenFunctionState {
     next_offset : u32,
 }
 
-impl<TOperator, TInner> AstExpressionLevel<TOperator, TInner> {
-    fn new(inner : TInner) -> AstExpressionLevel<TOperator, TInner> {
-        AstExpressionLevel {
-            inner,
-            binary_ops : vec![],
-        }
-    }
-}
-
-impl CodegenGlobalState {
-    fn new() -> CodegenGlobalState {
-        CodegenGlobalState {
-            next_label : 0,
-        }
-    }
-
-    fn consume_jump_label(&mut self) -> u32 {
-        self.next_label += 1;
-        self.next_label - 1
-    }
-}
-
-impl CodegenFunctionState {
-    fn new() -> CodegenFunctionState {
-        CodegenFunctionState {
-            variables : HashMap::new(),
-            next_offset : VARIABLE_SIZE,
-        }
-    }
-
-    fn add_var(&mut self, name : &str) -> bool {
-        if !self.variables.contains_key(name) {
-            self.variables.insert(String::from(name), self.next_offset);
-            self.next_offset += VARIABLE_SIZE;
-            true
+impl<'i, 't> Tokens<'i, 't> {
+    fn consume_tokens(&self, num_tokens : usize) -> Result<(Tokens<'i, 't>, Tokens<'i, 't>), String> {
+        if self.0.len() >= num_tokens {
+            let (tokens, remaining_tokens) = self.0.split_at(num_tokens);
+            Ok((Tokens(tokens), Tokens(remaining_tokens)))
         } else {
-            false
+            Err(format!("could not find {} more token(s)", num_tokens))
         }
     }
 
-    fn get_var_offset(&self, name : &str) -> Option<u32> {
-        self.variables.get(name).map(|value| {
-            *value
-        })
+    fn consume_expected_next_token(&mut self, expected_token : &str) -> Result<&mut Self, String> {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        if tokens[0] == expected_token {
+            *self = remaining_tokens;
+            Ok(self)
+        } else {
+            Err(format!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]))
+        }
+    }
+
+    fn consume_next_token(&mut self) -> Result<&'i str, String> {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+        *self = remaining_tokens;
+        Ok(tokens[0])
+    }
+
+    fn consume_identifier(&mut self) -> Result<&'i str, String> {
+        fn is_token_identifier(token : &str) -> bool {
+            lazy_static! {
+                static ref IDENT_REGEX : Regex = Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
+            }
+
+            IDENT_REGEX.find(token).is_some()
+        }
+
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        if is_token_identifier(tokens[0]) {
+            *self = remaining_tokens;
+            Ok(tokens[0])
+        } else {
+            Err(format!("token \"{}\" is not a variable name", tokens[0]))
+        }
+    }
+
+    fn consume_and_parse_next_token<T>(&mut self) -> Result<T, String>
+    where T : std::str::FromStr {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        let result = tokens[0].parse::<T>().or(Err(format!("token \"{}\" can't be parsed", tokens[0])));
+
+        if result.is_ok() {
+            *self = remaining_tokens;
+        }
+
+        result
+    }
+
+    fn consume_and_parse_next_binary_operator(&mut self, required_precedence_level : u32) -> Result<AstBinaryOperator, String> {
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        let operator = tokens[0].parse::<AstBinaryOperator>()?;
+        let operator_level = operator.get_precedence_level();
+        assert!(operator_level <= MAX_EXPRESSION_LEVEL);
+        if operator_level == required_precedence_level {
+            *self = remaining_tokens;
+            Ok(operator)
+        } else {
+            Err(format!("required precedence level {} doesn't match operator {} precedence level {}", required_precedence_level, tokens[0], operator_level))
+        }
+    }
+}
+
+impl<'i, 't> Deref for Tokens<'i, 't> {
+    type Target = &'t [&'i str];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+const MAX_EXPRESSION_LEVEL : u32 = 6;
+impl AstBinaryOperator {
+    fn get_precedence_level(&self) -> u32 {
+        match self {
+            AstBinaryOperator::Or => 6,
+            AstBinaryOperator::And => 5,
+            AstBinaryOperator::Equals => 4,
+            AstBinaryOperator::NotEquals => 4,
+            AstBinaryOperator::LessThan => 3,
+            AstBinaryOperator::GreaterThan => 3,
+            AstBinaryOperator::LessThanEqual => 3,
+            AstBinaryOperator::GreaterThanEqual => 3,
+            AstBinaryOperator::Plus => 2,
+            AstBinaryOperator::Minus => 2,
+            AstBinaryOperator::Multiply => 1,
+            AstBinaryOperator::Divide => 1,
+        }
     }
 }
 
@@ -343,69 +275,6 @@ impl AstToString for AstStatement {
     }
 }
 
-impl AstToString for AstExpression {
-    fn ast_to_string(&self, indent_levels : u32) -> String {
-        match self {
-            AstExpression::Assign(name, expr) => format!("{} = {}", name, expr.ast_to_string(indent_levels)),
-            AstExpression::Or(expr) => expr.ast_to_string(indent_levels),
-        }
-    }
-}
-
-impl AstToString for AstLogicalOrExpressionBinaryOperator {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        String::from(match self {
-            AstLogicalOrExpressionBinaryOperator::Or => "||",
-        })
-    }
-}
-
-impl AstToString for AstLogicalAndExpressionBinaryOperator {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        String::from(match self {
-            AstLogicalAndExpressionBinaryOperator::And => "&&",
-        })
-    }
-}
-
-impl AstToString for AstEqualityExpressionBinaryOperator {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        String::from(match self {
-            AstEqualityExpressionBinaryOperator::Equals => "==",
-            AstEqualityExpressionBinaryOperator::NotEquals => "!=",
-        })
-    }
-}
-
-impl AstToString for AstRelationalExpressionBinaryOperator {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        String::from(match self {
-            AstRelationalExpressionBinaryOperator::LessThan => "<",
-            AstRelationalExpressionBinaryOperator::GreaterThan => ">",
-            AstRelationalExpressionBinaryOperator::LessThanEqual => "<=",
-            AstRelationalExpressionBinaryOperator::GreaterThanEqual => ">=",
-        })
-    }
-}
-
-impl AstToString for AstAdditiveExpressionBinaryOperator {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        String::from(match self {
-            AstAdditiveExpressionBinaryOperator::Plus => "+",
-            AstAdditiveExpressionBinaryOperator::Minus => "-",
-        })
-    }
-}
-
-impl AstToString for AstTermBinaryOperator {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        String::from(match self {
-            AstTermBinaryOperator::Multiply => "*",
-            AstTermBinaryOperator::Divide => "/",
-        })
-    }
-}
-
 impl AstToString for AstUnaryOperator {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
         String::from(match self {
@@ -416,15 +285,33 @@ impl AstToString for AstUnaryOperator {
     }
 }
 
-impl AstToString for AstFactor {
+impl AstToString for AstBinaryOperator {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
+        String::from(match self {
+            AstBinaryOperator::Or => "||",
+            AstBinaryOperator::And => "&&",
+            AstBinaryOperator::Equals => "==",
+            AstBinaryOperator::NotEquals => "!=",
+            AstBinaryOperator::LessThan => "<",
+            AstBinaryOperator::GreaterThan => ">",
+            AstBinaryOperator::LessThanEqual => "<=",
+            AstBinaryOperator::GreaterThanEqual => ">=",
+            AstBinaryOperator::Plus => "+",
+            AstBinaryOperator::Minus => "-",
+            AstBinaryOperator::Multiply => "*",
+            AstBinaryOperator::Divide => "/",
+        })
+    }
+}
+
+impl AstToString for AstExpression {
+    fn ast_to_string(&self, indent_levels : u32) -> String {
         match self {
-            AstFactor::Constant(val) => format!("{}", val),
-            AstFactor::Variable(name) => name.clone(),
-            AstFactor::UnaryOperator(operator, factor) => {
-                format!("{}{}", operator.ast_to_string(0), factor.ast_to_string(0))
-            },
-            AstFactor::Expression(expr) => format!("({})", expr.ast_to_string(0)),
+            AstExpression::Constant(val) => format!("{}", val),
+            AstExpression::Variable(name) => name.clone(),
+            AstExpression::UnaryOperator(operator, expr) => format!("{}{}", operator.ast_to_string(0), expr.ast_to_string(0)),
+            AstExpression::Assign(name, expr) => format!("{} = {}", name, expr.ast_to_string(indent_levels)),
+            AstExpression::BinaryOperator(operator, left, right) => format!("({}) {} ({})", left.ast_to_string(0), operator.ast_to_string(0), right.ast_to_string(0)),
         }
     }
 }
@@ -441,148 +328,62 @@ impl std::str::FromStr for AstUnaryOperator {
     }
 }
 
-impl std::str::FromStr for AstLogicalOrExpressionBinaryOperator {
+impl std::str::FromStr for AstBinaryOperator {
     type Err = String;
     fn from_str(s : &str) -> Result<Self, Self::Err> {
         match s {
-            "||" => Ok(AstLogicalOrExpressionBinaryOperator::Or),
+            "||" => Ok(AstBinaryOperator::Or),
+            "&&" => Ok(AstBinaryOperator::And),
+            "==" => Ok(AstBinaryOperator::Equals),
+            "!=" => Ok(AstBinaryOperator::NotEquals),
+            "<" => Ok(AstBinaryOperator::LessThan),
+            ">" => Ok(AstBinaryOperator::GreaterThan),
+            "<=" => Ok(AstBinaryOperator::LessThanEqual),
+            ">=" => Ok(AstBinaryOperator::GreaterThanEqual),
+            "+" => Ok(AstBinaryOperator::Plus),
+            "-" => Ok(AstBinaryOperator::Minus),
+            "*" => Ok(AstBinaryOperator::Multiply),
+            "/" => Ok(AstBinaryOperator::Divide),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
 }
 
-impl std::str::FromStr for AstLogicalAndExpressionBinaryOperator {
-    type Err = String;
-    fn from_str(s : &str) -> Result<Self, Self::Err> {
-        match s {
-            "&&" => Ok(AstLogicalAndExpressionBinaryOperator::And),
-            _ => Err(format!("unknown operator {}", s)),
+impl CodegenGlobalState {
+    fn new() -> CodegenGlobalState {
+        CodegenGlobalState {
+            next_label : 0,
         }
     }
+
+    fn consume_jump_label(&mut self) -> u32 {
+        self.next_label += 1;
+        self.next_label - 1
+    }
 }
 
-impl std::str::FromStr for AstEqualityExpressionBinaryOperator {
-    type Err = String;
-    fn from_str(s : &str) -> Result<Self, Self::Err> {
-        match s {
-            "==" => Ok(AstEqualityExpressionBinaryOperator::Equals),
-            "!=" => Ok(AstEqualityExpressionBinaryOperator::NotEquals),
-            _ => Err(format!("unknown operator {}", s)),
+impl CodegenFunctionState {
+    fn new() -> CodegenFunctionState {
+        CodegenFunctionState {
+            variables : HashMap::new(),
+            next_offset : VARIABLE_SIZE,
         }
     }
-}
 
-impl std::str::FromStr for AstRelationalExpressionBinaryOperator {
-    type Err = String;
-    fn from_str(s : &str) -> Result<Self, Self::Err> {
-        match s {
-            "<" => Ok(AstRelationalExpressionBinaryOperator::LessThan),
-            ">" => Ok(AstRelationalExpressionBinaryOperator::GreaterThan),
-            "<=" => Ok(AstRelationalExpressionBinaryOperator::LessThanEqual),
-            ">=" => Ok(AstRelationalExpressionBinaryOperator::GreaterThanEqual),
-            _ => Err(format!("unknown operator {}", s)),
+    fn add_var(&mut self, name : &str) -> bool {
+        if !self.variables.contains_key(name) {
+            self.variables.insert(String::from(name), self.next_offset);
+            self.next_offset += VARIABLE_SIZE;
+            true
+        } else {
+            false
         }
     }
-}
 
-impl std::str::FromStr for AstAdditiveExpressionBinaryOperator {
-    type Err = String;
-    fn from_str(s : &str) -> Result<Self, Self::Err> {
-        match s {
-            "+" => Ok(AstAdditiveExpressionBinaryOperator::Plus),
-            "-" => Ok(AstAdditiveExpressionBinaryOperator::Minus),
-            _ => Err(format!("unknown operator {}", s)),
-        }
-    }
-}
-
-impl std::str::FromStr for AstTermBinaryOperator {
-    type Err = String;
-    fn from_str(s : &str) -> Result<Self, Self::Err> {
-        match s {
-            "*" => Ok(AstTermBinaryOperator::Multiply),
-            "/" => Ok(AstTermBinaryOperator::Divide),
-            _ => Err(format!("unknown operator {}", s)),
-        }
-    }
-}
-
-impl BinaryOperatorCodeGenerator for AstLogicalOrExpressionBinaryOperator {
-    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
-        let label = global_state.consume_jump_label();
-        format!("\n    cmp rax,0\n    mov rax,0\n    setne al\n    jne _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
-    }
-}
-
-impl BinaryOperatorCodeGenerator for AstLogicalAndExpressionBinaryOperator {
-    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
-        let label = global_state.consume_jump_label();
-        format!("\n    cmp rax,0\n    je _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
-    }
-}
-
-impl BinaryOperatorCodeGenerator for AstEqualityExpressionBinaryOperator {
-    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
-        format!("\n    push rax\n{}", rhs_code) +
-        &match &self {
-            AstEqualityExpressionBinaryOperator::Equals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    sete al"),
-            AstEqualityExpressionBinaryOperator::NotEquals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setne al"),
-        }
-    }
-}
-
-impl BinaryOperatorCodeGenerator for AstRelationalExpressionBinaryOperator {
-    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
-        format!("\n    push rax\n{}", rhs_code) +
-        &match &self {
-            AstRelationalExpressionBinaryOperator::LessThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setl al"),
-            AstRelationalExpressionBinaryOperator::GreaterThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setg al"),
-            AstRelationalExpressionBinaryOperator::LessThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setle al"),
-            AstRelationalExpressionBinaryOperator::GreaterThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setge al"),
-        }
-    }
-}
-
-impl BinaryOperatorCodeGenerator for AstAdditiveExpressionBinaryOperator {
-    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
-        format!("\n    push rax\n{}", rhs_code) +
-        &match &self {
-            AstAdditiveExpressionBinaryOperator::Plus => format!("\n    pop rcx\n    add rax,rcx"),
-            AstAdditiveExpressionBinaryOperator::Minus => format!("\n    pop rcx\n    sub rcx,rax\n    mov rax,rcx"),
-        }
-    }
-}
-
-impl BinaryOperatorCodeGenerator for AstTermBinaryOperator {
-    fn generate_code(&self, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
-        format!("\n    push rax\n{}", rhs_code) +
-        &match &self {
-            AstTermBinaryOperator::Multiply => format!("\n    mov rcx,rax\n    pop rax\n    imul rax,rcx"),
-            AstTermBinaryOperator::Divide => format!("\n    mov rcx,rax\n    pop rax\n    cdq\n    idiv ecx"),
-        }
-    }
-}
-
-impl<TOperator, TRhs> AstToString for AstBinaryOperation<TOperator, TRhs>
-    where TOperator : AstToString, TRhs : AstToString {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        format!("{} {}", self.operator.ast_to_string(0), self.rhs.ast_to_string(0))
-    }
-}
-
-impl<TOperator, TInner> AstToString for AstExpressionLevel<TOperator, TInner>
-    where TOperator : AstToString, TInner : AstToString {
-    fn ast_to_string(&self, _indent_levels : u32) -> String {
-        let format_binary_ops = || -> String {
-            let mut result = String::new();
-            for binop in &self.binary_ops {
-                result += " ";
-                result += &binop.ast_to_string(0);
-            }
-            result
-        };
-
-        self.inner.ast_to_string(0) + &format_binary_ops()
+    fn get_var_offset(&self, name : &str) -> Option<u32> {
+        self.variables.get(name).map(|value| {
+            *value
+        })
     }
 }
 
@@ -667,7 +468,8 @@ fn parse_function<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFu
     // Parse out all the block items possible.
     let mut block_items = vec![];
     loop {
-        if let Ok(block_item) = parse_block_item(&mut tokens) {
+        let res = parse_block_item(&mut tokens);
+        if let Ok(block_item) = res {
             block_items.push(block_item);
         } else {
             break;
@@ -740,57 +542,53 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
     Ok(statement)
 }
 
-fn parse_factor<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFactor, String> {
+fn parse_unary_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
     let mut tokens = original_tokens.clone();
 
     if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
         *original_tokens = tokens;
-        Ok(AstFactor::Constant(integer_literal))
+        Ok(AstExpression::Constant(integer_literal))
     } else if tokens.consume_expected_next_token("(").is_ok() {
         let inner = parse_expression(&mut tokens)?;
         tokens.consume_expected_next_token(")")?;
         *original_tokens = tokens;
-        Ok(AstFactor::Expression(Box::new(inner)))
+        Ok(inner)
     } else if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
-        let inner = parse_factor(&mut tokens)?;
+        let inner = parse_unary_expression(&mut tokens)?;
         *original_tokens = tokens;
-        Ok(AstFactor::UnaryOperator(operator, Box::new(inner)))
+        Ok(AstExpression::UnaryOperator(operator, Box::new(inner)))
     } else {
-        let variable_name = tokens.consume_variable_name()?;
+        let variable_name = tokens.consume_identifier()?;
         *original_tokens = tokens;
-        Ok(AstFactor::Variable(String::from(variable_name)))
+        Ok(AstExpression::Variable(String::from(variable_name)))
     }
 }
 
-fn parse_expression_level<'i, 't, TOperator, TInner>(
-    original_tokens : &mut Tokens<'i, 't>,
-    parse_inner : fn(&mut Tokens<'i, 't>) -> Result<TInner, String>
-    )
-    -> Result<AstExpressionLevel<TOperator, TInner>, String>
-    where TOperator : std::str::FromStr
+fn parse_binary_operator_level<'i, 't>(original_tokens : &mut Tokens<'i, 't>, level : u32) -> Result<AstExpression, String>
 {
     let mut tokens = original_tokens.clone();
 
-    let inner1 = parse_inner(&mut tokens)?;
-    let mut expr = AstExpressionLevel::<TOperator, TInner>::new(inner1);
+    if level == 0 {
+        let expr = parse_unary_expression(&mut tokens)?;
+        *original_tokens = tokens;
+        Ok(expr)
+    } else {
+        let mut expr = parse_binary_operator_level(&mut tokens, level - 1)?;
 
-    while let Ok(operator) = tokens.consume_and_parse_next_token::<TOperator>() {
-        let rhs = parse_inner(&mut tokens)?;
+        while let Ok(operator) = tokens.consume_and_parse_next_binary_operator(level) {
+            let rhs = parse_binary_operator_level(&mut tokens, level - 1)?;
+            expr = AstExpression::BinaryOperator(operator, Box::new(expr), Box::new(rhs));
+        }
 
-        expr.binary_ops.push(AstBinaryOperation {
-            operator,
-            rhs,
-        });
+        *original_tokens = tokens;
+        Ok(expr)
     }
-
-    *original_tokens = tokens;
-    Ok(expr)
 }
 
 fn parse_assignment_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
     let mut tokens = original_tokens.clone();
 
-    let variable_name = tokens.consume_variable_name()?;
+    let variable_name = tokens.consume_identifier()?;
     tokens.consume_expected_next_token("=")?;
 
     let expr = parse_expression(&mut tokens)?;
@@ -802,34 +600,8 @@ fn parse_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<Ast
     if let Ok(assignment) = parse_assignment_expression(original_tokens) {
         Ok(assignment)
     } else {
-        parse_logical_or_expression(original_tokens).map(|expr| {
-            AstExpression::Or(expr)
-        })
+        parse_binary_operator_level(original_tokens, MAX_EXPRESSION_LEVEL)
     }
-}
-
-fn parse_logical_or_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstLogicalOrExpression, String> {
-    parse_expression_level::<AstLogicalOrExpressionBinaryOperator, AstLogicalAndExpression>(original_tokens, parse_logical_and_expression)
-}
-
-fn parse_logical_and_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstLogicalAndExpression, String> {
-    parse_expression_level::<AstLogicalAndExpressionBinaryOperator, AstEqualityExpression>(original_tokens, parse_equality_expression)
-}
-
-fn parse_equality_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstEqualityExpression, String> {
-    parse_expression_level::<AstEqualityExpressionBinaryOperator, AstRelationalExpression>(original_tokens, parse_relational_expression)
-}
-
-fn parse_relational_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstRelationalExpression, String> {
-    parse_expression_level::<AstRelationalExpressionBinaryOperator, AstAdditiveExpression>(original_tokens, parse_additive_expression)
-}
-
-fn parse_additive_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstAdditiveExpression, String> {
-    parse_expression_level::<AstAdditiveExpressionBinaryOperator, AstTerm>(original_tokens, parse_term)
-}
-
-fn parse_term<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstTerm, String> {
-    parse_expression_level::<AstTermBinaryOperator, AstFactor>(original_tokens, parse_factor)
 }
 
 fn get_register_name(register_name : &str, width : u32) -> String {
@@ -842,85 +614,40 @@ fn get_register_name(register_name : &str, width : u32) -> String {
     }
 }
 
-fn generate_factor_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_factor : &AstFactor) -> Result<String, String> {
-    match ast_factor {
-        AstFactor::Constant(val) => Ok(format!("    mov rax,{}", val)),
-        AstFactor::Variable(name) => {
-            func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
-                Ok(format!("    mov rax,[rbp-{}]", offset))
-            })
-        },
-        AstFactor::UnaryOperator(operator, box_factor) => {
-            generate_factor_code(global_state, func_state, box_factor).and_then(|inner_factor_code| {
-                match operator {
-                    AstUnaryOperator::Negation => Ok(format!("{}\n    neg rax", inner_factor_code)),
-                    AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not rax", inner_factor_code)),
-                    AstUnaryOperator::LogicalNot => Ok(format!("{}\n    cmp rax,0\n    mov rax,0\n    sete al", inner_factor_code)),
-                }
-            })
-        },
-        AstFactor::Expression(box_expr) => generate_expression_code(global_state, func_state, &box_expr),
-    }
-}
+fn generate_program_code(ast_program : &AstProgram) -> Result<String, String> {
+    const HEADER : &str =
+r"INCLUDELIB msvcrt.lib
+.DATA
 
-fn generate_expression_level_code<TOperator, TInner>(
-    global_state : &mut CodegenGlobalState,
-    func_state : &CodegenFunctionState,
-    expr : &AstExpressionLevel<TOperator, TInner>,
-    generate_inner : fn(&mut CodegenGlobalState, &CodegenFunctionState, &TInner) -> Result<String, String>
-    ) -> Result<String, String>
-    where TOperator : BinaryOperatorCodeGenerator {
-    generate_inner(global_state, func_state, &expr.inner).and_then(|mut code| {
-        for binop in &expr.binary_ops {
-            let inner_code_result = generate_inner(global_state, func_state, &binop.rhs);
-            if let Ok(inner_code) = inner_code_result {
-                code += &binop.operator.generate_code(global_state, &inner_code);
-            } else {
-                return inner_code_result;
-            }
-        }
+.CODE
+start:
+";
+    const FOOTER : &str =
+r"END
+";
 
-        Ok(code)
+    let mut codegen_state = CodegenGlobalState::new();
+    generate_function_code(&mut codegen_state, &ast_program.main_function).map(|main_code| {
+        String::from(HEADER) + &main_code + "\n" + FOOTER
     })
 }
 
-fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstExpression) -> Result<String, String> {
-    match ast_node {
-        AstExpression::Or(expr) => {
-            generate_logical_or_expression_code(global_state, func_state, expr)
-        },
-        AstExpression::Assign(name, expr) => {
-            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
-                func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
-                    Ok(format!("{}\n    mov [rbp-{}],rax", expr_code, offset))
-                })
-            })
-        },
+fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function : &AstFunction) -> Result<String, String> {
+    let mut func_state = CodegenFunctionState::new();
+    let mut code = format!("{} PROC\n    push rbp\n    mov rbp,rsp", ast_function.name);
+
+    for block_item in &ast_function.body {
+        let result = generate_block_item_code(global_state, &mut func_state, block_item);
+        if let Ok(block_item_code) = result {
+            code += "\n";
+            code += &block_item_code;
+        } else {
+            return result;
+        }
     }
-}
 
-fn generate_logical_or_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstLogicalOrExpression) -> Result<String, String> {
-    generate_expression_level_code(global_state, func_state, ast_node, generate_logical_and_expression_code)
-}
-
-fn generate_logical_and_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstLogicalAndExpression) -> Result<String, String> {
-    generate_expression_level_code(global_state, func_state, ast_node, generate_equality_expression_code)
-}
-
-fn generate_equality_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstEqualityExpression) -> Result<String, String> {
-    generate_expression_level_code(global_state, func_state, ast_node, generate_relational_expression_code)
-}
-
-fn generate_relational_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstRelationalExpression) -> Result<String, String> {
-    generate_expression_level_code(global_state, func_state, ast_node, generate_additive_expression_code)
-}
-
-fn generate_additive_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstAdditiveExpression) -> Result<String, String> {
-    generate_expression_level_code(global_state, func_state, ast_node, generate_term_code)
-}
-
-fn generate_term_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstTerm) -> Result<String, String> {
-    generate_expression_level_code(global_state, func_state, ast_node, generate_factor_code)
+    // Add a default return of 0 in case the code in the function body didn't put a return statement.
+    Ok(code + &format!("\n    mov rsp,rbp\n    pop rbp\n    ret\n{} ENDP", ast_function.name))
 }
 
 fn generate_block_item_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_block_item : &AstBlockItem) -> Result<String, String> {
@@ -969,40 +696,66 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : 
     }
 }
 
-fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function : &AstFunction) -> Result<String, String> {
-    let mut func_state = CodegenFunctionState::new();
-    let mut code = format!("{} PROC\n    push rbp\n    mov rbp,rsp", ast_function.name);
-
-    for block_item in &ast_function.body {
-        let result = generate_block_item_code(global_state, &mut func_state, block_item);
-        if let Ok(block_item_code) = result {
-            code += "\n";
-            code += &block_item_code;
-        } else {
-            return result;
-        }
+fn generate_binary_operator_code(operator : &AstBinaryOperator, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
+    match operator {
+        AstBinaryOperator::Or => {
+            let label = global_state.consume_jump_label();
+            format!("\n    cmp rax,0\n    mov rax,0\n    setne al\n    jne _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
+        },
+        AstBinaryOperator::And => {
+            let label = global_state.consume_jump_label();
+            format!("\n    cmp rax,0\n    je _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
+        },
+        _ => {
+            format!("\n    push rax\n{}", rhs_code) +
+            &match operator {
+                AstBinaryOperator::Equals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    sete al"),
+                AstBinaryOperator::NotEquals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setne al"),
+                AstBinaryOperator::LessThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setl al"),
+                AstBinaryOperator::GreaterThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setg al"),
+                AstBinaryOperator::LessThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setle al"),
+                AstBinaryOperator::GreaterThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setge al"),
+                AstBinaryOperator::Plus => format!("\n    pop rcx\n    add rax,rcx"),
+                AstBinaryOperator::Minus => format!("\n    pop rcx\n    sub rcx,rax\n    mov rax,rcx"),
+                AstBinaryOperator::Multiply => format!("\n    mov rcx,rax\n    pop rax\n    imul rax,rcx"),
+                AstBinaryOperator::Divide => format!("\n    mov rcx,rax\n    pop rax\n    cdq\n    idiv ecx"),
+                AstBinaryOperator::Or => panic!("unexpected"),
+                AstBinaryOperator::And => panic!("unexpected"),
+            }
+        },
     }
-
-    // Add a default return of 0 in case the code in the function body didn't put a return statement.
-    Ok(code + &format!("\n    mov rsp,rbp\n    pop rbp\n    ret\n{} ENDP", ast_function.name))
 }
 
-fn generate_program_code(ast_program : &AstProgram) -> Result<String, String> {
-    const HEADER : &str =
-r"INCLUDELIB msvcrt.lib
-.DATA
-
-.CODE
-start:
-";
-    const FOOTER : &str =
-r"END
-";
-
-    let mut codegen_state = CodegenGlobalState::new();
-    generate_function_code(&mut codegen_state, &ast_program.main_function).and_then(|main_code| {
-        Ok(String::from(HEADER) + &main_code + "\n" + FOOTER)
-    })
+fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstExpression) -> Result<String, String> {
+    match ast_node {
+        AstExpression::Constant(val) => Ok(format!("    mov rax,{}", val)),
+        AstExpression::Variable(name) => {
+            func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).map(|offset| {
+                format!("    mov rax,[rbp-{}]", offset)
+            })
+        },
+        AstExpression::UnaryOperator(operator, expr) => {
+            generate_expression_code(global_state, func_state, &expr).and_then(|inner_factor_code| {
+                match operator {
+                    AstUnaryOperator::Negation => Ok(format!("{}\n    neg rax", inner_factor_code)),
+                    AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not rax", inner_factor_code)),
+                    AstUnaryOperator::LogicalNot => Ok(format!("{}\n    cmp rax,0\n    mov rax,0\n    sete al", inner_factor_code)),
+                }
+            })
+        },
+        AstExpression::BinaryOperator(operator, left, right) => {
+            let left_code = generate_expression_code(global_state, func_state, &left)?;
+            let right_code = generate_expression_code(global_state, func_state, &right)?;
+            Ok(left_code + &generate_binary_operator_code(&operator, global_state, &right_code))
+        },
+        AstExpression::Assign(name, expr) => {
+            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
+                func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
+                    Ok(format!("{}\n    mov [rbp-{}],rax", expr_code, offset))
+                })
+            })
+        },
+    }
 }
 
 fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool) -> Option<i32> {
