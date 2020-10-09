@@ -412,6 +412,8 @@ fn lex_next_token<'i>(input : &'i str)  -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^<").expect("failed to compile regex"),
             Regex::new(r"^>").expect("failed to compile regex"),
             Regex::new(r"^=").expect("failed to compile regex"),
+            Regex::new(r"^\?").expect("failed to compile regex"),
+            Regex::new(r"^:").expect("failed to compile regex"),
             Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
             Regex::new(r"^[0-9]+").expect("failed to compile regex"),
         ];
@@ -809,8 +811,33 @@ fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state :
                 })
             })
         },
-        // TODO implement
-        AstExpression::Conditional(condition, positive, negative) => panic!("not implemented"),
+        AstExpression::Conditional(condition, positive, negative) => {
+            let after_pos_label = global_state.consume_jump_label();
+            let mut code = generate_expression_code(global_state, func_state, condition)?;
+
+            // Check if the conditional expression was true or false.
+            code += "\n    cmp rax,0";
+
+            // If it was false, jump to the section after the positive portion.
+            code += &format!("\n    je _j{}", after_pos_label);
+
+            // Otherwise, execute the positive section.
+            code += "\n    ";
+            code += &generate_expression_code(global_state, func_state, positive)?;
+
+            let negative_code = generate_expression_code(global_state, func_state, negative)?;
+            let after_neg_label = global_state.consume_jump_label();
+            // At the end of the positive section, jump over the negative section so that both aren't executed.
+            code += &format!("\n    jmp _j{}", after_neg_label);
+
+            // Start of the negative section.
+            code += &format!("\n    _j{}:", after_pos_label);
+            code += "\n    ";
+            code += &negative_code;
+            code += &format!("\n    _j{}:", after_neg_label);
+
+            Ok(code)
+        },
     }
 }
 
@@ -1437,5 +1464,11 @@ r"int main() {{
     #[test]
     fn test_codegen_if_else_assign() {
         test_codegen_mainfunc("int x = 5; if (x == 5) x = 4; else x == 6; if (x == 6) x = 7; else x = 8; return x;", 8);
+    }
+
+    #[test]
+    fn test_codegen_ternary() {
+        test_codegen_mainfunc("return 1 == 1 ? 2 : 3;", 2);
+        test_codegen_mainfunc("return 1 == 0 ? 2 : 3;", 3);
     }
 }
