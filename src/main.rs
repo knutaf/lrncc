@@ -66,6 +66,7 @@ enum AstStatement {
     Return(AstExpression),
     Expression(AstExpression),
     Conditional(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
+    Compound(Box<Vec<AstBlockItem>>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -105,10 +106,17 @@ struct CodegenGlobalState {
     next_label : u32,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct StackVariable {
+    offset : u32,
+    block_id : u32,
+}
+
 #[derive(Clone)]
-struct CodegenFunctionState {
-    variables : HashMap<String, u32>,
+struct CodegenBlockState {
+    variables : HashMap<String, StackVariable>,
     next_offset : u32,
+    block_id : u32,
 }
 
 impl<'i, 't> Tokens<'i, 't> {
@@ -228,9 +236,9 @@ impl<'i> fmt::Display for AstProgram<'i> {
 impl<'i> AstToString for AstFunction<'i> {
     fn ast_to_string(&self, indent_levels : u32) -> String {
         let mut body_str = String::new();
-        for statement in &self.body {
+        for block_item in &self.body {
             body_str += "\n";
-            body_str += &statement.ast_to_string(indent_levels + 1);
+            body_str += &block_item.ast_to_string(indent_levels);
         }
 
         format!("{}FUNC {}:{}", Self::get_indent_string(indent_levels), self.name, &body_str)
@@ -240,8 +248,8 @@ impl<'i> AstToString for AstFunction<'i> {
 impl AstToString for AstBlockItem {
     fn ast_to_string(&self, indent_levels : u32) -> String {
         match self {
-            AstBlockItem::Statement(statement) => statement.ast_to_string(indent_levels),
-            AstBlockItem::Declaration(declaration) => declaration.ast_to_string(indent_levels),
+            AstBlockItem::Statement(statement) => statement.ast_to_string(indent_levels + 1),
+            AstBlockItem::Declaration(declaration) => declaration.ast_to_string(indent_levels + 1),
         }
     }
 }
@@ -266,12 +274,36 @@ impl AstToString for AstStatement {
             AstStatement::Return(expr) => format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1)),
             AstStatement::Expression(expr) => format!("{}{};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1)),
             AstStatement::Conditional(expr, positive, negative_opt) => {
-                let mut result = format!("{}if ({})\n{}", Self::get_indent_string(indent_levels), expr.ast_to_string(0), positive.ast_to_string(indent_levels + 1));
+                let pos_indent_levels =
+                    if let AstStatement::Compound(_) = **positive {
+                        indent_levels
+                    } else {
+                        indent_levels + 1
+                    };
+
+                let mut result = format!("{}if ({})\n{}", Self::get_indent_string(indent_levels), expr.ast_to_string(0), positive.ast_to_string(pos_indent_levels));
+
                 if let Some(negative) = negative_opt {
-                    result += &format!("\n{}else\n{}", Self::get_indent_string(indent_levels), negative.ast_to_string(indent_levels + 1));
+                    let neg_indent_levels =
+                        if let AstStatement::Compound(_) = **negative {
+                            indent_levels
+                        } else {
+                            indent_levels + 1
+                        };
+                    result += &format!("\n{}else\n{}", Self::get_indent_string(indent_levels), negative.ast_to_string(neg_indent_levels));
                 }
                 result
             },
+            AstStatement::Compound(block_items) => {
+                let mut result = String::new();
+                for block_item in block_items.iter() {
+                    if result.len() != 0 {
+                        result += "\n";
+                    }
+                    result += &block_item.ast_to_string(indent_levels);
+                }
+                result
+            }
         }
     }
 }
@@ -364,27 +396,49 @@ impl CodegenGlobalState {
     }
 }
 
-impl CodegenFunctionState {
-    fn new() -> CodegenFunctionState {
-        CodegenFunctionState {
+impl CodegenBlockState {
+    fn new() -> CodegenBlockState {
+        CodegenBlockState {
             variables : HashMap::new(),
             next_offset : VARIABLE_SIZE,
+            block_id : 0,
         }
     }
 
+    fn nest(&self) -> CodegenBlockState {
+        let mut nested = self.clone();
+        nested.block_id += 1;
+        nested
+    }
+
     fn add_var(&mut self, name : &str) -> bool {
-        if !self.variables.contains_key(name) {
-            self.variables.insert(String::from(name), self.next_offset);
-            self.next_offset += VARIABLE_SIZE;
-            true
-        } else {
-            false
+        if let Some(var) = self.variables.get(name) {
+            if var.block_id == self.block_id {
+                // Cannot declare the same variable twice in the same block.
+                return false;
+            }
+            // Else it was declared in an outer block already, so below we will overwrite it with the current block.
         }
+
+        // This will either insert a new variable or overwrite a previously declared variable.
+        self.variables.insert(String::from(name), StackVariable { offset : self.next_offset, block_id : self.block_id });
+        self.next_offset += VARIABLE_SIZE;
+        true
     }
 
     fn get_var_offset(&self, name : &str) -> Option<u32> {
         self.variables.get(name).map(|value| {
-            *value
+            value.offset
+        })
+    }
+
+    fn get_allocated_size(&self) -> u32 {
+        self.variables.iter().fold(0, |size, (name, var)| {
+            if var.block_id == self.block_id {
+                size + VARIABLE_SIZE
+            } else {
+                size
+            }
         })
     }
 }
@@ -537,6 +591,15 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
         }
 
         statement = AstStatement::Conditional(expr, Box::new(positive), negative);
+    } else if tokens.consume_expected_next_token("{").is_ok() {
+        let mut block_items = vec![];
+
+        while let Ok(block_item) = parse_block_item(&mut tokens) {
+            block_items.push(block_item);
+        }
+
+        tokens.consume_expected_next_token("}")?;
+        statement = AstStatement::Compound(Box::new(block_items));
     } else {
         statement = AstStatement::Expression(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
@@ -657,13 +720,12 @@ r"END
 }
 
 fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function : &AstFunction) -> Result<String, String> {
-    let mut func_state = CodegenFunctionState::new();
+    let mut block_state = CodegenBlockState::new();
     let mut code = format!("{} PROC\n    push rbp\n    mov rbp,rsp", ast_function.name);
 
     for block_item in &ast_function.body {
-        let result = generate_block_item_code(global_state, &mut func_state, block_item);
+        let result = generate_block_item_code(global_state, &mut block_state, block_item);
         if let Ok(block_item_code) = result {
-            code += "\n";
             code += &block_item_code;
         } else {
             return result;
@@ -674,23 +736,23 @@ fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function :
     Ok(code + &format!("\n    mov rsp,rbp\n    pop rbp\n    ret\n{} ENDP", ast_function.name))
 }
 
-fn generate_block_item_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_block_item : &AstBlockItem) -> Result<String, String> {
+fn generate_block_item_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, ast_block_item : &AstBlockItem) -> Result<String, String> {
     match ast_block_item {
-        AstBlockItem::Statement(statement) => generate_statement_code(global_state, func_state, statement),
-        AstBlockItem::Declaration(declaration) => generate_declaration_code(global_state, func_state, declaration),
+        AstBlockItem::Statement(statement) => generate_statement_code(global_state, block_state, statement),
+        AstBlockItem::Declaration(declaration) => generate_declaration_code(global_state, block_state, declaration),
     }
 }
 
-fn generate_declaration_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_declaration : &AstDeclaration) -> Result<String, String> {
+fn generate_declaration_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, ast_declaration : &AstDeclaration) -> Result<String, String> {
     match ast_declaration {
         AstDeclaration::DeclareVar(name, expr_opt) => {
-            if !func_state.add_var(&name) {
+            if !block_state.add_var(&name) {
                 return Err(format!("variable {} already defined", name));
             }
 
             let mut code = String::new();
             if let Some(expr) = expr_opt {
-                let result = generate_expression_code(global_state, func_state, expr);
+                let result = generate_expression_code(global_state, block_state, expr);
                 if let Ok(expr_code) = result {
                     code += &expr_code;
                 } else {
@@ -706,19 +768,19 @@ fn generate_declaration_code(global_state : &mut CodegenGlobalState, func_state 
     }
 }
 
-fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : &mut CodegenFunctionState, ast_statement : &AstStatement) -> Result<String, String> {
+fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, ast_statement : &AstStatement) -> Result<String, String> {
     match ast_statement {
         AstStatement::Return(expr) => {
-            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
+            generate_expression_code(global_state, block_state, expr).and_then(|expr_code| {
                 Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
             })
         },
         AstStatement::Expression(expr) => {
-            generate_expression_code(global_state, func_state, expr)
+            generate_expression_code(global_state, block_state, expr)
         },
         AstStatement::Conditional(condition, positive, negative_opt) => {
             let after_pos_label = global_state.consume_jump_label();
-            let mut code = generate_expression_code(global_state, func_state, condition)?;
+            let mut code = generate_expression_code(global_state, block_state, condition)?;
 
             // Check if the conditional expression was true or false.
             code += "\n    cmp rax,0";
@@ -728,11 +790,11 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : 
 
             // Otherwise, execute the positive section.
             code += "\n    ";
-            code += &generate_statement_code(global_state, func_state, positive)?;
+            code += &generate_statement_code(global_state, block_state, positive)?;
 
             // Check if there is an else clause.
             if let Some(negative) = negative_opt {
-                let negative_code = generate_statement_code(global_state, func_state, negative)?;
+                let negative_code = generate_statement_code(global_state, block_state, negative)?;
                 let after_neg_label = global_state.consume_jump_label();
                 // At the end of the positive section, jump over the negative section so that both aren't executed.
                 code += &format!("\n    jmp _j{}", after_neg_label);
@@ -749,6 +811,19 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, func_state : 
 
             Ok(code)
         },
+        AstStatement::Compound(block_items) => {
+            let mut code = String::new();
+            let mut inner_block_state = block_state.nest();
+            for block_item in block_items.iter() {
+                code += &generate_block_item_code(global_state, &mut inner_block_state, block_item)?;
+            }
+
+            let inner_block_bytes = inner_block_state.get_allocated_size();
+            if inner_block_bytes > 0 {
+                code += &format!("\n    add rsp,{}", inner_block_bytes);
+            }
+            Ok(code)
+        }
     }
 }
 
@@ -782,16 +857,16 @@ fn generate_binary_operator_code(operator : &AstBinaryOperator, global_state : &
     }
 }
 
-fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state : &CodegenFunctionState, ast_node : &AstExpression) -> Result<String, String> {
+fn generate_expression_code(global_state : &mut CodegenGlobalState, block_state : &CodegenBlockState, ast_node : &AstExpression) -> Result<String, String> {
     match ast_node {
-        AstExpression::Constant(val) => Ok(format!("    mov rax,{}", val)),
+        AstExpression::Constant(val) => Ok(format!("\n    mov rax,{}", val)),
         AstExpression::Variable(name) => {
-            func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).map(|offset| {
-                format!("    mov rax,[rbp-{}]", offset)
+            block_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).map(|offset| {
+                format!("\n    mov rax,[rbp-{}]", offset)
             })
         },
         AstExpression::UnaryOperator(operator, expr) => {
-            generate_expression_code(global_state, func_state, &expr).and_then(|inner_factor_code| {
+            generate_expression_code(global_state, block_state, &expr).and_then(|inner_factor_code| {
                 match operator {
                     AstUnaryOperator::Negation => Ok(format!("{}\n    neg rax", inner_factor_code)),
                     AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not rax", inner_factor_code)),
@@ -800,20 +875,20 @@ fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state :
             })
         },
         AstExpression::BinaryOperator(operator, left, right) => {
-            let left_code = generate_expression_code(global_state, func_state, &left)?;
-            let right_code = generate_expression_code(global_state, func_state, &right)?;
+            let left_code = generate_expression_code(global_state, block_state, &left)?;
+            let right_code = generate_expression_code(global_state, block_state, &right)?;
             Ok(left_code + &generate_binary_operator_code(&operator, global_state, &right_code))
         },
         AstExpression::Assign(name, expr) => {
-            generate_expression_code(global_state, func_state, expr).and_then(|expr_code| {
-                func_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
+            generate_expression_code(global_state, block_state, expr).and_then(|expr_code| {
+                block_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
                     Ok(format!("{}\n    mov [rbp-{}],rax", expr_code, offset))
                 })
             })
         },
         AstExpression::Conditional(condition, positive, negative) => {
             let after_pos_label = global_state.consume_jump_label();
-            let mut code = generate_expression_code(global_state, func_state, condition)?;
+            let mut code = generate_expression_code(global_state, block_state, condition)?;
 
             // Check if the conditional expression was true or false.
             code += "\n    cmp rax,0";
@@ -823,9 +898,9 @@ fn generate_expression_code(global_state : &mut CodegenGlobalState, func_state :
 
             // Otherwise, execute the positive section.
             code += "\n    ";
-            code += &generate_expression_code(global_state, func_state, positive)?;
+            code += &generate_expression_code(global_state, block_state, positive)?;
 
-            let negative_code = generate_expression_code(global_state, func_state, negative)?;
+            let negative_code = generate_expression_code(global_state, block_state, negative)?;
             let after_neg_label = global_state.consume_jump_label();
             // At the end of the positive section, jump over the negative section so that both aren't executed.
             code += &format!("\n    jmp _j{}", after_neg_label);
@@ -1470,5 +1545,13 @@ r"int main() {{
     fn test_codegen_ternary() {
         test_codegen_mainfunc("return 1 == 1 ? 2 : 3;", 2);
         test_codegen_mainfunc("return 1 == 0 ? 2 : 3;", 3);
+    }
+
+    #[test]
+    fn test_block_var_declarations() {
+        test_codegen_mainfunc("int x = 1; { x = 3; } return x;", 3);
+        test_codegen_mainfunc("int x = 1; { int x = 3; } return x;", 1);
+        test_codegen_mainfunc("int x = 1; { int y; } int z = 7; return z;", 7);
+        test_codegen_mainfunc_failure("int x = 1; { int x = 3; } int x = 5; return x;");
     }
 }
