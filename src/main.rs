@@ -64,9 +64,15 @@ enum AstDeclaration {
 #[derive(PartialEq, Clone, Debug)]
 enum AstStatement {
     Return(AstExpression),
-    Expression(AstExpression),
+    Expression(Option<AstExpression>),
     Conditional(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
     Compound(Box<Vec<AstBlockItem>>),
+    For(Option<AstExpression>, AstExpression, Option<AstExpression>, Box<AstStatement>),
+    ForDecl(AstDeclaration, AstExpression, Option<AstExpression>, Box<AstStatement>),
+    While(AstExpression, Box<AstStatement>),
+    DoWhile(AstExpression, Box<AstStatement>),
+    Break,
+    Continue,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -117,6 +123,8 @@ struct CodegenBlockState {
     variables : HashMap<String, StackVariable>,
     next_offset : u32,
     block_id : u32,
+    break_label : Option<u32>,
+    continue_label : Option<u32>,
 }
 
 impl<'i, 't> Tokens<'i, 't> {
@@ -134,8 +142,10 @@ impl<'i, 't> Tokens<'i, 't> {
 
         if tokens[0] == expected_token {
             *self = remaining_tokens;
+            println!("consumed expected next token {}", expected_token);
             Ok(self)
         } else {
+            println!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]);
             Err(format!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]))
         }
     }
@@ -159,6 +169,7 @@ impl<'i, 't> Tokens<'i, 't> {
 
         if is_token_identifier(tokens[0]) {
             *self = remaining_tokens;
+            println!("consumed identifier {}", tokens[0]);
             Ok(tokens[0])
         } else {
             Err(format!("token \"{}\" is not a variable name", tokens[0]))
@@ -237,8 +248,11 @@ impl<'i> AstToString for AstFunction<'i> {
     fn ast_to_string(&self, indent_levels : u32) -> String {
         let mut body_str = String::new();
         for block_item in &self.body {
-            body_str += "\n";
-            body_str += &block_item.ast_to_string(indent_levels);
+            let result = block_item.ast_to_string(indent_levels);
+            if result.len() != 0 {
+                body_str += "\n";
+                body_str += &result;
+            }
         }
 
         format!("{}FUNC {}:{}", Self::get_indent_string(indent_levels), self.name, &body_str)
@@ -272,7 +286,8 @@ impl AstToString for AstStatement {
     fn ast_to_string(&self, indent_levels : u32) -> String {
         match self {
             AstStatement::Return(expr) => format!("{}return {};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1)),
-            AstStatement::Expression(expr) => format!("{}{};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1)),
+            AstStatement::Expression(Some(expr)) => format!("{}{};", Self::get_indent_string(indent_levels), expr.ast_to_string(indent_levels + 1)),
+            AstStatement::Expression(None) => String::new(),
             AstStatement::Conditional(expr, positive, negative_opt) => {
                 let pos_indent_levels =
                     if let AstStatement::Compound(_) = **positive {
@@ -303,7 +318,52 @@ impl AstToString for AstStatement {
                     result += &block_item.ast_to_string(indent_levels);
                 }
                 result
-            }
+            },
+            AstStatement::For(expr_opt, condition, post_expr_opt, body) => {
+                format!(
+                    "{}for ({}; {}; {})\n{}",
+                    Self::get_indent_string(indent_levels),
+                    expr_opt.as_ref().map_or(String::new(), |expr| {
+                        expr.ast_to_string(0)
+                    }),
+                    condition.ast_to_string(0),
+                    post_expr_opt.as_ref().map_or(String::new(), |expr| {
+                        expr.ast_to_string(0)
+                    }),
+                    body.ast_to_string(indent_levels))
+            },
+            AstStatement::ForDecl(declaration, condition, post_expr_opt, body) => {
+                // Omit the semicolon after the declaration because it's built into the delcaration output itself.
+                format!(
+                    "{}for ({} {}; {})\n{}",
+                    Self::get_indent_string(indent_levels),
+                    declaration.ast_to_string(0),
+                    condition.ast_to_string(0),
+                    post_expr_opt.as_ref().map_or(String::new(), |expr| {
+                        expr.ast_to_string(0)
+                    }),
+                    body.ast_to_string(indent_levels))
+            },
+            AstStatement::While(condition, body) => {
+                format!(
+                    "{}while ({})\n{}",
+                    Self::get_indent_string(indent_levels),
+                    condition.ast_to_string(0),
+                    body.ast_to_string(indent_levels))
+            },
+            AstStatement::DoWhile(condition, body) => {
+                format!(
+                    "{}do while ({})\n{}",
+                    Self::get_indent_string(indent_levels),
+                    condition.ast_to_string(0),
+                    body.ast_to_string(indent_levels))
+            },
+            AstStatement::Break => {
+                format!("{}break;", Self::get_indent_string(indent_levels))
+            },
+            AstStatement::Continue => {
+                format!("{}continue;", Self::get_indent_string(indent_levels))
+            },
         }
     }
 }
@@ -402,6 +462,8 @@ impl CodegenBlockState {
             variables : HashMap::new(),
             next_offset : VARIABLE_SIZE,
             block_id : 0,
+            break_label : None,
+            continue_label : None,
         }
     }
 
@@ -409,6 +471,13 @@ impl CodegenBlockState {
         let mut nested = self.clone();
         nested.block_id += 1;
         nested
+    }
+
+    fn enter_loop(&self, break_label : u32, continue_label : u32) -> CodegenBlockState {
+        let mut loop_state = self.clone();
+        loop_state.break_label = Some(break_label);
+        loop_state.continue_label = Some(continue_label);
+        loop_state
     }
 
     fn add_var(&mut self, name : &str) -> bool {
@@ -440,6 +509,15 @@ impl CodegenBlockState {
                 size
             }
         })
+    }
+
+    fn generate_end_of_scope_code(&self) -> String {
+        let block_bytes = self.get_allocated_size();
+        if block_bytes > 0 {
+            format!("\n    add rsp,{}", block_bytes)
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -574,7 +652,9 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
     let mut tokens = original_tokens.clone();
 
     let statement;
-    if tokens.consume_expected_next_token("return").is_ok() {
+    if tokens.consume_expected_next_token(";").is_ok() {
+        statement = AstStatement::Expression(None);
+    } else if tokens.consume_expected_next_token("return").is_ok() {
         statement = AstStatement::Return(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
     } else if tokens.consume_expected_next_token("if").is_ok() {
@@ -591,6 +671,38 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
         }
 
         statement = AstStatement::Conditional(expr, Box::new(positive), negative);
+    } else if tokens.consume_expected_next_token("for").is_ok() {
+        tokens.consume_expected_next_token("(")?;
+
+        if tokens.consume_expected_next_token(";").is_ok() {
+            let (condition, post_expr_opt, body) = parse_remaining_for_statement(&mut tokens)?;
+            statement = AstStatement::For(None, condition, post_expr_opt, Box::new(body));
+        } else if let Ok(initial_declaration) = parse_declaration(&mut tokens) {
+            let (condition, post_expr_opt, body) = parse_remaining_for_statement(&mut tokens)?;
+            statement = AstStatement::ForDecl(initial_declaration, condition, post_expr_opt, Box::new(body));
+        } else {
+            let initial_expression = parse_expression(&mut tokens)?;
+            tokens.consume_expected_next_token(";")?;
+            let (condition, post_expr_opt, body) = parse_remaining_for_statement(&mut tokens)?;
+            statement = AstStatement::For(Some(initial_expression), condition, post_expr_opt, Box::new(body));
+        }
+    } else if tokens.consume_expected_next_token("while").is_ok() {
+        tokens.consume_expected_next_token("(")?;
+        let condition = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+
+        let body = parse_statement(&mut tokens)?;
+
+        statement = AstStatement::While(condition, Box::new(body));
+    } else if tokens.consume_expected_next_token("do").is_ok() {
+        let body = parse_statement(&mut tokens)?;
+        tokens.consume_expected_next_token("while")?;
+        tokens.consume_expected_next_token("(")?;
+        let condition = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+        tokens.consume_expected_next_token(";")?;
+
+        statement = AstStatement::DoWhile(condition, Box::new(body));
     } else if tokens.consume_expected_next_token("{").is_ok() {
         let mut block_items = vec![];
 
@@ -600,13 +712,45 @@ fn parse_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstS
 
         tokens.consume_expected_next_token("}")?;
         statement = AstStatement::Compound(Box::new(block_items));
+    } else if tokens.consume_expected_next_token("break").is_ok() {
+        statement = AstStatement::Break;
+        tokens.consume_expected_next_token(";")?;
+    } else if tokens.consume_expected_next_token("continue").is_ok() {
+        statement = AstStatement::Continue;
+        tokens.consume_expected_next_token(";")?;
     } else {
-        statement = AstStatement::Expression(parse_expression(&mut tokens)?);
+        statement = AstStatement::Expression(Some(parse_expression(&mut tokens)?));
         tokens.consume_expected_next_token(";")?;
     }
 
     *original_tokens = tokens;
     Ok(statement)
+}
+
+fn parse_remaining_for_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<(AstExpression, Option<AstExpression>, AstStatement), String> {
+    let mut tokens = original_tokens.clone();
+
+    // Empty condition is turned into a constant "true" value.
+    let condition;
+    if tokens.consume_expected_next_token(";").is_ok() {
+        condition = AstExpression::Constant(1);
+    } else {
+        condition = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(";")?;
+    }
+
+    let post_expr_opt;
+    if tokens.consume_expected_next_token(")").is_ok() {
+        post_expr_opt = None;
+    } else {
+        post_expr_opt = Some(parse_expression(&mut tokens)?);
+        tokens.consume_expected_next_token(")")?;
+    }
+
+    let body = parse_statement(&mut tokens)?;
+
+    *original_tokens = tokens;
+    Ok((condition, post_expr_opt, body))
 }
 
 fn parse_unary_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
@@ -775,9 +919,10 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state :
                 Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
             })
         },
-        AstStatement::Expression(expr) => {
+        AstStatement::Expression(Some(expr)) => {
             generate_expression_code(global_state, block_state, expr)
         },
+        AstStatement::Expression(None) => { Ok(String::new()) },
         AstStatement::Conditional(condition, positive, negative_opt) => {
             let after_pos_label = global_state.consume_jump_label();
             let mut code = generate_expression_code(global_state, block_state, condition)?;
@@ -818,13 +963,139 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state :
                 code += &generate_block_item_code(global_state, &mut inner_block_state, block_item)?;
             }
 
-            let inner_block_bytes = inner_block_state.get_allocated_size();
-            if inner_block_bytes > 0 {
-                code += &format!("\n    add rsp,{}", inner_block_bytes);
-            }
+            code += &inner_block_state.generate_end_of_scope_code();
             Ok(code)
-        }
+        },
+        AstStatement::For(expr_opt, condition, post_expr_opt, body) => {
+            let mut code = String::new();
+
+            // The header of the for loop is in its own scope, for declarations.
+            let mut block_state = block_state.nest();
+
+            if let Some(pre_expression) = expr_opt.as_ref()  {
+                code += &generate_expression_code(global_state, &mut block_state, pre_expression)?;
+            }
+
+            code += &generate_remaining_for_loop_code(global_state, &mut block_state, condition, body, post_expr_opt)?;
+            Ok(code)
+        },
+        AstStatement::ForDecl(declaration, condition, post_expr_opt, body) => {
+            let mut code = String::new();
+
+            // The header of the for loop is in its own scope, for declarations.
+            let mut block_state = block_state.nest();
+            code += &generate_declaration_code(global_state, &mut block_state, declaration)?;
+            code += &generate_remaining_for_loop_code(global_state, &mut block_state, condition, body, post_expr_opt)?;
+
+            Ok(code)
+        },
+        AstStatement::While(condition, body) => {
+            let before_loop_condition_label = global_state.consume_jump_label();
+            let after_loop_label = global_state.consume_jump_label();
+
+            let mut code = format!("\n    _j{}:", before_loop_condition_label);
+            code += &generate_expression_code(global_state, block_state, condition)?;
+
+            // Check if the conditional expression was true or false.
+            code += "\n    cmp rax,0";
+
+            // If it was false, jump to after the loop body.
+            code += &format!("\n    je _j{}", after_loop_label);
+
+            // Set up the jump labels for break and continue.
+            let mut block_state = block_state.enter_loop(after_loop_label, before_loop_condition_label);
+
+            // The loop condition was true, so now include the body's code.
+            code += "\n    ";
+            code += &generate_statement_code(global_state, &mut block_state, body)?;
+
+            // At the end of the loop body, jump back to before the loop condition so it can be evaluated again.
+            code += &format!("\n    jmp _j{}", before_loop_condition_label);
+
+            // The label after the end of the loop, so the condition can jump here if false.
+            code += &format!("\n    _j{}:", after_loop_label);
+            Ok(code)
+        },
+        AstStatement::DoWhile(condition, body) => {
+            let before_loop_body = global_state.consume_jump_label();
+            let before_loop_condition_label = global_state.consume_jump_label();
+            let after_loop_label = global_state.consume_jump_label();
+
+            let mut code = format!("\n    _j{}:", before_loop_body);
+
+            // Set up the jump labels for break and continue.
+            let mut block_state = block_state.enter_loop(after_loop_label, before_loop_condition_label);
+
+            code += &generate_statement_code(global_state, &mut block_state, body)?;
+
+            code += &format!("\n    _j{}:", before_loop_condition_label);
+
+            // After the loop body, check the condition.
+            code += &generate_expression_code(global_state, &mut block_state, condition)?;
+
+            // Check if the conditional expression was true or false.
+            code += "\n    cmp rax,0";
+
+            // If it was true, jump back to the start of the loop body. Otherwise just continue.
+            code += &format!("\n    jne _j{}", before_loop_body);
+            code += &format!("\n    _j{}:", after_loop_label);
+            Ok(code)
+        },
+        AstStatement::Break => {
+            if let Some(break_label) = block_state.break_label {
+                Ok(format!("\n    jmp _j{}", break_label))
+            } else {
+                Err(String::from("break statement used outside of loop"))
+            }
+        },
+        AstStatement::Continue => {
+            if let Some(continue_label) = block_state.continue_label {
+                Ok(format!("\n    jmp _j{}", continue_label))
+            } else {
+                Err(String::from("continue statement used outside of loop"))
+            }
+        },
     }
+}
+
+fn generate_remaining_for_loop_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, condition : &AstExpression, body : &AstStatement, post_expr_opt : &Option<AstExpression>) -> Result<String, String> {
+    let before_loop_condition_label = global_state.consume_jump_label();
+    let after_body_label = global_state.consume_jump_label();
+    let after_loop_label = global_state.consume_jump_label();
+
+    let mut code = format!("\n    _j{}:", before_loop_condition_label);
+    code += &generate_expression_code(global_state, block_state, condition)?;
+
+    // Check if the conditional expression was true or false.
+    code += "\n    cmp rax,0";
+
+    // If it was false, jump to after the loop body.
+    code += &format!("\n    je _j{}", after_loop_label);
+
+    // Set up the jump labels for break and continue.
+    let mut block_state = block_state.enter_loop(after_loop_label, after_body_label);
+
+    // The loop condition was true, so now include the body's code.
+    code += "\n    ";
+    code += &generate_statement_code(global_state, &mut block_state, body)?;
+
+    // Just before the loop body is a label for the target of a continue statement, which is just before the post
+    // expression.
+    code += &format!("\n    _j{}:", after_body_label);
+
+    // After the loop body, evaluate the post-expression, if present.
+    if let Some(post_expression) = post_expr_opt.as_ref() {
+        code += &generate_expression_code(global_state, &mut block_state, post_expression)?;
+    }
+
+    // At the end of the loop body, jump back to before the loop condition so it can be evaluated again.
+    code += &format!("\n    jmp _j{}", before_loop_condition_label);
+
+    // The label after the end of the loop, so the condition can jump here if false.
+    code += &format!("\n    _j{}:", after_loop_label);
+
+    code += &block_state.generate_end_of_scope_code();
+    Ok(code)
 }
 
 fn generate_binary_operator_code(operator : &AstBinaryOperator, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
@@ -1553,5 +1824,53 @@ r"int main() {{
         test_codegen_mainfunc("int x = 1; { int x = 3; } return x;", 1);
         test_codegen_mainfunc("int x = 1; { int y; } int z = 7; return z;", 7);
         test_codegen_mainfunc_failure("int x = 1; { int x = 3; } int x = 5; return x;");
+    }
+
+    #[test]
+    fn test_while_loop() {
+        test_codegen_mainfunc("int x = 1; while (x < 10) x = x + 1; return x;", 10);
+    }
+
+    #[test]
+    fn test_while_loop_with_break() {
+        test_codegen_mainfunc("int x = 1; while (x < 10) { x = x + 1; break; } return x;", 2);
+    }
+
+    #[test]
+    fn test_while_loop_with_continue() {
+        test_codegen_mainfunc("int x = 1; while (x < 10) { x = x + 1; continue; x = 50; } return x;", 10);
+    }
+
+    #[test]
+    fn test_do_while_loop() {
+        test_codegen_mainfunc("do { return 1; } while (0); return 2;", 1);
+    }
+
+    #[test]
+    fn test_do_while_loop_with_break() {
+        test_codegen_mainfunc("do { break; return 1; } while (0); return 2;", 2);
+    }
+
+    #[test]
+    fn test_do_while_loop_with_continue() {
+        test_codegen_mainfunc("int x = 20; do { continue; } while ((x = 50) < 10); return x;", 50);
+    }
+
+    #[test]
+    fn test_for_loop() {
+        test_codegen_mainfunc("int y = 100; for (int i = 0; i < 10; i = i + 1) y = i; return y;", 9);
+        test_codegen_mainfunc("int y = 100; int i = 150; for (int i = 0; i < 10; i = i + 1) { y = i; } return y + i;", 159);
+        test_codegen_mainfunc("int i = 150; for (i = 0; i < 10; i = i + 1) { } return i;", 10);
+    }
+
+    #[test]
+    fn test_for_loop_with_break() {
+        test_codegen_mainfunc("int i = 150; for (i = 2; i < 10; i = i + 1) { break; i = 20; } return i;", 2);
+        test_codegen_mainfunc("int i = 150; for (i = 2; i < 10; i = i + 1) { if (i == 3) { break; } } return i;", 3);
+    }
+
+    #[test]
+    fn test_for_loop_with_continue() {
+        test_codegen_mainfunc("int i = 150; for (i = 2; i < 10; i = i + 1) { continue; i = 20; } return i;", 10);
     }
 }
