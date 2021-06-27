@@ -14,10 +14,15 @@ use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
 const VARIABLE_SIZE : u32 = 8;
+const RCX_SP_OFFSET : u32 = VARIABLE_SIZE * 1;
+const RDX_SP_OFFSET : u32 = VARIABLE_SIZE * 2;
+const R8_SP_OFFSET : u32 = VARIABLE_SIZE * 3;
+const R9_SP_OFFSET : u32 = VARIABLE_SIZE * 4;
 
 fn generate_random_string(len : usize) -> String {
     thread_rng()
         .sample_iter(&Alphanumeric)
+        .map(char::from)
         .take(len)
         .collect()
 }
@@ -40,13 +45,14 @@ struct Tokens<'i, 't>(&'t [&'i str]);
 
 #[derive(PartialEq, Clone, Debug)]
 struct AstProgram<'i> {
-    main_function : AstFunction<'i>,
+    functions : Vec<AstFunction<'i>>,
 }
 
 #[derive(PartialEq, Clone, Debug)]
 struct AstFunction<'i> {
     name : &'i str,
-    body : Vec<AstBlockItem>,
+    parameters : Vec<String>,
+    body_opt : Option<Vec<AstBlockItem>>,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -106,22 +112,28 @@ enum AstExpression {
     BinaryOperator(AstBinaryOperator, Box<AstExpression>, Box<AstExpression>),
     Assign(String, Box<AstExpression>),
     Conditional(Box<AstExpression>, Box<AstExpression>, Box<AstExpression>),
+    FuncCall(String, Vec<AstExpression>),
 }
 
+#[derive(Clone, PartialEq)]
 struct CodegenGlobalState {
     next_label : u32,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct StackVariable {
-    offset : u32,
+    offset_from_base : i32,
     block_id : u32,
 }
 
 #[derive(Clone)]
 struct CodegenBlockState {
     variables : HashMap<String, StackVariable>,
-    next_offset : u32,
+    next_local_offset_from_base : i32,
+    next_arg_to_func_offset_from_base : u32,
+    next_func_call_arg_offset_from_sp : u32,
+    lowest_local_offet_from_base : i32,
+    frame_size : Option<u32>,
     block_id : u32,
     break_label : Option<u32>,
     continue_label : Option<u32>,
@@ -142,10 +154,10 @@ impl<'i, 't> Tokens<'i, 't> {
 
         if tokens[0] == expected_token {
             *self = remaining_tokens;
-            println!("consumed expected next token {}", expected_token);
+            //println!("consumed expected next token {}", expected_token);
             Ok(self)
         } else {
-            println!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]);
+            //println!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]);
             Err(format!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]))
         }
     }
@@ -169,7 +181,7 @@ impl<'i, 't> Tokens<'i, 't> {
 
         if is_token_identifier(tokens[0]) {
             *self = remaining_tokens;
-            println!("consumed identifier {}", tokens[0]);
+            //println!("consumed identifier {}", tokens[0]);
             Ok(tokens[0])
         } else {
             Err(format!("token \"{}\" is not a variable name", tokens[0]))
@@ -212,6 +224,133 @@ impl<'i, 't> Deref for Tokens<'i, 't> {
     }
 }
 
+impl<'i> AstProgram<'i> {
+    fn lookup_function_definition(&'i self, name : &str) -> Option<&'i AstFunction<'i>> {
+        for func in &self.functions {
+            if func.name == name {
+                return Some(func);
+            }
+        }
+
+        return None;
+    }
+
+    fn collect_all_expressions(&self) -> Vec<&AstExpression> {
+        let mut expressions = vec![];
+        for func in &self.functions {
+            // Only definitions can have statements in them that need to be scanned for expressions.
+            if !func.is_definition() {
+                continue;
+            }
+
+            for block_item in func.body_opt.as_ref().unwrap().iter() {
+                Self::add_expressions_from_block_item(block_item, &mut expressions);
+            }
+        }
+
+        expressions
+    }
+
+    fn add_expressions_from_block_item<'p>(block_item : &'p AstBlockItem, expressions : &mut Vec<&'p AstExpression>) {
+        match block_item {
+            AstBlockItem::Declaration(decl) => {
+                Self::add_expressions_from_declaration(decl, expressions);
+            },
+            AstBlockItem::Statement(stmt) => {
+                Self::add_expressions_from_statement(stmt, expressions);
+            },
+        }
+    }
+
+    fn add_expressions_from_declaration<'p>(declaration : &'p AstDeclaration, expressions : &mut Vec<&'p AstExpression>) {
+        if let AstDeclaration::DeclareVar(_, Some(expr)) = declaration {
+            Self::add_expressions_from_expression(expr, expressions);
+        }
+    }
+
+    fn add_expressions_from_statement<'p>(statement : &'p AstStatement, expressions : &mut Vec<&'p AstExpression>) {
+        match statement {
+            AstStatement::Return(expr) => Self::add_expressions_from_expression(expr, expressions),
+            AstStatement::Expression(expr_opt) => {
+                if let Some(expr) = expr_opt {
+                    Self::add_expressions_from_expression(expr, expressions);
+                }
+            },
+            AstStatement::Conditional(cond, pos_stmt, neg_stmt_opt) => {
+                Self::add_expressions_from_expression(cond, expressions);
+                Self::add_expressions_from_statement(&pos_stmt, expressions);
+                if let Some(neg_stmt) = neg_stmt_opt {
+                    Self::add_expressions_from_statement(neg_stmt, expressions);
+                }
+            },
+            AstStatement::Compound(block_items) => {
+                for block_item in block_items.iter() {
+                    Self::add_expressions_from_block_item(block_item, expressions);
+                }
+            },
+            AstStatement::ForDecl(decl, cond, post_opt, body) => {
+                Self::add_expressions_from_declaration(&decl, expressions);
+
+                Self::add_expressions_from_expression(cond, expressions);
+
+                if let Some(post) = post_opt {
+                    Self::add_expressions_from_expression(post, expressions);
+                }
+
+                Self::add_expressions_from_statement(body, expressions);
+            },
+            AstStatement::For(pre_opt, cond, post_opt, body) => {
+                if let Some(pre) = pre_opt {
+                    Self::add_expressions_from_expression(pre, expressions);
+                }
+
+                Self::add_expressions_from_expression(cond, expressions);
+
+                if let Some(post) = post_opt {
+                    Self::add_expressions_from_expression(post, expressions);
+                }
+
+                Self::add_expressions_from_statement(body, expressions);
+            },
+            AstStatement::While(cond, body) => {
+                Self::add_expressions_from_expression(cond, expressions);
+                Self::add_expressions_from_statement(body, expressions);
+            },
+            AstStatement::DoWhile(cond, body) => {
+                Self::add_expressions_from_expression(cond, expressions);
+                Self::add_expressions_from_statement(body, expressions);
+            },
+            AstStatement::Break => {},
+            AstStatement::Continue => {},
+        }
+    }
+
+    fn add_expressions_from_expression<'p>(expression : &'p AstExpression, expressions : &mut Vec<&'p AstExpression>) {
+        expressions.push(expression);
+
+        match expression {
+            AstExpression::Constant(_) |
+            AstExpression::Variable(_) => expressions.push(expression),
+            AstExpression::UnaryOperator(_, expr) => Self::add_expressions_from_expression(expr, expressions),
+            AstExpression::BinaryOperator(_, expr1, expr2) => {
+                Self::add_expressions_from_expression(expr1, expressions);
+                Self::add_expressions_from_expression(expr2, expressions);
+            },
+            AstExpression::Assign(_, expr) => Self::add_expressions_from_expression(expr, expressions),
+            AstExpression::Conditional(expr1, expr2, expr3) => {
+                Self::add_expressions_from_expression(expr1, expressions);
+                Self::add_expressions_from_expression(expr2, expressions);
+                Self::add_expressions_from_expression(expr3, expressions);
+            },
+            AstExpression::FuncCall(_, args) => {
+                for arg in args.iter() {
+                    Self::add_expressions_from_expression(arg, expressions);
+                }
+            },
+        }
+    }
+}
+
 const MAX_EXPRESSION_LEVEL : u32 = 6;
 impl AstBinaryOperator {
     fn get_precedence_level(&self) -> u32 {
@@ -232,9 +371,17 @@ impl AstBinaryOperator {
     }
 }
 
+impl<'i> AstFunction<'i> {
+    fn is_definition(&self) -> bool {
+        self.body_opt.is_some()
+    }
+}
+
 impl<'i> AstToString for AstProgram<'i> {
     fn ast_to_string(&self, _indent_levels : u32) -> String {
-        format!("{}", self.main_function.ast_to_string(0))
+        self.functions.iter().map(|function| {
+            function.ast_to_string(0)
+        }).collect::<Vec<String>>().join("\n\n")
     }
 }
 
@@ -246,16 +393,26 @@ impl<'i> fmt::Display for AstProgram<'i> {
 
 impl<'i> AstToString for AstFunction<'i> {
     fn ast_to_string(&self, indent_levels : u32) -> String {
-        let mut body_str = String::new();
-        for block_item in &self.body {
-            let result = block_item.ast_to_string(indent_levels);
-            if result.len() != 0 {
-                body_str += "\n";
-                body_str += &result;
-            }
+        fn format_parameter_list(parameters : &Vec<String>) -> String {
+            parameters.iter().map(|param| {
+                format!("int {}", param)
+            }).collect::<Vec<String>>().join(", ")
         }
 
-        format!("{}FUNC {}:{}", Self::get_indent_string(indent_levels), self.name, &body_str)
+        if let Some(body) = self.body_opt.as_ref() {
+            let mut body_str = String::new();
+            for block_item in body {
+                let result = block_item.ast_to_string(indent_levels);
+                if result.len() != 0 {
+                    body_str += "\n";
+                    body_str += &result;
+                }
+            }
+
+            format!("{}FUNC {}({}):{}", Self::get_indent_string(indent_levels), self.name, &format_parameter_list(&self.parameters), &body_str)
+        } else {
+            format!("{}FUNC DECL {}({});", Self::get_indent_string(indent_levels), self.name, &format_parameter_list(&self.parameters))
+        }
     }
 }
 
@@ -406,6 +563,12 @@ impl AstToString for AstExpression {
             AstExpression::Assign(name, expr) => format!("{} = {}", name, expr.ast_to_string(indent_levels)),
             AstExpression::BinaryOperator(operator, left, right) => format!("({}) {} ({})", left.ast_to_string(0), operator.ast_to_string(0), right.ast_to_string(0)),
             AstExpression::Conditional(condition, positive, negative) => format!("({}) ? ({}) : ({})", condition.ast_to_string(0), positive.ast_to_string(0), negative.ast_to_string(0)),
+            AstExpression::FuncCall(name, args) => {
+                let args_string = args.iter().map(|arg| {
+                    arg.ast_to_string(0)
+                }).collect::<Vec<String>>().join(", ");
+                format!("{}({})", name, args_string)
+            },
         }
     }
 }
@@ -457,14 +620,51 @@ impl CodegenGlobalState {
 }
 
 impl CodegenBlockState {
-    fn new() -> CodegenBlockState {
-        CodegenBlockState {
-            variables : HashMap::new(),
-            next_offset : VARIABLE_SIZE,
-            block_id : 0,
-            break_label : None,
-            continue_label : None,
+    fn new(func : &AstFunction, frame_size : Option<u32>) -> CodegenBlockState {
+        let mut block_state =
+            CodegenBlockState {
+                variables : HashMap::new(),
+
+                // When entering a new function, the base pointer points to the return address to the caller. The first
+                // available location to allocate a new stack variable is rbp-8.
+                next_local_offset_from_base : -(VARIABLE_SIZE as i32),
+
+                // The first parameter to the callee is at rbp+8, because rbp+0 is the return address.
+                next_arg_to_func_offset_from_base : VARIABLE_SIZE,
+
+                // Arguments to a function called by this one. When adjusting this, first we reserve stack space for
+                // the whole function, but ultimately at the point of the call instruction, the first argument is at
+                // rsp+0, next is at rsp+8, etc..
+                next_func_call_arg_offset_from_sp : 0,
+
+                // Keep track of the lowest local or temp space offset from the base pointer, which represents the size
+                // of this stack frame.
+                lowest_local_offet_from_base : 0,
+
+                // In order to correctly determine the frame size, code generation needs to make two passes over the
+                // contents of a function. In the first pass, it runs through all the variable and parameter tracking
+                // logic to determine the frame size needed. The frame size determines the rsp adjustment in the
+                // function prologue, so in the second pass the correct rsp offsets of variables and temp locations can
+                // be emitted.
+                frame_size,
+
+                // Reserve block_id 0 specially for function parameters. All local variables go to block_id 1 or higher.
+                block_id : 1,
+                break_label : None,
+                continue_label : None,
+            };
+
+        let mut arg_index = 0;
+        for arg_name in func.parameters.iter() {
+            block_state.add_param(arg_name);
+            arg_index += 1;
         }
+
+        block_state
+    }
+
+    fn new_for_scan(func : &AstFunction) -> CodegenBlockState {
+        CodegenBlockState::new(func, None)
     }
 
     fn nest(&self) -> CodegenBlockState {
@@ -480,44 +680,101 @@ impl CodegenBlockState {
         loop_state
     }
 
-    fn add_var(&mut self, name : &str) -> bool {
+    fn consume_variable_slot(&mut self) {
+        if self.next_local_offset_from_base < self.lowest_local_offet_from_base {
+            self.lowest_local_offet_from_base = self.next_local_offset_from_base;
+        }
+
+        self.next_local_offset_from_base -= VARIABLE_SIZE as i32;
+    }
+
+    fn update_lowest_local_offset_from_base_from_nested(&mut self, nested : &CodegenBlockState) {
+        self.lowest_local_offet_from_base = std::cmp::min(self.lowest_local_offet_from_base, nested.lowest_local_offet_from_base);
+    }
+
+    fn add_stack_var(&mut self, name : &str) -> bool {
         if let Some(var) = self.variables.get(name) {
-            if var.block_id == self.block_id {
-                // Cannot declare the same variable twice in the same block.
+            if var.block_id == self.block_id || var.block_id == 0 {
+                // Cannot declare the same variable twice in the same block, and cannot declare variables in any block
+                // that clash with function parameter names.
                 return false;
             }
             // Else it was declared in an outer block already, so below we will overwrite it with the current block.
         }
 
         // This will either insert a new variable or overwrite a previously declared variable.
-        self.variables.insert(String::from(name), StackVariable { offset : self.next_offset, block_id : self.block_id });
-        self.next_offset += VARIABLE_SIZE;
+        self.variables.insert(String::from(name), StackVariable { offset_from_base : self.next_local_offset_from_base, block_id : self.block_id });
+        self.consume_variable_slot();
         true
     }
 
-    fn get_var_offset(&self, name : &str) -> Option<u32> {
-        self.variables.get(name).map(|value| {
-            value.offset
-        })
-    }
-
-    fn get_allocated_size(&self) -> u32 {
-        self.variables.iter().fold(0, |size, (name, var)| {
-            if var.block_id == self.block_id {
-                size + VARIABLE_SIZE
-            } else {
-                size
-            }
-        })
-    }
-
-    fn generate_end_of_scope_code(&self) -> String {
-        let block_bytes = self.get_allocated_size();
-        if block_bytes > 0 {
-            format!("\n    add rsp,{}", block_bytes)
-        } else {
-            String::new()
+    fn add_param(&mut self, name : &str) -> bool {
+        if let Some(var) = self.variables.get(name) {
+            // Cannot declare the same parameter name twice.
+            assert_eq!(var.block_id, 0);
+            return false;
         }
+
+        // Always add parameters with block id 0 so we can prevent local variables from clashing with them.
+        self.variables.insert(String::from(name), StackVariable { offset_from_base : self.next_arg_to_func_offset_from_base as i32, block_id : 0 });
+        self.next_arg_to_func_offset_from_base += VARIABLE_SIZE;
+        true
+    }
+
+    fn push_temp(&mut self) -> u32 {
+        let offset_from_sp = self.translate_offset_from_base_to_offset_from_sp(self.next_local_offset_from_base);
+        self.consume_variable_slot();
+        offset_from_sp
+    }
+
+    fn pop_temp(&mut self) -> u32 {
+        self.next_local_offset_from_base += VARIABLE_SIZE as i32;
+        let ret = self.translate_offset_from_base_to_offset_from_sp(self.next_local_offset_from_base);
+        ret
+    }
+
+    fn push_arg(&mut self) -> u32 {
+        // Arguments to a function call are pushed in reverse order with the first argument at rsp+0. Make sure to
+        // reserve temp space so the frame is big enough to hold them.
+        self.push_temp();
+
+        let offset_from_sp = self.next_func_call_arg_offset_from_sp;
+        self.next_func_call_arg_offset_from_sp += VARIABLE_SIZE;
+        offset_from_sp
+    }
+
+    fn pop_arg(&mut self) {
+        // Every arg to a function also has temp space reserved to make sure the frame size is big enough, so need to
+        // free the space along with adjusting where the next arg is.
+        self.pop_temp();
+        self.next_func_call_arg_offset_from_sp -= VARIABLE_SIZE;
+    }
+
+    fn get_var_location_str(&self, name : &str) -> Option<String> {
+        let offset_from_base = self.variables.get(name)?.offset_from_base;
+
+        Some(match offset_from_base as u32 {
+            RCX_SP_OFFSET => String::from("rcx"),
+            RDX_SP_OFFSET => String::from("rdx"),
+            R8_SP_OFFSET => String::from("r8"),
+            R9_SP_OFFSET => String::from("r9"),
+            _ => format!("[rsp+{}]", self.translate_offset_from_base_to_offset_from_sp(offset_from_base)),
+        })
+    }
+
+    fn translate_offset_from_base_to_offset_from_sp(&self, offset_from_base : i32) -> u32 {
+        // This assumes the frame size is big enough to hold all of the variables and temp locations needed by this
+        // block. The first local variable is at rbp-8, which will turn into a large rsp offset, since it is "far away"
+        // from rsp. The last allocated local variable will be closest to rsp. Arguments to this function will be even
+        // farther from the rsp, past the rbp.
+        ((self.get_frame_size() as i32) + offset_from_base) as u32
+    }
+
+    fn get_frame_size(&self) -> u32 {
+        // This object is used either to just track and calculate the frame size (in which case self.frame_size is None,
+        // and the result of this function is the speculative frame size, until the traversal of the function body is
+        // complete), or to actually generate code, in which case the frame size is a fixed value.
+        self.frame_size.unwrap_or(-self.lowest_local_offet_from_base as u32)
     }
 }
 
@@ -546,6 +803,7 @@ fn lex_next_token<'i>(input : &'i str)  -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^=").expect("failed to compile regex"),
             Regex::new(r"^\?").expect("failed to compile regex"),
             Regex::new(r"^:").expect("failed to compile regex"),
+            Regex::new(r"^,").expect("failed to compile regex"),
             Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
             Regex::new(r"^[0-9]+").expect("failed to compile regex"),
         ];
@@ -562,7 +820,7 @@ fn lex_next_token<'i>(input : &'i str)  -> Result<(&'i str, &'i str), String> {
     Err(format!("unrecognized token starting at {}", input))
 }
 
-fn lex_all_tokens<'i>(input : &'i str) -> Result<Vec<&'i str>, String> {
+fn lex_all_tokens<'i>(input : &'i str) -> Result<Vec<&'i str>, Vec<String>> {
     let mut tokens : Vec<&'i str> = vec![];
 
     let mut remaining_input = input.trim();
@@ -574,7 +832,7 @@ fn lex_all_tokens<'i>(input : &'i str) -> Result<Vec<&'i str>, String> {
                 //println!("token: {}", split.0);
                 remaining_input = split.1.trim();
             },
-            Err(msg) => return Err(msg)
+            Err(msg) => return Err(vec![msg])
         }
     }
 
@@ -582,10 +840,14 @@ fn lex_all_tokens<'i>(input : &'i str) -> Result<Vec<&'i str>, String> {
 }
 
 fn parse_program<'i, 't>(mut tokens : Tokens<'i, 't>) -> Result<AstProgram<'i>, String> {
-    let function = parse_function(&mut tokens)?;
+    let mut functions = vec![];
+    while let Ok(function) = parse_function(&mut tokens) {
+        functions.push(function);
+    }
+
     if tokens.0.len() == 0 {
         Ok(AstProgram {
-            main_function: function,
+            functions,
         })
     } else {
         Err(format!("extra tokens after main function end: {:?}", tokens))
@@ -598,27 +860,54 @@ fn parse_function<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstFu
     tokens.consume_expected_next_token("int")?;
     let name = tokens.consume_next_token()?;
     tokens.consume_expected_next_token("(")?;
-    tokens.consume_expected_next_token(")")?;
-    tokens.consume_expected_next_token("{")?;
 
-    // Parse out all the block items possible.
-    let mut block_items = vec![];
-    loop {
-        let res = parse_block_item(&mut tokens);
-        if let Ok(block_item) = res {
-            block_items.push(block_item);
-        } else {
-            break;
-        }
+    let mut parameters = vec![];
+    while let Ok(parameter_name) = parse_function_parameter(&mut tokens, parameters.len() == 0) {
+        parameters.push(String::from(parameter_name));
     }
 
-    tokens.consume_expected_next_token("}")?;
+    tokens.consume_expected_next_token(")")?;
+
+    let block_items_opt;
+    if tokens.consume_expected_next_token("{").is_ok() {
+        // Parse out all the block items possible.
+        let mut block_items = vec![];
+        loop {
+            let res = parse_block_item(&mut tokens);
+            if let Ok(block_item) = res {
+                block_items.push(block_item);
+            } else {
+                break;
+            }
+        }
+
+        tokens.consume_expected_next_token("}")?;
+        block_items_opt = Some(block_items);
+    } else {
+        tokens.consume_expected_next_token(";")?;
+        block_items_opt = None;
+    }
 
     *original_tokens = tokens;
     Ok(AstFunction {
         name,
-        body : block_items,
+        parameters,
+        body_opt : block_items_opt,
     })
+}
+
+fn parse_function_parameter<'i, 't>(original_tokens : &mut Tokens<'i, 't>, is_first_parameter : bool) -> Result<&'i str, String> {
+    let mut tokens = original_tokens.clone();
+
+    if !is_first_parameter {
+        tokens.consume_expected_next_token(",")?;
+    }
+
+    tokens.consume_expected_next_token("int")?;
+
+    let var_name = tokens.consume_next_token()?;
+    *original_tokens = tokens;
+    Ok(var_name)
 }
 
 fn parse_block_item<'i, 't>(tokens : &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
@@ -753,6 +1042,29 @@ fn parse_remaining_for_statement<'i, 't>(original_tokens : &mut Tokens<'i, 't>) 
     Ok((condition, post_expr_opt, body))
 }
 
+fn parse_func_call<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+    let mut tokens = original_tokens.clone();
+
+    let function_name = tokens.consume_identifier()?;
+    tokens.consume_expected_next_token("(")?;
+
+    let mut arguments = vec![];
+    loop {
+        if tokens.consume_expected_next_token(")").is_ok() {
+            break;
+        }
+
+        if arguments.len() != 0 {
+            tokens.consume_expected_next_token(",")?;
+        }
+
+        arguments.push(parse_expression(&mut tokens)?);
+    }
+
+    *original_tokens = tokens;
+    Ok(AstExpression::FuncCall(function_name.to_string(), arguments))
+}
+
 fn parse_unary_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
     let mut tokens = original_tokens.clone();
 
@@ -768,6 +1080,9 @@ fn parse_unary_expression<'i, 't>(original_tokens : &mut Tokens<'i, 't>) -> Resu
         let inner = parse_unary_expression(&mut tokens)?;
         *original_tokens = tokens;
         Ok(AstExpression::UnaryOperator(operator, Box::new(inner)))
+    } else if let Ok(func_call) = parse_func_call(&mut tokens) {
+        *original_tokens = tokens;
+        Ok(func_call)
     } else {
         let variable_name = tokens.consume_identifier()?;
         *original_tokens = tokens;
@@ -851,33 +1166,50 @@ r"INCLUDELIB msvcrt.lib
 .DATA
 
 .CODE
-start:
 ";
     const FOOTER : &str =
-r"END
-";
+r"
+END";
 
+    let mut asm = String::from(HEADER);
     let mut codegen_state = CodegenGlobalState::new();
-    generate_function_code(&mut codegen_state, &ast_program.main_function).map(|main_code| {
-        String::from(HEADER) + &main_code + "\n" + FOOTER
-    })
+
+    for function in &ast_program.functions {
+        asm += &generate_function_code(&mut codegen_state, function)?;
+        asm += "\n";
+    }
+
+    asm += FOOTER;
+    Ok(asm)
 }
 
 fn generate_function_code(global_state : &mut CodegenGlobalState, ast_function : &AstFunction) -> Result<String, String> {
-    let mut block_state = CodegenBlockState::new();
-    let mut code = format!("{} PROC\n    push rbp\n    mov rbp,rsp", ast_function.name);
+    if let Some(body) = ast_function.body_opt.as_ref() {
+        let mut block_state_temp = CodegenBlockState::new_for_scan(ast_function);
 
-    for block_item in &ast_function.body {
-        let result = generate_block_item_code(global_state, &mut block_state, block_item);
-        if let Ok(block_item_code) = result {
-            code += &block_item_code;
-        } else {
-            return result;
+        // Compute frame size
+        let mut global_state_temp = global_state.clone();
+        for block_item in body {
+            generate_block_item_code(global_state, &mut block_state_temp, block_item);
         }
-    }
 
-    // Add a default return of 0 in case the code in the function body didn't put a return statement.
-    Ok(code + &format!("\n    mov rsp,rbp\n    pop rbp\n    ret\n{} ENDP", ast_function.name))
+        let mut block_state = CodegenBlockState::new(ast_function, Some(block_state_temp.get_frame_size()));
+        let mut code = format!("{} PROC\n    sub rsp,{}", ast_function.name, block_state.get_frame_size());
+
+        for block_item in body {
+            let result = generate_block_item_code(global_state, &mut block_state, block_item);
+            if let Ok(block_item_code) = result {
+                code += &block_item_code;
+            } else {
+                return result;
+            }
+        }
+
+        // Add a default return of 0 in case the code in the function body didn't put a return statement.
+        Ok(code + &format!("\n    add rsp,{}\n    ret\n{} ENDP", block_state.get_frame_size(), ast_function.name))
+    } else {
+        Ok(format!("EXTERN {} :PROC", ast_function.name))
+    }
 }
 
 fn generate_block_item_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, ast_block_item : &AstBlockItem) -> Result<String, String> {
@@ -890,7 +1222,7 @@ fn generate_block_item_code(global_state : &mut CodegenGlobalState, block_state 
 fn generate_declaration_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, ast_declaration : &AstDeclaration) -> Result<String, String> {
     match ast_declaration {
         AstDeclaration::DeclareVar(name, expr_opt) => {
-            if !block_state.add_var(&name) {
+            if !block_state.add_stack_var(&name) {
                 return Err(format!("variable {} already defined", name));
             }
 
@@ -899,14 +1231,13 @@ fn generate_declaration_code(global_state : &mut CodegenGlobalState, block_state
                 let result = generate_expression_code(global_state, block_state, expr);
                 if let Ok(expr_code) = result {
                     code += &expr_code;
+
+                    // The assignment expression is in rax and should be stored at the variable's location.
+                    code += &format!("\n    mov {},rax ; {} <- rax", block_state.get_var_location_str(&name).unwrap(), &name);
                 } else {
                     return result;
                 }
             }
-
-            // The assignment expression (or junk data, if no expression was used) is in rax and should be stored at the
-            // variable's location on the stack.
-            code += "\n    push rax";
             Ok(code)
         },
     }
@@ -915,9 +1246,8 @@ fn generate_declaration_code(global_state : &mut CodegenGlobalState, block_state
 fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, ast_statement : &AstStatement) -> Result<String, String> {
     match ast_statement {
         AstStatement::Return(expr) => {
-            generate_expression_code(global_state, block_state, expr).and_then(|expr_code| {
-                Ok(format!("{}\n    mov rsp,rbp\n    pop rbp\n    ret", expr_code))
-            })
+            let expr_code = generate_expression_code(global_state, block_state, expr)?;
+            Ok(format!("{}\n    add rsp,{}\n    ret", expr_code, block_state.get_frame_size()))
         },
         AstStatement::Expression(Some(expr)) => {
             generate_expression_code(global_state, block_state, expr)
@@ -963,29 +1293,35 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state :
                 code += &generate_block_item_code(global_state, &mut inner_block_state, block_item)?;
             }
 
-            code += &inner_block_state.generate_end_of_scope_code();
+            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
+
             Ok(code)
         },
         AstStatement::For(expr_opt, condition, post_expr_opt, body) => {
             let mut code = String::new();
 
             // The header of the for loop is in its own scope, for declarations.
-            let mut block_state = block_state.nest();
+            let mut inner_block_state = block_state.nest();
 
             if let Some(pre_expression) = expr_opt.as_ref()  {
-                code += &generate_expression_code(global_state, &mut block_state, pre_expression)?;
+                code += &generate_expression_code(global_state, &mut inner_block_state, pre_expression)?;
             }
 
-            code += &generate_remaining_for_loop_code(global_state, &mut block_state, condition, body, post_expr_opt)?;
+            code += &generate_remaining_for_loop_code(global_state, &mut inner_block_state, condition, body, post_expr_opt)?;
+
+            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
+
             Ok(code)
         },
         AstStatement::ForDecl(declaration, condition, post_expr_opt, body) => {
             let mut code = String::new();
 
             // The header of the for loop is in its own scope, for declarations.
-            let mut block_state = block_state.nest();
-            code += &generate_declaration_code(global_state, &mut block_state, declaration)?;
-            code += &generate_remaining_for_loop_code(global_state, &mut block_state, condition, body, post_expr_opt)?;
+            let mut inner_block_state = block_state.nest();
+            code += &generate_declaration_code(global_state, &mut inner_block_state, declaration)?;
+            code += &generate_remaining_for_loop_code(global_state, &mut inner_block_state, condition, body, post_expr_opt)?;
+
+            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
 
             Ok(code)
         },
@@ -1003,17 +1339,20 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state :
             code += &format!("\n    je _j{}", after_loop_label);
 
             // Set up the jump labels for break and continue.
-            let mut block_state = block_state.enter_loop(after_loop_label, before_loop_condition_label);
+            let mut inner_block_state = block_state.enter_loop(after_loop_label, before_loop_condition_label);
 
             // The loop condition was true, so now include the body's code.
             code += "\n    ";
-            code += &generate_statement_code(global_state, &mut block_state, body)?;
+            code += &generate_statement_code(global_state, &mut inner_block_state, body)?;
 
             // At the end of the loop body, jump back to before the loop condition so it can be evaluated again.
             code += &format!("\n    jmp _j{}", before_loop_condition_label);
 
             // The label after the end of the loop, so the condition can jump here if false.
             code += &format!("\n    _j{}:", after_loop_label);
+
+            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
+
             Ok(code)
         },
         AstStatement::DoWhile(condition, body) => {
@@ -1024,14 +1363,14 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state :
             let mut code = format!("\n    _j{}:", before_loop_body);
 
             // Set up the jump labels for break and continue.
-            let mut block_state = block_state.enter_loop(after_loop_label, before_loop_condition_label);
+            let mut inner_block_state = block_state.enter_loop(after_loop_label, before_loop_condition_label);
 
-            code += &generate_statement_code(global_state, &mut block_state, body)?;
+            code += &generate_statement_code(global_state, &mut inner_block_state, body)?;
 
             code += &format!("\n    _j{}:", before_loop_condition_label);
 
             // After the loop body, check the condition.
-            code += &generate_expression_code(global_state, &mut block_state, condition)?;
+            code += &generate_expression_code(global_state, &mut inner_block_state, condition)?;
 
             // Check if the conditional expression was true or false.
             code += "\n    cmp rax,0";
@@ -1039,6 +1378,9 @@ fn generate_statement_code(global_state : &mut CodegenGlobalState, block_state :
             // If it was true, jump back to the start of the loop body. Otherwise just continue.
             code += &format!("\n    jne _j{}", before_loop_body);
             code += &format!("\n    _j{}:", after_loop_label);
+
+            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
+
             Ok(code)
         },
         AstStatement::Break => {
@@ -1073,11 +1415,11 @@ fn generate_remaining_for_loop_code(global_state : &mut CodegenGlobalState, bloc
     code += &format!("\n    je _j{}", after_loop_label);
 
     // Set up the jump labels for break and continue.
-    let mut block_state = block_state.enter_loop(after_loop_label, after_body_label);
+    let mut inner_block_state = block_state.enter_loop(after_loop_label, after_body_label);
 
     // The loop condition was true, so now include the body's code.
     code += "\n    ";
-    code += &generate_statement_code(global_state, &mut block_state, body)?;
+    code += &generate_statement_code(global_state, &mut inner_block_state, body)?;
 
     // Just before the loop body is a label for the target of a continue statement, which is just before the post
     // expression.
@@ -1085,7 +1427,7 @@ fn generate_remaining_for_loop_code(global_state : &mut CodegenGlobalState, bloc
 
     // After the loop body, evaluate the post-expression, if present.
     if let Some(post_expression) = post_expr_opt.as_ref() {
-        code += &generate_expression_code(global_state, &mut block_state, post_expression)?;
+        code += &generate_expression_code(global_state, &mut inner_block_state, post_expression)?;
     }
 
     // At the end of the loop body, jump back to before the loop condition so it can be evaluated again.
@@ -1094,11 +1436,12 @@ fn generate_remaining_for_loop_code(global_state : &mut CodegenGlobalState, bloc
     // The label after the end of the loop, so the condition can jump here if false.
     code += &format!("\n    _j{}:", after_loop_label);
 
-    code += &block_state.generate_end_of_scope_code();
+    block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
+
     Ok(code)
 }
 
-fn generate_binary_operator_code(operator : &AstBinaryOperator, global_state : &mut CodegenGlobalState, rhs_code : &str) -> String {
+fn generate_binary_operator_code(operator : &AstBinaryOperator, global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, rhs_code : &str, lhs_temp_location : &str) -> String {
     match operator {
         AstBinaryOperator::Or => {
             let label = global_state.consume_jump_label();
@@ -1109,31 +1452,39 @@ fn generate_binary_operator_code(operator : &AstBinaryOperator, global_state : &
             format!("\n    cmp rax,0\n    je _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
         },
         _ => {
-            format!("\n    push rax\n{}", rhs_code) +
-            &match operator {
-                AstBinaryOperator::Equals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    sete al"),
-                AstBinaryOperator::NotEquals => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setne al"),
-                AstBinaryOperator::LessThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setl al"),
-                AstBinaryOperator::GreaterThan => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setg al"),
-                AstBinaryOperator::LessThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setle al"),
-                AstBinaryOperator::GreaterThanEqual => format!("\n    pop rcx\n    cmp rcx,rax\n    mov rax,0\n    setge al"),
-                AstBinaryOperator::Plus => format!("\n    pop rcx\n    add rax,rcx"),
-                AstBinaryOperator::Minus => format!("\n    pop rcx\n    sub rcx,rax\n    mov rax,rcx"),
-                AstBinaryOperator::Multiply => format!("\n    mov rcx,rax\n    pop rax\n    imul rax,rcx"),
-                AstBinaryOperator::Divide => format!("\n    mov rcx,rax\n    pop rax\n    cdq\n    idiv ecx"),
+            // The left side of the operator's code was emitted just before this, and stores the result in rax. Move it
+            // to temp stack space so that rax can be repurposed for the right hand side expression.
+            let mut code = format!("\n    mov {},rax ; lhs_temp <- rax", lhs_temp_location);
+
+            // Emit the right side code and then the code for the operand that combines it with the left side code from
+            // its temp location.
+            code += rhs_code;
+            code += &match operator {
+                AstBinaryOperator::Equals => format!("\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    sete al", lhs_temp_location),
+                AstBinaryOperator::NotEquals => format!("\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setne al", lhs_temp_location),
+                AstBinaryOperator::LessThan => format!("\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setl al", lhs_temp_location),
+                AstBinaryOperator::GreaterThan => format!("\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setg al", lhs_temp_location),
+                AstBinaryOperator::LessThanEqual => format!("\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setle al", lhs_temp_location),
+                AstBinaryOperator::GreaterThanEqual => format!("\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setge al", lhs_temp_location),
+                AstBinaryOperator::Plus => format!("\n    mov r10,{}\n    add rax,r10", lhs_temp_location),
+                AstBinaryOperator::Minus => format!("\n    mov r10,{}\n    sub r10,rax\n    mov rax,r10", lhs_temp_location),
+                AstBinaryOperator::Multiply => format!("\n    mov r10,rax\n    mov rax,{}\n    imul rax,r10", lhs_temp_location),
+                AstBinaryOperator::Divide => format!("\n    mov r10,rax\n    mov rax,{}\n    cdq\n    idiv r10d", lhs_temp_location),
                 AstBinaryOperator::Or => panic!("unexpected"),
                 AstBinaryOperator::And => panic!("unexpected"),
-            }
+            };
+
+            code
         },
     }
 }
 
-fn generate_expression_code(global_state : &mut CodegenGlobalState, block_state : &CodegenBlockState, ast_node : &AstExpression) -> Result<String, String> {
+fn generate_expression_code(global_state : &mut CodegenGlobalState, block_state : &mut CodegenBlockState, ast_node : &AstExpression) -> Result<String, String> {
     match ast_node {
         AstExpression::Constant(val) => Ok(format!("\n    mov rax,{}", val)),
         AstExpression::Variable(name) => {
-            block_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).map(|offset| {
-                format!("\n    mov rax,[rbp-{}]", offset)
+            block_state.get_var_location_str(&name).ok_or(format!("unknown variable {}", name)).map(|location| {
+                format!("\n    mov rax,{} ; rax <- {}", &location, &name)
             })
         },
         AstExpression::UnaryOperator(operator, expr) => {
@@ -1146,14 +1497,22 @@ fn generate_expression_code(global_state : &mut CodegenGlobalState, block_state 
             })
         },
         AstExpression::BinaryOperator(operator, left, right) => {
+            // The left hand side is emitted first. Like all expressions, the result is stored in rax. Then we need to
+            // allocate temp space to hold that lhs result before performing the rhs.
             let left_code = generate_expression_code(global_state, block_state, &left)?;
+
+            let lhs_temp_offset_from_sp = block_state.push_temp();
             let right_code = generate_expression_code(global_state, block_state, &right)?;
-            Ok(left_code + &generate_binary_operator_code(&operator, global_state, &right_code))
+
+            let result = Ok(left_code + &generate_binary_operator_code(&operator, global_state, block_state, &right_code, &format!("[rsp+{}]", lhs_temp_offset_from_sp)));
+            block_state.pop_temp();
+
+            result
         },
         AstExpression::Assign(name, expr) => {
             generate_expression_code(global_state, block_state, expr).and_then(|expr_code| {
-                block_state.get_var_offset(&name).ok_or(format!("unknown variable {}", name)).and_then(|offset| {
-                    Ok(format!("{}\n    mov [rbp-{}],rax", expr_code, offset))
+                block_state.get_var_location_str(&name).ok_or(format!("unknown variable {}", name)).and_then(|location| {
+                    Ok(format!("{}\n    mov {},rax ; {} <- rax", expr_code, &location, &name))
                 })
             })
         },
@@ -1184,6 +1543,109 @@ fn generate_expression_code(global_state : &mut CodegenGlobalState, block_state 
 
             Ok(code)
         },
+        AstExpression::FuncCall(name, args) => {
+            let mut code = String::new();
+
+            // Allocate temp space for the expression results as they are computed. Store and remember them because
+            // more temp space will be allocated below when copying the parameters into the correct locations for
+            // passing to the callee. In other words, store and remember them so that we don't interleave pop with
+            // more push calls below.
+            let mut arg_sp_offsets = vec![];
+            for arg_expr in args.iter() {
+                code += &generate_expression_code(global_state, block_state, arg_expr)?;
+                let arg_temp_offset_from_sp = block_state.push_temp();
+                arg_sp_offsets.push(arg_temp_offset_from_sp);
+                code += &format!("\n    mov [rsp+{}],rax ; temp <- rax", arg_temp_offset_from_sp);
+            }
+
+            // Must reserve space for the first 4 args, whether they are used or not and even though they're being
+            // stored in registers rather than on the stack. This code looks weird because it appears to do nothing
+            // (pushes and pops without any interleaving access), but it has a side effect of recording the required
+            // frame size.
+            for _ in 0 .. 4 {
+                block_state.push_arg();
+            }
+
+            // Push the arguments onto the stack in reverse order, as required by calling convention.
+            for _ in args.iter().rev() {
+                // Grab the last temp value location from the stored list. The length is then the index of the arg.
+                let arg_temp_offset_from_sp = arg_sp_offsets.pop().unwrap();
+
+                let dest =
+                    match arg_sp_offsets.len() {
+                        0 => String::from("rcx"),
+                        1 => String::from("rdx"),
+                        2 => String::from("r8"),
+                        3 => String::from("r9"),
+                        _ => format!("[rsp+{}]", block_state.push_arg()),
+                    };
+
+                code += &format!("\n    mov r10,[rsp+{}]", arg_temp_offset_from_sp);
+                code += &format!("\n    mov {},r10 ; arg {} <- temp", dest, arg_sp_offsets.len());
+            }
+
+            code += &format!("\n    call {}", name);
+
+            // Pop all the temp values, making sure to pop at least the 4 that are always reserved.
+            for _ in 0 .. std::cmp::max(args.len(), 4) {
+                block_state.pop_arg();
+            }
+
+            // Pop all the temp expression values used before setting up the parameters.
+            for _ in args.iter() {
+                block_state.pop_temp();
+            }
+
+            Ok(code)
+        },
+    }
+}
+
+fn validate_ast(ast_program : &AstProgram) -> Result<(), Vec<String>> {
+    let mut errors = vec![];
+
+    for function in &ast_program.functions {
+        let mut num_definitions = 0;
+        let mut param_count_opt = None;
+        for func in &ast_program.functions {
+            if func.name == function.name {
+                // Check for multiple definitions of the same function.
+                if func.is_definition() {
+                    num_definitions += 1;
+
+                    if num_definitions > 1 {
+                        errors.push(format!("found {} definitions of function \"{}\"", num_definitions, function.name));
+                        return Err(errors);
+                    }
+                }
+
+                // Check for declarations of the same function with different parameter counts.
+                if let Some(param_count) = param_count_opt {
+                    if param_count != func.parameters.len() {
+                        errors.push(format!("function {} re-delcaration with wrong parameter count {}. previously defined with parameter count {}", func.name, func.parameters.len(), param_count));
+                        return Err(errors);
+                    }
+                } else {
+                    param_count_opt = Some(func.parameters.len());
+                }
+            }
+        }
+    }
+
+    let all_expressions = ast_program.collect_all_expressions();
+    for expression in &all_expressions {
+        if let AstExpression::FuncCall(name, args) = expression {
+            let func = ast_program.lookup_function_definition(&name).unwrap();
+            if func.parameters.len() != args.len() {
+                errors.push(format!("function {} called with wrong parameter count {}. Should be {}.", &name, args.len(), func.parameters.len()));
+            }
+        }
+    }
+
+    if errors.len() == 0 {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 
@@ -1224,25 +1686,49 @@ fn assemble_and_link(code : &str, exe_path : &str, should_suppress_output : bool
     status.code()
 }
 
+// TODO should return line numbers with errors
+fn parse_and_validate<'i>(input : &'i str) -> Result<AstProgram<'i>, Vec<String>> {
+    let tokens = lex_all_tokens(&input)?;
+    /*
+    for token in tokens.iter() {
+        println!("{}", token);
+    }
+
+    println!();
+    */
+
+    // TODO all parsing should return a list of errors, not just one. for now, wrap it in a single error
+    let ast = parse_program(Tokens(&tokens)).map_err(|e| { vec![e] })?;
+    println!("AST:\n{}\n", ast);
+
+    validate_ast(&ast)?;
+
+    Ok(ast)
+}
+
 fn compile_and_link(input : &str, output_exe : &str, should_suppress_output : bool) -> Result<i32, String> {
-    lex_all_tokens(&input).and_then(|tokens| {
-        for token in tokens.iter() {
-            println!("{}", token);
-        }
+    match parse_and_validate(input) {
+        Ok(ast) => {
+            let asm = generate_program_code(&ast)?;
+            println!("assembly:\n{}", asm);
 
-        println!();
+            let exit_code = assemble_and_link(&asm, output_exe, should_suppress_output).expect("programs should always have an exit code");
+            println!("assemble status: {:?}", exit_code);
 
-        parse_program(Tokens(&tokens)).and_then(|ast| {
-            println!("AST:\n{}\n", ast);
+            Ok(exit_code)
+        },
+        Err(errors) => {
+            if errors.len() > 1 {
+                for error_message in errors.iter().skip(1) {
+                    println!("Error: {}", error_message);
+                }
+            }
 
-            generate_program_code(&ast).and_then(|asm| {
-                println!("assembly:\n{}", asm);
-                let exit_code = assemble_and_link(&asm, output_exe, should_suppress_output).expect("programs should always have an exit code");
-                println!("assemble status: {:?}", exit_code);
-                Ok(exit_code)
-            })
-        })
-    })
+            // For now return just the first error
+            let error_message = errors.get(0).unwrap();
+            Err(error_message.clone())
+        },
+    }
 }
 
 fn main() {
@@ -1297,362 +1783,6 @@ r"int main(){return 2;}";
         assert_eq!(lex_all_tokens("int main() { return !1; }"), Ok(vec!["int", "main", "(", ")", "{", "return", "!", "1", ";", "}"]));
     }
 
-    /* TODO re-enable parse tests when the AST is a bit more stable
-    fn make_factor_expression(factor : AstFactor) -> AstExpression {
-        AstExpression::new(AstTerm::new(factor))
-    }
-
-    fn make_constant_term(value : u32) -> AstTerm {
-        AstTerm {
-            inner : AstFactor::Constant(value),
-            binary_ops : vec![],
-        }
-    }
-
-    fn test_parse_simple(value : u32) {
-        let input = format!(
-r"int main() {{
-    return {};
-}}", value);
-
-        assert_eq!(
-            parse_program(&lex_all_tokens(&input).unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        make_factor_expression(AstFactor::Constant(value))
-                    )
-                },
-            })
-        );
-    }
-
-    fn test_parse_failure(input : &str) {
-        assert!(parse_program(&lex_all_tokens(input).unwrap()).is_err());
-    }
-
-    #[test]
-    fn parse_return_0() {
-        test_parse_simple(0);
-    }
-
-    #[test]
-    fn parse_return_2() {
-        test_parse_simple(2);
-    }
-
-    #[test]
-    fn parse_return_multi_digit() {
-        test_parse_simple(12345);
-    }
-
-    #[test]
-    fn parse_error_missing_open_paren() {
-        test_parse_failure("int main) { return 1; }");
-    }
-
-    #[test]
-    fn parse_error_missing_close_paren() {
-        test_parse_failure("int main( { return 1; }");
-    }
-
-    #[test]
-    fn parse_error_missing_retval() {
-        test_parse_failure("int main() { return; }");
-    }
-
-    #[test]
-    fn parse_error_missing_close_brace() {
-        test_parse_failure("int main() { return;");
-    }
-
-    #[test]
-    fn parse_error_missing_statement_semicolon() {
-        test_parse_failure("int main() { return }");
-        test_parse_failure("int main() { return 5 }");
-        test_parse_failure("int main() { return !5 }");
-    }
-
-    #[test]
-    fn parse_error_missing_statement_missing_space() {
-        test_parse_failure("int main() { return0; }");
-    }
-
-    #[test]
-    fn parse_error_missing_statement_return_wrong_case() {
-        test_parse_failure("int main() { RETURN 0; }");
-    }
-
-    #[test]
-    fn parse_error_extra_token() {
-        test_parse_failure("int main() { return 0; }}");
-    }
-
-    #[test]
-    fn parse_error_missing_unary_operand() {
-        test_parse_failure("int main() { return !; }}");
-        test_parse_failure("int main() { return !-~; }}");
-    }
-
-    #[test]
-    fn parse_error_unary_operand_misorder() {
-        test_parse_failure("int main() { return 5!; }}");
-        test_parse_failure("int main() { return 5-; }}");
-        test_parse_failure("int main() { return 5~; }}");
-    }
-
-    fn test_parse_single_unary_operator(token : &str, operator : AstUnaryOperator) {
-        assert_eq!(
-            parse_program(&lex_all_tokens(&format!("int main() {{ return {}1; }}", token)).unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        make_factor_expression(AstFactor::UnaryOperator(operator, Box::new(AstFactor::Constant(1))))
-                    )
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn parse_single_unary_operators() {
-        test_parse_single_unary_operator("-", AstUnaryOperator::Negation);
-        test_parse_single_unary_operator("~", AstUnaryOperator::BitwiseNot);
-        test_parse_single_unary_operator("!", AstUnaryOperator::LogicalNot);
-    }
-
-    #[test]
-    fn test_parse_multi_unary_operators() {
-        assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return -~!1; }").unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        make_factor_expression(
-                            AstFactor::UnaryOperator(
-                                AstUnaryOperator::Negation,
-                                Box::new(AstFactor::UnaryOperator(
-                                    AstUnaryOperator::BitwiseNot,
-                                    Box::new(AstFactor::UnaryOperator(
-                                        AstUnaryOperator::LogicalNot,
-                                        Box::new(AstFactor::Constant(1))
-                                    ))
-                                ))
-                            )
-                        )
-                    )
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_single_binary_expression_operation() {
-        assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 + 4; }").unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        AstExpression {
-                            inner : make_constant_term(3),
-                            binary_ops : vec![
-                                AstAdditiveExpressionBinaryOperation {
-                                    operator : AstAdditiveExpressionBinaryOperator::Plus,
-                                    rhs : make_constant_term(4),
-                                },
-                            ],
-                        }
-                    )
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_multi_binary_expression_operation() {
-        assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 + 4 - 5; }").unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        AstExpression {
-                            inner : make_constant_term(3),
-                            binary_ops : vec![
-                                AstAdditiveExpressionBinaryOperation {
-                                    operator : AstAdditiveExpressionBinaryOperator::Plus,
-                                    rhs : make_constant_term(4),
-                                },
-                                AstAdditiveExpressionBinaryOperation {
-                                    operator : AstAdditiveExpressionBinaryOperator::Minus,
-                                    rhs : make_constant_term(5),
-                                },
-                            ],
-                        }
-                    )
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_single_binary_term_operation() {
-        assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 * 4; }").unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        AstExpression::new(
-                            AstTerm {
-                                inner : AstFactor::Constant(3),
-                                binary_ops : vec![
-                                    AstTermBinaryOperation {
-                                        operator : AstTermBinaryOperator::Multiply,
-                                        rhs : AstFactor::Constant(4)
-                                    },
-                                ],
-                            },
-                        )
-                    )
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_multi_binary_term_operation() {
-        assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 * 4 / 5; }").unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        AstExpression::new(
-                            AstTerm {
-                                inner : AstFactor::Constant(3),
-                                binary_ops : vec![
-                                    AstTermBinaryOperation {
-                                        operator : AstTermBinaryOperator::Multiply,
-                                        rhs : AstFactor::Constant(4)
-                                    },
-                                    AstTermBinaryOperation {
-                                        operator : AstTermBinaryOperator::Divide,
-                                        rhs : AstFactor::Constant(5)
-                                    },
-                                ],
-                            },
-                        )
-                    )
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_multi_binary_expression_and_term_operations() {
-        assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 * 4 / 5 + 6 * 7 / 8 - 11 / 10 * 9; }").unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        AstExpression {
-                            inner : AstTerm {
-                                inner : AstFactor::Constant(3),
-                                binary_ops : vec![
-                                    AstTermBinaryOperation {
-                                        operator : AstTermBinaryOperator::Multiply,
-                                        rhs : AstFactor::Constant(4)
-                                    },
-                                    AstTermBinaryOperation {
-                                        operator : AstTermBinaryOperator::Divide,
-                                        rhs : AstFactor::Constant(5)
-                                    },
-                                ],
-                            },
-                            binary_ops : vec![
-                                AstAdditiveExpressionBinaryOperation {
-                                    operator : AstAdditiveExpressionBinaryOperator::Plus,
-                                    rhs : AstTerm {
-                                        inner : AstFactor::Constant(6),
-                                        binary_ops : vec![
-                                            AstTermBinaryOperation {
-                                                operator : AstTermBinaryOperator::Multiply,
-                                                rhs : AstFactor::Constant(7)
-                                            },
-                                            AstTermBinaryOperation {
-                                                operator : AstTermBinaryOperator::Divide,
-                                                rhs : AstFactor::Constant(8)
-                                            },
-                                        ],
-                                    },
-                                },
-                                AstAdditiveExpressionBinaryOperation {
-                                    operator : AstAdditiveExpressionBinaryOperator::Minus,
-                                    rhs : AstTerm {
-                                        inner : AstFactor::Constant(11),
-                                        binary_ops : vec![
-                                            AstTermBinaryOperation {
-                                                operator : AstTermBinaryOperator::Divide,
-                                                rhs : AstFactor::Constant(10)
-                                            },
-                                            AstTermBinaryOperation {
-                                                operator : AstTermBinaryOperator::Multiply,
-                                                rhs : AstFactor::Constant(9)
-                                            },
-                                        ],
-                                    },
-                                },
-                            ],
-                        }
-                    )
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_binary_operator_grouping() {
-        assert_eq!(
-            parse_program(&lex_all_tokens("int main() { return 3 * (4 + 5); }").unwrap()),
-            Ok(AstProgram {
-                main_function: AstFunction {
-                    name: "main",
-                    body: AstStatement::Return(
-                        AstExpression {
-                            inner : AstTerm {
-                                inner : AstFactor::Constant(3),
-                                binary_ops : vec![
-                                    AstTermBinaryOperation {
-                                        operator : AstTermBinaryOperator::Multiply,
-                                        rhs : AstFactor::Expression(
-                                             Box::new(AstExpression {
-                                                 inner : make_constant_term(4),
-                                                 binary_ops : vec![
-                                                     AstAdditiveExpressionBinaryOperation {
-                                                         operator : AstAdditiveExpressionBinaryOperator::Plus,
-                                                         rhs : make_constant_term(5)
-                                                     },
-                                                 ],
-                                             })
-                                        )
-                                    },
-                                ],
-                            },
-                            binary_ops : vec![]
-                        }
-                    )
-                },
-            })
-        );
-    }
-    */
-
     fn codegen_run_and_check_exit_code_or_compile_failure(input : &str, expected_result : Option<i32>) {
         let exe_name = format!("test_{}.exe", generate_random_string(8));
         let mut pdb_path = Path::new(&exe_name).to_path_buf();
@@ -1679,6 +1809,18 @@ r"int main() {{
         } else {
             println!("compile failed! {:?}", compile_result);
             assert!(expected_result.is_none());
+        }
+    }
+
+    fn test_validate_error_count(input : &str, expected_error_count : usize) {
+        match parse_and_validate(input) {
+            Ok(ast) => {
+                // If parsing succeeded, then the caller should have expected 0 errors.
+                assert_eq!(expected_error_count, 0);
+            },
+            Err(errors) => {
+                assert_eq!(expected_error_count, errors.len());
+            }
         }
     }
 
@@ -1783,6 +1925,11 @@ r"int main() {{
     }
 
     #[test]
+    fn test_codegen_operator_precedence2() {
+        test_codegen_expression("1 * 2 + 3 * 4", 14);
+    }
+
+    #[test]
     fn test_codegen_var_use() {
         test_codegen_mainfunc("int x = 5; int y = 6; int z; x = 1; z = 3; return x + y + z;", 10);
     }
@@ -1872,5 +2019,157 @@ r"int main() {{
     #[test]
     fn test_for_loop_with_continue() {
         test_codegen_mainfunc("int i = 150; for (i = 2; i < 10; i = i + 1) { continue; i = 20; } return i;", 10);
+    }
+
+    #[test]
+    fn test_wrong_func_arg_count() {
+        test_validate_error_count(
+r"int blah(int x, int y)
+{
+    return 5;
+}
+
+int main() {
+    while (blah()) { }
+    do { blah(); } while (blah());
+    if (blah()) { blah(); } else { blah(); }
+    int x = blah();
+    x = blah();
+    for (int y = blah(); blah(); blah()) { blah(); }
+    for (blah(); blah(); blah()) { blah(); }
+    blah();
+
+    int x = -blah();
+    x = blah(blah(10), blah(), blah());
+    return blah() + blah();
+}",
+            24);
+    }
+
+    #[test]
+    fn test_recursive_function() {
+        codegen_run_and_check_exit_code(
+r"
+int sigma(int x) {
+    if (x == 0) {
+        return 0;
+    }
+
+    return x + sigma(x - 1);
+}
+
+int main() {
+    return sigma(10);
+}
+",
+           55);
+    }
+
+    #[test]
+    fn test_nested_function_arg_counts() {
+        codegen_run_and_check_exit_code(
+r"
+int func0()
+{
+    return 1;
+}
+
+int func1(int a)
+{
+    return a;
+}
+
+int func2(int a, int b)
+{
+    return a + b;
+}
+
+int func3(int a, int b, int c)
+{
+    return a + b + c;
+}
+
+int func4(int a, int b, int c, int d)
+{
+    return a + b + c + d;
+}
+
+int func5(int a, int b, int c, int d, int e)
+{
+    return a + b + c + d + e;
+}
+
+int func6(int a, int b, int c, int d, int e, int f)
+{
+    return a + b + c + d + e + f;
+}
+
+int main() {
+    return func6(
+        func1(func0()),
+        func2(1, 2),
+        func3(1, 2, 3),
+        func4(1, 2, 3, 4),
+        func5(1, 2, 3, 4, 5),
+        func6(1, 2, 3, 4, 5, 6));
+}
+",
+           56);
+    }
+
+    #[test]
+    fn test_nested_block_variable_allocation() {
+        codegen_run_and_check_exit_code(
+r"
+int func()
+{
+    int a = 1;
+    {
+        int b = 2;
+        {
+            int c = 3;
+            {
+                int d = 4;
+                a = a + b + c + d;
+            }
+        }
+    }
+    int e = 5;
+    int f = 6;
+    return a + e + f;
+}
+
+int main() {
+    return func();
+}
+",
+           21);
+    }
+
+    #[test]
+    fn test_parameter_redefinition() {
+        codegen_run_and_expect_compile_failure(
+r"int blah(int x)
+{
+    int x;
+    return 5;
+}
+
+int main() {
+    return 1;
+}");
+
+        codegen_run_and_expect_compile_failure(
+r"int blah(int x)
+{
+    {
+        int x;
+        return 5;
+    }
+}
+
+int main() {
+    return 1;
+}");
     }
 }
