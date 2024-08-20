@@ -25,6 +25,11 @@ fn generate_random_string(len: usize) -> String {
         .collect()
 }
 
+// Convenience method for formatting an io::Error to String.
+fn format_io_err(err: std::io::Error) -> String {
+    format!("{}: {}", err.kind(), err)
+}
+
 trait AstToString {
     fn ast_to_string(&self, indent_levels: u32) -> String;
 
@@ -893,6 +898,10 @@ impl CodegenBlockState {
 
 fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
     lazy_static! {
+        static ref SKIPPED_TOKEN_REGEXES: Vec<regex::Regex> = vec![
+            Regex::new(r"^\#[^\n]*").expect("failed to compile regex"),
+            Regex::new(r"^\/\/[^\n]*").expect("failed to compile regex"),
+        ];
         static ref TOKEN_REGEXES: Vec<regex::Regex> = vec![
             Regex::new(r"^&&").expect("failed to compile regex"),
             Regex::new(r"^\|\|").expect("failed to compile regex"),
@@ -922,6 +931,14 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
         ];
     }
 
+    for r in SKIPPED_TOKEN_REGEXES.iter() {
+        if let Some(mat) = r.find(input) {
+            let range = mat.range();
+            //println!("match: {}, {}", range.start, range.end);
+            return Ok(("", input.split_at(range.end).1));
+        }
+    }
+
     for r in TOKEN_REGEXES.iter() {
         if let Some(mat) = r.find(input) {
             let range = mat.range();
@@ -941,8 +958,11 @@ fn lex_all_tokens<'i>(input: &'i str) -> Result<Vec<&'i str>, Vec<String>> {
         match lex_next_token(&remaining_input) {
             Ok(split) => {
                 //println!("[{}], [{}]", split.0, split.1);
-                tokens.push(split.0);
                 //println!("token: {}", split.0);
+                if !split.0.is_empty() {
+                    tokens.push(split.0);
+                }
+
                 remaining_input = split.1.trim();
             }
             Err(msg) => return Err(vec![msg]),
@@ -1925,10 +1945,12 @@ fn validate_ast(ast_program: &AstProgram) -> Result<(), Vec<String>> {
     }
 }
 
-fn assemble_and_link(code: &str, exe_path: &str, should_suppress_output: bool) -> Option<i32> {
-    let temp_dir = Path::new(&format!("testrun_{}", generate_random_string(8))).to_path_buf();
-    std::fs::create_dir_all(&temp_dir);
-
+fn assemble_and_link(
+    code: &str,
+    output_exe_path: &str,
+    should_suppress_output: bool,
+    temp_dir: &Path,
+) -> Option<i32> {
     let asm_path = temp_dir.join("code.asm");
     let exe_temp_output_path = temp_dir.join("output.exe");
     let pdb_temp_output_path = temp_dir.join("output.pdb");
@@ -1955,13 +1977,11 @@ fn assemble_and_link(code: &str, exe_path: &str, should_suppress_output: bool) -
 
     println!("assembly status: {:?}", status);
     if status.success() {
-        std::fs::rename(&exe_temp_output_path, &Path::new(exe_path));
+        std::fs::rename(&exe_temp_output_path, &Path::new(output_exe_path));
 
-        let mut pdb_path = Path::new(exe_path).to_path_buf();
+        let mut pdb_path = Path::new(output_exe_path).to_path_buf();
         pdb_path.set_extension("pdb");
         std::fs::rename(&pdb_temp_output_path, &pdb_path);
-        println!("cleaning up temp dir {}", temp_dir.to_string_lossy());
-        std::fs::remove_dir_all(&temp_dir);
     }
 
     status.code()
@@ -1987,53 +2007,108 @@ fn parse_and_validate<'i>(input: &'i str) -> Result<AstProgram<'i>, Vec<String>>
     Ok(ast)
 }
 
+fn preprocess(
+    input: &str,
+    should_suppress_output: bool,
+    temp_dir: &Path,
+) -> Result<String, String> {
+    let preprocessed_output_path = temp_dir.join("input.i");
+
+    let temp_input_path = temp_dir.join("input.c");
+    std::fs::write(&temp_input_path, &input);
+
+    let mut command = Command::new("cl.exe");
+    let args = ["/P", "/Fiinput.i", "input.c"];
+    command.args(&args);
+    command.current_dir(&temp_dir);
+
+    println!("preprocess command: {:?}", command);
+
+    if should_suppress_output {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+
+    let status = command.status().expect("failed to run cl.exe");
+
+    println!("preprocess status: {:?}", status);
+    if status.success() {
+        Ok(std::fs::read_to_string(&preprocessed_output_path).map_err(format_io_err)?)
+    } else {
+        Err(format!("preprocessor failed with {:?}", status))
+    }
+}
+
 fn compile_and_link(
     input: &str,
     output_exe: &str,
     should_suppress_output: bool,
 ) -> Result<i32, String> {
-    match parse_and_validate(input) {
-        Ok(ast) => {
-            let asm = generate_program_code(&ast)?;
-            println!("assembly:\n{}", asm);
+    fn helper(
+        input: &str,
+        output_exe: &str,
+        should_suppress_output: bool,
+        temp_dir: &Path,
+    ) -> Result<i32, String> {
+        let input = preprocess(input, should_suppress_output, temp_dir)?;
 
-            let exit_code = assemble_and_link(&asm, output_exe, should_suppress_output)
-                .expect("programs should always have an exit code");
-            println!("assemble status: {:?}", exit_code);
+        match parse_and_validate(&input) {
+            Ok(ast) => {
+                let asm = generate_program_code(&ast)?;
+                println!("assembly:\n{}", asm);
 
-            Ok(exit_code)
-        }
-        Err(errors) => {
-            if errors.len() > 1 {
-                for error_message in errors.iter().skip(1) {
-                    println!("Error: {}", error_message);
+                let exit_code =
+                    assemble_and_link(&asm, output_exe, should_suppress_output, temp_dir)
+                        .expect("programs should always have an exit code");
+                println!("assemble status: {}", exit_code);
+
+                if exit_code == 0 {
+                    Ok(exit_code)
+                } else {
+                    Err(format!("assembler failed with exit code {}", exit_code))
                 }
             }
+            Err(errors) => {
+                if errors.len() > 1 {
+                    for error_message in errors.iter().skip(1) {
+                        println!("Error: {}", error_message);
+                    }
+                }
 
-            // For now return just the first error
-            let error_message = errors.get(0).unwrap();
-            Err(error_message.clone())
+                // For now return just the first error
+                let error_message = errors.get(0).unwrap();
+                Err(error_message.clone())
+            }
         }
     }
+
+    let temp_dir_name = format!("testrun_{}", generate_random_string(8));
+    let temp_dir = Path::new(&temp_dir_name);
+    std::fs::create_dir_all(&temp_dir);
+    let ret = helper(input, output_exe, should_suppress_output, temp_dir);
+    if ret.is_ok() {
+        println!("cleaning up temp dir {}", temp_dir.to_string_lossy());
+        std::fs::remove_dir_all(&temp_dir);
+    }
+    ret
 }
+
 #[derive(clap::Parser, Clone)]
 #[command(author, version, about)]
 struct LcArgs {
     #[arg()]
-    input: String,
+    input_path: String,
 
     #[arg()]
-    output: String,
+    output_path: String,
 }
 
 fn main() {
     let mut args = LcArgs::parse();
 
-    println!("loading {}", args.input);
-    let input = std::fs::read_to_string(&args.input).unwrap();
-    //println!("input: {}", input);
+    println!("loading {}", args.input_path);
+    let input = std::fs::read_to_string(&args.input_path).unwrap();
 
-    let exit_code = match compile_and_link(&input, &args.output, false) {
+    let exit_code = match compile_and_link(&input, &args.output_path, false) {
         Ok(inner_exit_code) => inner_exit_code,
         Err(msg) => {
             println!("error! {}", msg);
@@ -2102,24 +2177,27 @@ mod test {
         input: &str,
         expected_result: Option<i32>,
     ) {
-        let exe_name = format!("test_{}.exe", generate_random_string(8));
-        let mut pdb_path = Path::new(&exe_name).to_path_buf();
-        pdb_path.set_extension("pdb");
+        let exe_path = Path::new(&format!("test_{}.exe", generate_random_string(8))).to_path_buf();
 
-        let compile_result = compile_and_link(input, &exe_name, true);
+        let compile_result = compile_and_link(input, exe_path.to_str().unwrap(), true);
 
         if compile_result.is_ok() {
+            let exe_path_abs = exe_path.canonicalize().unwrap();
+            let exe_path_str = exe_path_abs.to_str().unwrap();
+            let mut pdb_path = exe_path_abs.clone();
+            pdb_path.set_extension("pdb");
+
             if let Some(expected_exit_code) = expected_result {
-                let actual_exit_code = Command::new(&exe_name)
+                let actual_exit_code = Command::new(exe_path_str)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
-                    .expect("failed to run test.exe")
+                    .expect(&format!("failed to run {}", exe_path_str))
                     .code()
                     .expect("all processes must have exit code");
 
                 assert_eq!(expected_exit_code, actual_exit_code);
-                std::fs::remove_file(exe_name);
+                std::fs::remove_file(&exe_path_abs);
                 std::fs::remove_file(&pdb_path);
             } else {
                 assert!(false, "compile succeeded but expected failure");
