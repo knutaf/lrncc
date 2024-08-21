@@ -2228,13 +2228,15 @@ mod test {
     ) {
         let args = LcArgs {
             input_path: String::new(),
-            output_path: format!("test_{}.exe", generate_random_string(8)),
+            output_path: Some(format!("test_{}.exe", generate_random_string(8))),
             mode: Mode::All,
         };
 
-        let compile_result = compile_and_link(args, input, true);
+        let compile_result = compile_and_link(&args, input, true);
         if compile_result.is_ok() {
-            let exe_path_abs = Path::new(args.output_path).canonicalize().unwrap();
+            let exe_path_abs = Path::new(args.output_path.as_ref().unwrap())
+                .canonicalize()
+                .unwrap();
             let exe_path_str = exe_path_abs.to_str().unwrap();
             let mut pdb_path = exe_path_abs.clone();
             pdb_path.set_extension("pdb");
