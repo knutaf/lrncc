@@ -926,8 +926,8 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^\?").expect("failed to compile regex"),
             Regex::new(r"^:").expect("failed to compile regex"),
             Regex::new(r"^,").expect("failed to compile regex"),
-            Regex::new(r"^[a-zA-Z]\w*").expect("failed to compile regex"),
-            Regex::new(r"^[0-9]+").expect("failed to compile regex"),
+            Regex::new(r"^[a-zA-Z]\w*\b").expect("failed to compile regex"),
+            Regex::new(r"^[0-9]+\b").expect("failed to compile regex"),
         ];
     }
 
@@ -2220,6 +2220,31 @@ mod test {
                 "int", "main", "(", ")", "{", "return", "!", "1", ";", "}"
             ])
         );
+    }
+
+    #[test]
+    fn lex_no_at() {
+        assert!(lex_all_tokens("int main() { return 0@1; }").is_err());
+    }
+
+    #[test]
+    fn lex_no_backslash() {
+        assert!(lex_all_tokens("\\").is_err());
+    }
+
+    #[test]
+    fn lex_no_backtick() {
+        assert!(lex_all_tokens("`").is_err());
+    }
+
+    #[test]
+    fn lex_bad_identifier() {
+        assert!(lex_all_tokens("int main() { return 1foo; }").is_err());
+    }
+
+    #[test]
+    fn lex_no_at_identifier() {
+        assert!(lex_all_tokens("int main() { return @b; }").is_err());
     }
 
     fn codegen_run_and_check_exit_code_or_compile_failure(
