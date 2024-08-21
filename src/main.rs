@@ -1988,7 +1988,7 @@ fn assemble_and_link(
 }
 
 // TODO should return line numbers with errors
-fn parse_and_validate<'i>(input: &'i str) -> Result<AstProgram<'i>, Vec<String>> {
+fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, Vec<String>> {
     let tokens = lex_all_tokens(&input)?;
     /*
     for token in tokens.iter() {
@@ -1997,6 +1997,10 @@ fn parse_and_validate<'i>(input: &'i str) -> Result<AstProgram<'i>, Vec<String>>
 
     println!();
     */
+
+    if let Mode::LexOnly = mode {
+        return Ok(AstProgram { functions: vec![] });
+    }
 
     // TODO all parsing should return a list of errors, not just one. for now, wrap it in a single error
     let ast = parse_program(Tokens(&tokens)).map_err(|e| vec![e])?;
@@ -2039,34 +2043,49 @@ fn preprocess(
 }
 
 fn compile_and_link(
+    args: &LcArgs,
     input: &str,
-    output_exe: &str,
     should_suppress_output: bool,
 ) -> Result<i32, String> {
     fn helper(
+        args: &LcArgs,
         input: &str,
-        output_exe: &str,
         should_suppress_output: bool,
         temp_dir: &Path,
     ) -> Result<i32, String> {
         let input = preprocess(input, should_suppress_output, temp_dir)?;
 
-        match parse_and_validate(&input) {
-            Ok(ast) => {
-                let asm = generate_program_code(&ast)?;
-                println!("assembly:\n{}", asm);
+        match parse_and_validate(args.mode, &input) {
+            Ok(ast) => match args.mode {
+                Mode::All | Mode::CodegenOnly => {
+                    let asm = generate_program_code(&ast)?;
+                    println!("assembly:\n{}", asm);
 
-                let exit_code =
-                    assemble_and_link(&asm, output_exe, should_suppress_output, temp_dir)
+                    if let Mode::All = args.mode {
+                        let exit_code = assemble_and_link(
+                            &asm,
+                            &args.output_path.as_ref().unwrap(),
+                            should_suppress_output,
+                            temp_dir,
+                        )
                         .expect("programs should always have an exit code");
-                println!("assemble status: {}", exit_code);
+                        println!("assemble status: {}", exit_code);
 
-                if exit_code == 0 {
-                    Ok(exit_code)
-                } else {
-                    Err(format!("assembler failed with exit code {}", exit_code))
+                        if exit_code == 0 {
+                            Ok(exit_code)
+                        } else {
+                            Err(format!("assembler failed with exit code {}", exit_code))
+                        }
+                    } else {
+                        if let Some(output_path) = &args.output_path {
+                            std::fs::write(&output_path, &asm).map_err(format_io_err)?;
+                        }
+
+                        Ok(0)
+                    }
                 }
-            }
+                _ => Ok(0),
+            },
             Err(errors) => {
                 if errors.len() > 1 {
                     for error_message in errors.iter().skip(1) {
@@ -2084,7 +2103,7 @@ fn compile_and_link(
     let temp_dir_name = format!("testrun_{}", generate_random_string(8));
     let temp_dir = Path::new(&temp_dir_name);
     std::fs::create_dir_all(&temp_dir);
-    let ret = helper(input, output_exe, should_suppress_output, temp_dir);
+    let ret = helper(args, input, should_suppress_output, temp_dir);
     if ret.is_ok() {
         println!("cleaning up temp dir {}", temp_dir.to_string_lossy());
         std::fs::remove_dir_all(&temp_dir);
@@ -2092,23 +2111,53 @@ fn compile_and_link(
     ret
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
+enum Mode {
+    /// Compile and link executable.
+    #[value(name = "all")]
+    All,
+
+    /// Lex only. Exit code is zero if successful.
+    #[value(name = "lex", alias = "l")]
+    LexOnly,
+
+    /// Lex and parse only. Exit code is zero if successful.
+    #[value(name = "parse", alias = "p")]
+    ParseOnly,
+
+    /// Lex, parse, and codegen only. Exit code is zero if successful.
+    #[value(name = "codegen", alias = "c")]
+    CodegenOnly,
+}
+
 #[derive(clap::Parser, Clone)]
 #[command(author, version, about)]
 struct LcArgs {
+    /// Mode
+    #[arg(short = 'm', value_enum, default_value_t = Mode::All)]
+    mode: Mode,
+
     #[arg()]
     input_path: String,
 
     #[arg()]
-    output_path: String,
+    output_path: Option<String>,
 }
 
 fn main() {
     let mut args = LcArgs::parse();
 
+    if let Mode::All = args.mode {
+        if args.output_path.is_none() {
+            println!("Must specify output path!");
+            std::process::exit(1)
+        }
+    }
+
     println!("loading {}", args.input_path);
     let input = std::fs::read_to_string(&args.input_path).unwrap();
 
-    let exit_code = match compile_and_link(&input, &args.output_path, false) {
+    let exit_code = match compile_and_link(&args, &input, false) {
         Ok(inner_exit_code) => inner_exit_code,
         Err(msg) => {
             println!("error! {}", msg);
@@ -2177,12 +2226,15 @@ mod test {
         input: &str,
         expected_result: Option<i32>,
     ) {
-        let exe_path = Path::new(&format!("test_{}.exe", generate_random_string(8))).to_path_buf();
+        let args = LcArgs {
+            input_path: String::new(),
+            output_path: format!("test_{}.exe", generate_random_string(8)),
+            mode: Mode::All,
+        };
 
-        let compile_result = compile_and_link(input, exe_path.to_str().unwrap(), true);
-
+        let compile_result = compile_and_link(args, input, true);
         if compile_result.is_ok() {
-            let exe_path_abs = exe_path.canonicalize().unwrap();
+            let exe_path_abs = Path::new(args.output_path).canonicalize().unwrap();
             let exe_path_str = exe_path_abs.to_str().unwrap();
             let mut pdb_path = exe_path_abs.clone();
             pdb_path.set_extension("pdb");
@@ -2209,7 +2261,7 @@ mod test {
     }
 
     fn test_validate_error_count(input: &str, expected_error_count: usize) {
-        match parse_and_validate(input) {
+        match parse_and_validate(Mode::All, input) {
             Ok(ast) => {
                 // If parsing succeeded, then the caller should have expected 0 errors.
                 assert_eq!(expected_error_count, 0);
