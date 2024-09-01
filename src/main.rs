@@ -910,7 +910,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^<=").expect("failed to compile regex"),
             Regex::new(r"^>=").expect("failed to compile regex"),
             Regex::new(r"^--").expect("failed to compile regex"),
-            Regex::new(r"^++").expect("failed to compile regex"),
+            Regex::new(r"^\+\+").expect("failed to compile regex"),
             Regex::new(r"^\{").expect("failed to compile regex"),
             Regex::new(r"^\}").expect("failed to compile regex"),
             Regex::new(r"^\(").expect("failed to compile regex"),
