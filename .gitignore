@@ -1,0 +1,10 @@
+Cargo.lock
+*.exe
+*.pdb
+*.asm
+*.obj
+*.lnk
+input.c
+merge_to_public.cmd
+**/target/
+**/*.rs.bk
