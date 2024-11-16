@@ -8,7 +8,7 @@ use {
     rand::distributions::Alphanumeric,
     rand::{thread_rng, Rng},
     regex::Regex,
-    std::{collections::HashMap, env, fmt, ops::Deref, path::*, process::*},
+    std::{collections::HashMap, fmt, fmt::Display, ops::Deref, path::*, process::*},
 };
 
 const VARIABLE_SIZE: u32 = 8;
@@ -30,127 +30,110 @@ fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
 }
 
-trait AstToString {
-    fn ast_to_string(&self, indent_levels: u32) -> String;
-
-    fn get_indent_string(indent_levels: u32) -> String {
-        let mut result = String::new();
-        for _ in 0..indent_levels {
-            result += "    ";
+fn fmt_list<'t, T>(
+    f: &mut fmt::Formatter,
+    list: impl Iterator<Item = &'t T>,
+    joiner: &str,
+) -> fmt::Result
+where
+    T: fmt::Display + 't,
+{
+    let mut first = true;
+    for item in list {
+        if !first {
+            f.write_str(joiner)?;
         }
-        result
+
+        first = false;
+
+        item.fmt(f)?;
+    }
+
+    Ok(())
+}
+
+/// A wrapper to allow passing an arbitrary formatter for Display, so you don't have to implement Display for every type
+/// you want to print.
+struct DisplayWrapper<W>
+where
+    W: Fn(&mut fmt::Formatter) -> fmt::Result,
+{
+    writer: W,
+}
+
+impl<W> fmt::Display for DisplayWrapper<W>
+where
+    W: Fn(&mut fmt::Formatter) -> fmt::Result,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        (self.writer)(f)
+    }
+}
+
+/// Takes a function that is used for fmt-style formatting.
+fn display_with<W>(writer: W) -> DisplayWrapper<W>
+where
+    W: Fn(&mut fmt::Formatter) -> fmt::Result,
+{
+    DisplayWrapper { writer }
+}
+
+fn format_code_and_comment<W1, W2>(
+    f: &mut fmt::Formatter,
+    code_writer: W1,
+    comment_writer: W2,
+) -> fmt::Result
+where
+    W1: Fn(&mut fmt::Formatter) -> fmt::Result,
+    W2: Fn(&mut fmt::Formatter) -> fmt::Result,
+{
+    // This has to be done in two stages because it's not really possible to pass in the padding/alignment information
+    // to the formatter. So format them into individual strings and then write them as just strings with the correct
+    // alignment.
+    let code_output = format!("{}", display_with(code_writer));
+    let comment_output = format!("{}", display_with(comment_writer));
+
+    write!(f, "    {:<30} ; {:<50}\n", code_output, comment_output)
+}
+
+trait FmtNode {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result;
+
+    fn fmt_nodelist<'t, T>(
+        f: &mut fmt::Formatter,
+        list: impl Iterator<Item = &'t T>,
+        joiner: &str,
+        indent_levels: u32,
+    ) -> fmt::Result
+    where
+        T: FmtNode + 't,
+    {
+        let mut first = true;
+        for item in list {
+            if !first {
+                f.write_str(joiner)?;
+            }
+
+            first = false;
+
+            item.fmt_node(f, indent_levels)?;
+        }
+
+        Ok(())
+    }
+
+    fn write_indent(f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        for _ in 0..indent_levels {
+            f.write_str("    ")?;
+        }
+
+        Ok(())
     }
 }
 
 // A wrapper around a slice of tokens with convenience functions useful for parsing.
 #[derive(PartialEq, Clone, Debug)]
 struct Tokens<'i, 't>(&'t [&'i str]);
-
-#[derive(PartialEq, Clone, Debug)]
-struct AstProgram<'i> {
-    functions: Vec<AstFunction<'i>>,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-struct AstFunction<'i> {
-    name: &'i str,
-    parameters: Vec<String>,
-    body_opt: Option<Vec<AstBlockItem>>,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstBlockItem {
-    Declaration(AstDeclaration),
-    Statement(AstStatement),
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstDeclaration {
-    DeclareVar(String, Option<AstExpression>),
-}
-
-// TODO: use a string slice instead of a string
-#[derive(PartialEq, Clone, Debug)]
-enum AstStatement {
-    Return(AstExpression),
-    Expression(Option<AstExpression>),
-    Conditional(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
-    Compound(Box<Vec<AstBlockItem>>),
-    For(
-        Option<AstExpression>,
-        AstExpression,
-        Option<AstExpression>,
-        Box<AstStatement>,
-    ),
-    ForDecl(
-        AstDeclaration,
-        AstExpression,
-        Option<AstExpression>,
-        Box<AstStatement>,
-    ),
-    While(AstExpression, Box<AstStatement>),
-    DoWhile(AstExpression, Box<AstStatement>),
-    Break,
-    Continue,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstUnaryOperator {
-    Negation,
-    BitwiseNot,
-    LogicalNot,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstBinaryOperator {
-    Or,
-    And,
-    Equals,
-    NotEquals,
-    LessThan,
-    GreaterThan,
-    LessThanEqual,
-    GreaterThanEqual,
-    Plus,
-    Minus,
-    Multiply,
-    Divide,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum AstExpression {
-    Constant(u32),
-    Variable(String), // TODO use a string slice
-    UnaryOperator(AstUnaryOperator, Box<AstExpression>),
-    BinaryOperator(AstBinaryOperator, Box<AstExpression>, Box<AstExpression>),
-    Assign(String, Box<AstExpression>),
-    Conditional(Box<AstExpression>, Box<AstExpression>, Box<AstExpression>),
-    FuncCall(String, Vec<AstExpression>),
-}
-
-#[derive(Clone, PartialEq)]
-struct CodegenGlobalState {
-    next_label: u32,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct StackVariable {
-    offset_from_base: i32,
-    block_id: u32,
-}
-
-#[derive(Clone)]
-struct CodegenBlockState {
-    variables: HashMap<String, StackVariable>,
-    next_local_offset_from_base: i32,
-    next_arg_to_func_offset_from_base: u32,
-    next_func_call_arg_offset_from_sp: u32,
-    lowest_local_offet_from_base: i32,
-    frame_size: Option<u32>,
-    block_id: u32,
-    break_label: Option<u32>,
-    continue_label: Option<u32>,
-}
 
 impl<'i, 't> Tokens<'i, 't> {
     fn consume_tokens(
@@ -224,26 +207,6 @@ impl<'i, 't> Tokens<'i, 't> {
 
         result
     }
-
-    fn consume_and_parse_next_binary_operator(
-        &mut self,
-        required_precedence_level: u32,
-    ) -> Result<AstBinaryOperator, String> {
-        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
-
-        let operator = tokens[0].parse::<AstBinaryOperator>()?;
-        let operator_level = operator.get_precedence_level();
-        assert!(operator_level <= MAX_EXPRESSION_LEVEL);
-        if operator_level == required_precedence_level {
-            *self = remaining_tokens;
-            Ok(operator)
-        } else {
-            Err(format!(
-                "required precedence level {} doesn't match operator {} precedence level {}",
-                required_precedence_level, tokens[0], operator_level
-            ))
-        }
-    }
 }
 
 impl<'i, 't> Deref for Tokens<'i, 't> {
@@ -254,422 +217,205 @@ impl<'i, 't> Deref for Tokens<'i, 't> {
     }
 }
 
+#[derive(PartialEq, Clone, Debug)]
+struct AstProgram<'i> {
+    functions: Vec<AstFunction<'i>>,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+struct AstFunction<'i> {
+    name: &'i str,
+    parameters: Vec<String>,
+    body: AstStatement,
+}
+
+// TODO: use a string slice instead of a string
+#[derive(PartialEq, Clone, Debug)]
+enum AstStatement {
+    Return(AstExpression),
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AstExpression {
+    Constant(u32),
+    UnaryOperator(AstUnaryOperator, Box<AstExpression>),
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AstUnaryOperator {
+    Negation,
+    BitwiseNot,
+}
+
+#[derive(Debug)]
+struct TacProgram {
+    functions: Vec<TacFunction>,
+}
+
+// TODO: string slice instead
+#[derive(Debug)]
+struct TacFunction {
+    name: String,
+    body: Vec<TacInstruction>,
+}
+
+#[derive(Debug)]
+enum TacInstruction {
+    Return(TacVal),
+    UnaryOp(TacUnaryOperator, TacVal, TacVar),
+}
+
+#[derive(Debug, Clone)]
+struct TacVar(String);
+
+#[derive(Debug)]
+enum TacVal {
+    Constant(u32),
+    Var(TacVar),
+}
+
+#[derive(Debug)]
+enum TacUnaryOperator {
+    Negation,
+    BitwiseNot,
+}
+
+#[derive(Debug)]
+struct AsmProgram {
+    functions: Vec<AsmFunction>,
+}
+
+// TODO: use str slice
+#[derive(Debug)]
+struct AsmFunction {
+    name: String,
+    body: Vec<AsmInstruction>,
+}
+
+#[derive(Debug, Clone)]
+enum AsmInstruction {
+    Mov(AsmVal, AsmLocation),
+    UnaryOp(AsmUnaryOperator, AsmLocation),
+    AllocateStack(u32),
+    Ret(u32),
+}
+
+#[derive(Debug, Clone)]
+enum AsmVal {
+    Imm(u32),
+    Loc(AsmLocation),
+}
+
+#[derive(Debug, Clone)]
+enum AsmLocation {
+    Reg(&'static str),
+    PseudoReg(String),
+    RbpOffset(i32, String),
+    RspOffset(u32, String),
+}
+
+#[derive(Debug, Clone)]
+enum AsmUnaryOperator {
+    Neg,
+    Not,
+}
+
+struct TacGenState {
+    next_temporary_id: u32,
+}
+
+struct FuncStackFrame {
+    names: HashMap<String, i32>,
+    max_base_offset: u32,
+}
+
 impl<'i> AstProgram<'i> {
     fn lookup_function_definition(&'i self, name: &str) -> Option<&'i AstFunction<'i>> {
-        for func in &self.functions {
-            if func.name == name {
-                return Some(func);
-            }
-        }
-
-        return None;
+        self.functions.iter().find(|func| func.name == name)
     }
 
-    fn collect_all_expressions(&self) -> Vec<&AstExpression> {
-        let mut expressions = vec![];
-        for func in &self.functions {
-            // Only definitions can have statements in them that need to be scanned for expressions.
-            if !func.is_definition() {
-                continue;
-            }
+    fn to_tac(&self) -> Result<TacProgram, String> {
+        let mut tacgen_state = TacGenState::new();
 
-            for block_item in func.body_opt.as_ref().unwrap().iter() {
-                Self::add_expressions_from_block_item(block_item, &mut expressions);
-            }
+        let mut functions = vec![];
+        for func in self.functions.iter() {
+            functions.push(func.to_tac(&mut tacgen_state)?);
         }
 
-        expressions
-    }
-
-    fn add_expressions_from_block_item<'p>(
-        block_item: &'p AstBlockItem,
-        expressions: &mut Vec<&'p AstExpression>,
-    ) {
-        match block_item {
-            AstBlockItem::Declaration(decl) => {
-                Self::add_expressions_from_declaration(decl, expressions);
-            }
-            AstBlockItem::Statement(stmt) => {
-                Self::add_expressions_from_statement(stmt, expressions);
-            }
-        }
-    }
-
-    fn add_expressions_from_declaration<'p>(
-        declaration: &'p AstDeclaration,
-        expressions: &mut Vec<&'p AstExpression>,
-    ) {
-        if let AstDeclaration::DeclareVar(_, Some(expr)) = declaration {
-            Self::add_expressions_from_expression(expr, expressions);
-        }
-    }
-
-    fn add_expressions_from_statement<'p>(
-        statement: &'p AstStatement,
-        expressions: &mut Vec<&'p AstExpression>,
-    ) {
-        match statement {
-            AstStatement::Return(expr) => Self::add_expressions_from_expression(expr, expressions),
-            AstStatement::Expression(expr_opt) => {
-                if let Some(expr) = expr_opt {
-                    Self::add_expressions_from_expression(expr, expressions);
-                }
-            }
-            AstStatement::Conditional(cond, pos_stmt, neg_stmt_opt) => {
-                Self::add_expressions_from_expression(cond, expressions);
-                Self::add_expressions_from_statement(&pos_stmt, expressions);
-                if let Some(neg_stmt) = neg_stmt_opt {
-                    Self::add_expressions_from_statement(neg_stmt, expressions);
-                }
-            }
-            AstStatement::Compound(block_items) => {
-                for block_item in block_items.iter() {
-                    Self::add_expressions_from_block_item(block_item, expressions);
-                }
-            }
-            AstStatement::ForDecl(decl, cond, post_opt, body) => {
-                Self::add_expressions_from_declaration(&decl, expressions);
-
-                Self::add_expressions_from_expression(cond, expressions);
-
-                if let Some(post) = post_opt {
-                    Self::add_expressions_from_expression(post, expressions);
-                }
-
-                Self::add_expressions_from_statement(body, expressions);
-            }
-            AstStatement::For(pre_opt, cond, post_opt, body) => {
-                if let Some(pre) = pre_opt {
-                    Self::add_expressions_from_expression(pre, expressions);
-                }
-
-                Self::add_expressions_from_expression(cond, expressions);
-
-                if let Some(post) = post_opt {
-                    Self::add_expressions_from_expression(post, expressions);
-                }
-
-                Self::add_expressions_from_statement(body, expressions);
-            }
-            AstStatement::While(cond, body) => {
-                Self::add_expressions_from_expression(cond, expressions);
-                Self::add_expressions_from_statement(body, expressions);
-            }
-            AstStatement::DoWhile(cond, body) => {
-                Self::add_expressions_from_expression(cond, expressions);
-                Self::add_expressions_from_statement(body, expressions);
-            }
-            AstStatement::Break => {}
-            AstStatement::Continue => {}
-        }
-    }
-
-    fn add_expressions_from_expression<'p>(
-        expression: &'p AstExpression,
-        expressions: &mut Vec<&'p AstExpression>,
-    ) {
-        expressions.push(expression);
-
-        match expression {
-            AstExpression::Constant(_) | AstExpression::Variable(_) => expressions.push(expression),
-            AstExpression::UnaryOperator(_, expr) => {
-                Self::add_expressions_from_expression(expr, expressions)
-            }
-            AstExpression::BinaryOperator(_, expr1, expr2) => {
-                Self::add_expressions_from_expression(expr1, expressions);
-                Self::add_expressions_from_expression(expr2, expressions);
-            }
-            AstExpression::Assign(_, expr) => {
-                Self::add_expressions_from_expression(expr, expressions)
-            }
-            AstExpression::Conditional(expr1, expr2, expr3) => {
-                Self::add_expressions_from_expression(expr1, expressions);
-                Self::add_expressions_from_expression(expr2, expressions);
-                Self::add_expressions_from_expression(expr3, expressions);
-            }
-            AstExpression::FuncCall(_, args) => {
-                for arg in args.iter() {
-                    Self::add_expressions_from_expression(arg, expressions);
-                }
-            }
-        }
+        Ok(TacProgram { functions })
     }
 }
 
-const MAX_EXPRESSION_LEVEL: u32 = 6;
-impl AstBinaryOperator {
-    fn get_precedence_level(&self) -> u32 {
-        match self {
-            AstBinaryOperator::Or => 6,
-            AstBinaryOperator::And => 5,
-            AstBinaryOperator::Equals => 4,
-            AstBinaryOperator::NotEquals => 4,
-            AstBinaryOperator::LessThan => 3,
-            AstBinaryOperator::GreaterThan => 3,
-            AstBinaryOperator::LessThanEqual => 3,
-            AstBinaryOperator::GreaterThanEqual => 3,
-            AstBinaryOperator::Plus => 2,
-            AstBinaryOperator::Minus => 2,
-            AstBinaryOperator::Multiply => 1,
-            AstBinaryOperator::Divide => 1,
-        }
+impl<'i> FmtNode for AstProgram<'i> {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        Self::fmt_nodelist(f, self.functions.iter(), "\n\n", 0)
     }
 }
 
 impl<'i> AstFunction<'i> {
-    fn is_definition(&self) -> bool {
-        self.body_opt.is_some()
+    fn to_tac(&self, tacgen_state: &mut TacGenState) -> Result<TacFunction, String> {
+        Ok(TacFunction {
+            name: String::from(self.name),
+            body: self.body.to_tac(tacgen_state)?,
+        })
     }
 }
 
-impl<'i> AstToString for AstProgram<'i> {
-    fn ast_to_string(&self, _indent_levels: u32) -> String {
-        self.functions
-            .iter()
-            .map(|function| function.ast_to_string(0))
-            .collect::<Vec<String>>()
-            .join("\n\n")
+impl<'i> FmtNode for AstFunction<'i> {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        Self::write_indent(f, indent_levels)?;
+        write!(f, "FUNC {}(", self.name)?;
+        fmt_list(f, self.parameters.iter(), ", ")?;
+        writeln!(f, "):")?;
+        self.body.fmt_node(f, indent_levels + 1)
     }
 }
 
-impl<'i> fmt::Display for AstProgram<'i> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.ast_to_string(0))
-    }
-}
+impl AstStatement {
+    fn to_tac(&self, tacgen_state: &mut TacGenState) -> Result<Vec<TacInstruction>, String> {
+        let mut instructions = vec![];
 
-impl<'i> AstToString for AstFunction<'i> {
-    fn ast_to_string(&self, indent_levels: u32) -> String {
-        fn format_parameter_list(parameters: &Vec<String>) -> String {
-            parameters
-                .iter()
-                .map(|param| format!("int {}", param))
-                .collect::<Vec<String>>()
-                .join(", ")
-        }
-
-        if let Some(body) = self.body_opt.as_ref() {
-            let mut body_str = String::new();
-            for block_item in body {
-                let result = block_item.ast_to_string(indent_levels);
-                if result.len() != 0 {
-                    body_str += "\n";
-                    body_str += &result;
-                }
-            }
-
-            format!(
-                "{}FUNC {}({}):{}",
-                Self::get_indent_string(indent_levels),
-                self.name,
-                &format_parameter_list(&self.parameters),
-                &body_str
-            )
-        } else {
-            format!(
-                "{}FUNC DECL {}({});",
-                Self::get_indent_string(indent_levels),
-                self.name,
-                &format_parameter_list(&self.parameters)
-            )
-        }
-    }
-}
-
-impl AstToString for AstBlockItem {
-    fn ast_to_string(&self, indent_levels: u32) -> String {
         match self {
-            AstBlockItem::Statement(statement) => statement.ast_to_string(indent_levels + 1),
-            AstBlockItem::Declaration(declaration) => declaration.ast_to_string(indent_levels + 1),
-        }
-    }
-}
-
-impl AstToString for AstDeclaration {
-    fn ast_to_string(&self, indent_levels: u32) -> String {
-        if let AstDeclaration::DeclareVar(name, expr_opt) = self {
-            if let Some(expr) = expr_opt {
-                format!(
-                    "{}int {} = {};",
-                    Self::get_indent_string(indent_levels),
-                    &name,
-                    expr.ast_to_string(indent_levels + 1)
-                )
-            } else {
-                format!("{}int {};", Self::get_indent_string(indent_levels), &name)
+            AstStatement::Return(ast_exp) => {
+                let tac_val = ast_exp.to_tac(tacgen_state, &mut instructions)?;
+                instructions.push(TacInstruction::Return(tac_val));
             }
-        } else {
-            format!("{}err {:?}", Self::get_indent_string(indent_levels), self)
         }
+
+        Ok(instructions)
     }
 }
 
-impl AstToString for AstStatement {
-    fn ast_to_string(&self, indent_levels: u32) -> String {
+impl FmtNode for AstStatement {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        Self::write_indent(f, indent_levels)?;
+
         match self {
-            AstStatement::Return(expr) => format!(
-                "{}return {};",
-                Self::get_indent_string(indent_levels),
-                expr.ast_to_string(indent_levels + 1)
-            ),
-            AstStatement::Expression(Some(expr)) => format!(
-                "{}{};",
-                Self::get_indent_string(indent_levels),
-                expr.ast_to_string(indent_levels + 1)
-            ),
-            AstStatement::Expression(None) => String::new(),
-            AstStatement::Conditional(expr, positive, negative_opt) => {
-                let pos_indent_levels = if let AstStatement::Compound(_) = **positive {
-                    indent_levels
-                } else {
-                    indent_levels + 1
-                };
+            AstStatement::Return(expr) => {
+                write!(f, "return ")?;
+                expr.fmt_node(f, indent_levels + 1)?;
+            }
+        }
 
-                let mut result = format!(
-                    "{}if ({})\n{}",
-                    Self::get_indent_string(indent_levels),
-                    expr.ast_to_string(0),
-                    positive.ast_to_string(pos_indent_levels)
-                );
+        Ok(())
+    }
+}
 
-                if let Some(negative) = negative_opt {
-                    let neg_indent_levels = if let AstStatement::Compound(_) = **negative {
-                        indent_levels
-                    } else {
-                        indent_levels + 1
-                    };
-                    result += &format!(
-                        "\n{}else\n{}",
-                        Self::get_indent_string(indent_levels),
-                        negative.ast_to_string(neg_indent_levels)
-                    );
-                }
-                result
-            }
-            AstStatement::Compound(block_items) => {
-                let mut result = String::new();
-                for block_item in block_items.iter() {
-                    if result.len() != 0 {
-                        result += "\n";
-                    }
-                    result += &block_item.ast_to_string(indent_levels);
-                }
-                result
-            }
-            AstStatement::For(expr_opt, condition, post_expr_opt, body) => {
-                format!(
-                    "{}for ({}; {}; {})\n{}",
-                    Self::get_indent_string(indent_levels),
-                    expr_opt
-                        .as_ref()
-                        .map_or(String::new(), |expr| { expr.ast_to_string(0) }),
-                    condition.ast_to_string(0),
-                    post_expr_opt
-                        .as_ref()
-                        .map_or(String::new(), |expr| { expr.ast_to_string(0) }),
-                    body.ast_to_string(indent_levels)
-                )
-            }
-            AstStatement::ForDecl(declaration, condition, post_expr_opt, body) => {
-                // Omit the semicolon after the declaration because it's built into the delcaration output itself.
-                format!(
-                    "{}for ({} {}; {})\n{}",
-                    Self::get_indent_string(indent_levels),
-                    declaration.ast_to_string(0),
-                    condition.ast_to_string(0),
-                    post_expr_opt
-                        .as_ref()
-                        .map_or(String::new(), |expr| { expr.ast_to_string(0) }),
-                    body.ast_to_string(indent_levels)
-                )
-            }
-            AstStatement::While(condition, body) => {
-                format!(
-                    "{}while ({})\n{}",
-                    Self::get_indent_string(indent_levels),
-                    condition.ast_to_string(0),
-                    body.ast_to_string(indent_levels)
-                )
-            }
-            AstStatement::DoWhile(condition, body) => {
-                format!(
-                    "{}do while ({})\n{}",
-                    Self::get_indent_string(indent_levels),
-                    condition.ast_to_string(0),
-                    body.ast_to_string(indent_levels)
-                )
-            }
-            AstStatement::Break => {
-                format!("{}break;", Self::get_indent_string(indent_levels))
-            }
-            AstStatement::Continue => {
-                format!("{}continue;", Self::get_indent_string(indent_levels))
-            }
+impl AstUnaryOperator {
+    fn to_tac(&self) -> TacUnaryOperator {
+        match self {
+            AstUnaryOperator::Negation => TacUnaryOperator::Negation,
+            AstUnaryOperator::BitwiseNot => TacUnaryOperator::BitwiseNot,
         }
     }
 }
 
-impl AstToString for AstUnaryOperator {
-    fn ast_to_string(&self, _indent_levels: u32) -> String {
-        String::from(match self {
+impl FmtNode for AstUnaryOperator {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        f.write_str(match self {
             AstUnaryOperator::Negation => "-",
             AstUnaryOperator::BitwiseNot => "~",
-            AstUnaryOperator::LogicalNot => "!",
         })
-    }
-}
-
-impl AstToString for AstBinaryOperator {
-    fn ast_to_string(&self, _indent_levels: u32) -> String {
-        String::from(match self {
-            AstBinaryOperator::Or => "||",
-            AstBinaryOperator::And => "&&",
-            AstBinaryOperator::Equals => "==",
-            AstBinaryOperator::NotEquals => "!=",
-            AstBinaryOperator::LessThan => "<",
-            AstBinaryOperator::GreaterThan => ">",
-            AstBinaryOperator::LessThanEqual => "<=",
-            AstBinaryOperator::GreaterThanEqual => ">=",
-            AstBinaryOperator::Plus => "+",
-            AstBinaryOperator::Minus => "-",
-            AstBinaryOperator::Multiply => "*",
-            AstBinaryOperator::Divide => "/",
-        })
-    }
-}
-
-impl AstToString for AstExpression {
-    fn ast_to_string(&self, indent_levels: u32) -> String {
-        match self {
-            AstExpression::Constant(val) => format!("{}", val),
-            AstExpression::Variable(name) => name.clone(),
-            AstExpression::UnaryOperator(operator, expr) => {
-                format!("{}{}", operator.ast_to_string(0), expr.ast_to_string(0))
-            }
-            AstExpression::Assign(name, expr) => {
-                format!("{} = {}", name, expr.ast_to_string(indent_levels))
-            }
-            AstExpression::BinaryOperator(operator, left, right) => format!(
-                "({}) {} ({})",
-                left.ast_to_string(0),
-                operator.ast_to_string(0),
-                right.ast_to_string(0)
-            ),
-            AstExpression::Conditional(condition, positive, negative) => format!(
-                "({}) ? ({}) : ({})",
-                condition.ast_to_string(0),
-                positive.ast_to_string(0),
-                negative.ast_to_string(0)
-            ),
-            AstExpression::FuncCall(name, args) => {
-                let args_string = args
-                    .iter()
-                    .map(|arg| arg.ast_to_string(0))
-                    .collect::<Vec<String>>()
-                    .join(", ");
-                format!("{}({})", name, args_string)
-            }
-        }
     }
 }
 
@@ -679,220 +425,569 @@ impl std::str::FromStr for AstUnaryOperator {
         match s {
             "-" => Ok(AstUnaryOperator::Negation),
             "~" => Ok(AstUnaryOperator::BitwiseNot),
-            "!" => Ok(AstUnaryOperator::LogicalNot),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
 }
 
-impl std::str::FromStr for AstBinaryOperator {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "||" => Ok(AstBinaryOperator::Or),
-            "&&" => Ok(AstBinaryOperator::And),
-            "==" => Ok(AstBinaryOperator::Equals),
-            "!=" => Ok(AstBinaryOperator::NotEquals),
-            "<" => Ok(AstBinaryOperator::LessThan),
-            ">" => Ok(AstBinaryOperator::GreaterThan),
-            "<=" => Ok(AstBinaryOperator::LessThanEqual),
-            ">=" => Ok(AstBinaryOperator::GreaterThanEqual),
-            "+" => Ok(AstBinaryOperator::Plus),
-            "-" => Ok(AstBinaryOperator::Minus),
-            "*" => Ok(AstBinaryOperator::Multiply),
-            "/" => Ok(AstBinaryOperator::Divide),
-            _ => Err(format!("unknown operator {}", s)),
-        }
-    }
-}
-
-impl CodegenGlobalState {
-    fn new() -> CodegenGlobalState {
-        CodegenGlobalState { next_label: 0 }
-    }
-
-    fn consume_jump_label(&mut self) -> u32 {
-        self.next_label += 1;
-        self.next_label - 1
-    }
-}
-
-impl CodegenBlockState {
-    fn new(func: &AstFunction, frame_size: Option<u32>) -> CodegenBlockState {
-        let mut block_state = CodegenBlockState {
-            variables: HashMap::new(),
-
-            // When entering a new function, the base pointer points to the return address to the caller. The first
-            // available location to allocate a new stack variable is rbp-8.
-            next_local_offset_from_base: -(VARIABLE_SIZE as i32),
-
-            // The first parameter to the callee is at rbp+8, because rbp+0 is the return address.
-            next_arg_to_func_offset_from_base: VARIABLE_SIZE,
-
-            // Arguments to a function called by this one. When adjusting this, first we reserve stack space for
-            // the whole function, but ultimately at the point of the call instruction, the first argument is at
-            // rsp+0, next is at rsp+8, etc..
-            next_func_call_arg_offset_from_sp: 0,
-
-            // Keep track of the lowest local or temp space offset from the base pointer, which represents the size
-            // of this stack frame.
-            lowest_local_offet_from_base: 0,
-
-            // In order to correctly determine the frame size, code generation needs to make two passes over the
-            // contents of a function. In the first pass, it runs through all the variable and parameter tracking
-            // logic to determine the frame size needed. The frame size determines the rsp adjustment in the
-            // function prologue, so in the second pass the correct rsp offsets of variables and temp locations can
-            // be emitted.
-            frame_size,
-
-            // Reserve block_id 0 specially for function parameters. All local variables go to block_id 1 or higher.
-            block_id: 1,
-            break_label: None,
-            continue_label: None,
-        };
-
-        let mut arg_index = 0;
-        for arg_name in func.parameters.iter() {
-            block_state.add_param(arg_name);
-            arg_index += 1;
-        }
-
-        block_state
-    }
-
-    fn new_for_scan(func: &AstFunction) -> CodegenBlockState {
-        CodegenBlockState::new(func, None)
-    }
-
-    fn nest(&self) -> CodegenBlockState {
-        let mut nested = self.clone();
-        nested.block_id += 1;
-        nested
-    }
-
-    fn enter_loop(&self, break_label: u32, continue_label: u32) -> CodegenBlockState {
-        let mut loop_state = self.clone();
-        loop_state.break_label = Some(break_label);
-        loop_state.continue_label = Some(continue_label);
-        loop_state
-    }
-
-    fn consume_variable_slot(&mut self) {
-        if self.next_local_offset_from_base < self.lowest_local_offet_from_base {
-            self.lowest_local_offet_from_base = self.next_local_offset_from_base;
-        }
-
-        self.next_local_offset_from_base -= VARIABLE_SIZE as i32;
-    }
-
-    fn update_lowest_local_offset_from_base_from_nested(&mut self, nested: &CodegenBlockState) {
-        self.lowest_local_offet_from_base = std::cmp::min(
-            self.lowest_local_offet_from_base,
-            nested.lowest_local_offet_from_base,
-        );
-    }
-
-    fn add_stack_var(&mut self, name: &str) -> bool {
-        if let Some(var) = self.variables.get(name) {
-            if var.block_id == self.block_id || var.block_id == 0 {
-                // Cannot declare the same variable twice in the same block, and cannot declare variables in any block
-                // that clash with function parameter names.
-                return false;
+impl AstExpression {
+    fn to_tac(
+        &self,
+        tacgen_state: &mut TacGenState,
+        instructions: &mut Vec<TacInstruction>,
+    ) -> Result<TacVal, String> {
+        Ok(match self {
+            AstExpression::Constant(num) => TacVal::Constant(*num),
+            AstExpression::UnaryOperator(ast_unary_op, ast_exp_inner) => {
+                let tac_exp_inner_var = ast_exp_inner.to_tac(tacgen_state, instructions)?;
+                let tempvar = tacgen_state.allocate_temporary();
+                instructions.push(TacInstruction::UnaryOp(
+                    ast_unary_op.to_tac(),
+                    tac_exp_inner_var,
+                    tempvar.clone(),
+                ));
+                TacVal::Var(tempvar)
             }
-            // Else it was declared in an outer block already, so below we will overwrite it with the current block.
-        }
-
-        // This will either insert a new variable or overwrite a previously declared variable.
-        self.variables.insert(
-            String::from(name),
-            StackVariable {
-                offset_from_base: self.next_local_offset_from_base,
-                block_id: self.block_id,
-            },
-        );
-        self.consume_variable_slot();
-        true
-    }
-
-    fn add_param(&mut self, name: &str) -> bool {
-        if let Some(var) = self.variables.get(name) {
-            // Cannot declare the same parameter name twice.
-            assert_eq!(var.block_id, 0);
-            return false;
-        }
-
-        // Always add parameters with block id 0 so we can prevent local variables from clashing with them.
-        self.variables.insert(
-            String::from(name),
-            StackVariable {
-                offset_from_base: self.next_arg_to_func_offset_from_base as i32,
-                block_id: 0,
-            },
-        );
-        self.next_arg_to_func_offset_from_base += VARIABLE_SIZE;
-        true
-    }
-
-    fn push_temp(&mut self) -> u32 {
-        let offset_from_sp =
-            self.translate_offset_from_base_to_offset_from_sp(self.next_local_offset_from_base);
-        self.consume_variable_slot();
-        offset_from_sp
-    }
-
-    fn pop_temp(&mut self) -> u32 {
-        self.next_local_offset_from_base += VARIABLE_SIZE as i32;
-        let ret =
-            self.translate_offset_from_base_to_offset_from_sp(self.next_local_offset_from_base);
-        ret
-    }
-
-    fn push_arg(&mut self) -> u32 {
-        // Arguments to a function call are pushed in reverse order with the first argument at rsp+0. Make sure to
-        // reserve temp space so the frame is big enough to hold them.
-        self.push_temp();
-
-        let offset_from_sp = self.next_func_call_arg_offset_from_sp;
-        self.next_func_call_arg_offset_from_sp += VARIABLE_SIZE;
-        offset_from_sp
-    }
-
-    fn pop_arg(&mut self) {
-        // Every arg to a function also has temp space reserved to make sure the frame size is big enough, so need to
-        // free the space along with adjusting where the next arg is.
-        self.pop_temp();
-        self.next_func_call_arg_offset_from_sp -= VARIABLE_SIZE;
-    }
-
-    fn get_var_location_str(&self, name: &str) -> Option<String> {
-        let offset_from_base = self.variables.get(name)?.offset_from_base;
-
-        Some(match offset_from_base as u32 {
-            RCX_SP_OFFSET => String::from("rcx"),
-            RDX_SP_OFFSET => String::from("rdx"),
-            R8_SP_OFFSET => String::from("r8"),
-            R9_SP_OFFSET => String::from("r9"),
-            _ => format!(
-                "[rsp+{}]",
-                self.translate_offset_from_base_to_offset_from_sp(offset_from_base)
-            ),
         })
     }
+}
 
-    fn translate_offset_from_base_to_offset_from_sp(&self, offset_from_base: i32) -> u32 {
-        // This assumes the frame size is big enough to hold all of the variables and temp locations needed by this
-        // block. The first local variable is at rbp-8, which will turn into a large rsp offset, since it is "far away"
-        // from rsp. The last allocated local variable will be closest to rsp. Arguments to this function will be even
-        // farther from the rsp, past the rbp.
-        ((self.get_frame_size() as i32) + offset_from_base) as u32
+impl FmtNode for AstExpression {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        match self {
+            AstExpression::Constant(val) => write!(f, "{}", val)?,
+            AstExpression::UnaryOperator(operator, expr) => {
+                operator.fmt_node(f, 0)?;
+                expr.fmt_node(f, 0)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl TacProgram {
+    fn to_asm(&self) -> Result<AsmProgram, String> {
+        let mut functions = Vec::new();
+        for func in self.functions.iter() {
+            functions.push(func.to_asm()?);
+        }
+
+        Ok(AsmProgram { functions })
+    }
+}
+
+impl FmtNode for TacProgram {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        Self::fmt_nodelist(f, self.functions.iter(), "\n\n", 0)
+    }
+}
+
+impl TacFunction {
+    fn to_asm(&self) -> Result<AsmFunction, String> {
+        let mut body = Vec::new();
+        for instruction in self.body.iter() {
+            instruction.to_asm(&mut body)?;
+        }
+
+        Ok(AsmFunction {
+            name: self.name.clone(),
+            body,
+        })
+    }
+}
+
+impl FmtNode for TacFunction {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        writeln!(f, "FUNC {}", self.name)?;
+        Self::fmt_nodelist(f, self.body.iter(), "\n", indent_levels + 1)
+    }
+}
+
+impl TacInstruction {
+    fn to_asm(&self, func_body: &mut Vec<AsmInstruction>) -> Result<(), String> {
+        match self {
+            TacInstruction::Return(val) => {
+                func_body.push(AsmInstruction::Mov(val.to_asm()?, AsmLocation::Reg("eax")));
+                func_body.push(AsmInstruction::Ret(0));
+            }
+            TacInstruction::UnaryOp(unary_op, src_val, dest_var) => {
+                let dest_asm_loc = dest_var.to_asm()?;
+                func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_asm_loc.clone()));
+                func_body.push(AsmInstruction::UnaryOp(unary_op.to_asm()?, dest_asm_loc));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for TacInstruction {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        Self::write_indent(f, indent_levels)?;
+        match self {
+            TacInstruction::Return(val) => {
+                write!(f, "return ")?;
+                val.fmt_node(f, 0)?;
+                writeln!(f)?;
+            }
+            TacInstruction::UnaryOp(unary_op, src, dest) => {
+                dest.fmt_node(f, 0)?;
+                write!(f, " = ")?;
+                unary_op.fmt(f)?;
+                write!(f, " ")?;
+                src.fmt_node(f, 0)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for TacVar {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl TacVal {
+    fn to_asm(&self) -> Result<AsmVal, String> {
+        Ok(match self {
+            TacVal::Constant(num) => AsmVal::Imm(*num),
+            TacVal::Var(var) => AsmVal::Loc(var.to_asm()?),
+        })
+    }
+}
+
+impl FmtNode for TacVal {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        match self {
+            TacVal::Constant(num) => {
+                write!(f, "{}", num)?;
+            }
+            TacVal::Var(var) => {
+                var.fmt_node(f, 0)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl TacVar {
+    fn to_asm(&self) -> Result<AsmLocation, String> {
+        Ok(AsmLocation::PseudoReg(self.0.clone()))
+    }
+}
+
+impl TacUnaryOperator {
+    fn to_asm(&self) -> Result<AsmUnaryOperator, String> {
+        Ok(match self {
+            TacUnaryOperator::Negation => AsmUnaryOperator::Neg,
+            TacUnaryOperator::BitwiseNot => AsmUnaryOperator::Not,
+        })
+    }
+}
+
+impl fmt::Display for TacUnaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            TacUnaryOperator::Negation => "Negate",
+            TacUnaryOperator::BitwiseNot => "BitwiseNot",
+        })
+    }
+}
+
+impl AsmProgram {
+    fn finalize(&mut self) -> Result<(), String> {
+        for func in self.functions.iter_mut() {
+            func.finalize()?;
+        }
+
+        Ok(())
     }
 
-    fn get_frame_size(&self) -> u32 {
-        // This object is used either to just track and calculate the frame size (in which case self.frame_size is None,
-        // and the result of this function is the speculative frame size, until the traversal of the function body is
-        // complete), or to actually generate code, in which case the frame size is a fixed value.
-        self.frame_size
-            .unwrap_or(-self.lowest_local_offet_from_base as u32)
+    fn emit_code(&self) -> Result<String, String> {
+        Ok(format!(
+            "{}",
+            display_with(|f| {
+                write!(
+                    f,
+                    "INCLUDELIB msvcrt.lib\n\
+                       .DATA\n\
+                       \n\
+                       .CODE\n"
+                )?;
+
+                for func in self.functions.iter() {
+                    func.emit_code(f)?;
+                }
+
+                write!(f, "\nEND")?;
+
+                Ok(())
+            })
+        ))
+    }
+}
+
+impl FmtNode for AsmProgram {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        Self::fmt_nodelist(f, self.functions.iter(), "\n\n", 0)
+    }
+}
+
+impl AsmFunction {
+    fn finalize(&mut self) -> Result<(), String> {
+        let mut frame = FuncStackFrame::new();
+
+        // TODO: consider an iterator over all locations
+        for inst in self.body.iter_mut() {
+            match inst {
+                AsmInstruction::Mov(src_val, dest_loc) => {
+                    if let AsmVal::Loc(src_loc) = src_val {
+                        src_loc.resolve_pseudoregister(&mut frame)?;
+                    }
+
+                    dest_loc.resolve_pseudoregister(&mut frame)?;
+                }
+                AsmInstruction::UnaryOp(_, dest_loc) => {
+                    dest_loc.resolve_pseudoregister(&mut frame)?;
+                }
+                AsmInstruction::AllocateStack(_) => {}
+                AsmInstruction::Ret(_) => {}
+            }
+        }
+
+        // Allocate the stack frame's size at the beginning of the function body.
+        self.body
+            .insert(0, AsmInstruction::AllocateStack(frame.size()));
+
+        // In any place that has a Ret instruction, fill it in with the stack frame size.
+        for inst in self.body.iter_mut() {
+            if let AsmInstruction::Ret(size) = inst {
+                *size = frame.size();
+            }
+        }
+
+        for inst in self.body.iter_mut() {
+            inst.convert_to_rsp_offset(&frame);
+        }
+
+        let mut i = 0;
+        while i < self.body.len() {
+            // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store it
+            // in a temporary register.
+            if let AsmInstruction::Mov(
+                ref src_loc @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+                ref mut dest_loc @ AsmLocation::RspOffset(_, _),
+            ) = &mut self.body[i]
+            {
+                let real_dest = dest_loc.clone();
+                *dest_loc = AsmLocation::Reg("r10d");
+
+                self.body.insert(
+                    i + 1,
+                    AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r10d")), real_dest),
+                );
+
+                // We don't need to examine the next instruction since we just inserted it and know it's correct.
+                i += 1;
+            }
+
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "{} PROC", self.name)?;
+
+        for inst in self.body.iter() {
+            inst.emit_code(f)?;
+        }
+
+        writeln!(f, "{} ENDP", self.name)?;
+        Ok(())
+    }
+}
+
+impl FmtNode for AsmFunction {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        writeln!(f, "FUNC {}", self.name)?;
+        Self::fmt_nodelist(f, self.body.iter(), "\n", 1)
+    }
+}
+
+impl AsmInstruction {
+    fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
+        match self {
+            AsmInstruction::Mov(src_val, dest_loc) => {
+                if let AsmVal::Loc(src_loc) = src_val {
+                    src_loc.convert_to_rsp_offset(frame);
+                }
+
+                dest_loc.convert_to_rsp_offset(frame);
+            }
+            AsmInstruction::UnaryOp(_, dest_loc) => {
+                dest_loc.convert_to_rsp_offset(frame);
+            }
+            AsmInstruction::AllocateStack(_) => {}
+            AsmInstruction::Ret(_) => {}
+        }
+    }
+
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AsmInstruction::Mov(src_val, dest_loc) => {
+                format_code_and_comment(
+                    f,
+                    |f| {
+                        write!(f, "mov ")?;
+                        dest_loc.emit_code(f)?;
+                        write!(f, ",")?;
+                        src_val.emit_code(f)
+                    },
+                    |f| {
+                        dest_loc.fmt_asm_comment(f)?;
+                        write!(f, " <- ")?;
+                        src_val.fmt_asm_comment(f)
+                    },
+                )?;
+            }
+            AsmInstruction::UnaryOp(unary_op, dest_loc) => {
+                format_code_and_comment(
+                    f,
+                    |f| {
+                        unary_op.emit_code(f)?;
+                        write!(f, " ")?;
+                        dest_loc.emit_code(f)
+                    },
+                    |f| {
+                        unary_op.emit_code(f)?;
+                        write!(f, " ")?;
+                        dest_loc.fmt_asm_comment(f)
+                    },
+                )?;
+            }
+            AsmInstruction::AllocateStack(size) => {
+                format_code_and_comment(
+                    f,
+                    |f| write!(f, "sub rsp,{}", size),
+                    |f| write!(f, "stack_alloc {} bytes", size),
+                )?;
+            }
+            AsmInstruction::Ret(size) => {
+                format_code_and_comment(
+                    f,
+                    |f| write!(f, "add rsp,{}", size),
+                    |f| write!(f, "stack_alloc {} bytes", size),
+                )?;
+
+                writeln!(f, "    ret")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for AsmInstruction {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        Self::write_indent(f, indent_levels)?;
+        match self {
+            AsmInstruction::Mov(src_val, dest_loc) => {
+                write!(f, "Mov ")?;
+                src_val.fmt_node(f, 0)?;
+                write!(f, " -> ")?;
+                dest_loc.fmt_node(f, 0)?;
+            }
+            AsmInstruction::UnaryOp(unary_op, dest_loc) => {
+                unary_op.fmt_node(f, 0)?;
+                write!(f, " ")?;
+                dest_loc.fmt_node(f, 0)?;
+            }
+            AsmInstruction::AllocateStack(size) => {
+                write!(f, "AllocateStack {}", size)?;
+            }
+            AsmInstruction::Ret(size) => {
+                write!(f, "Ret (dealloc {} stack)", size)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl AsmVal {
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AsmVal::Imm(num) => {
+                write!(f, "{}", num)?;
+            }
+            AsmVal::Loc(loc) => {
+                loc.emit_code(f)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fmt_asm_comment(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AsmVal::Imm(num) => {
+                write!(f, "{}", num)?;
+            }
+            AsmVal::Loc(loc) => {
+                loc.fmt_asm_comment(f)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for AsmVal {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        match self {
+            AsmVal::Imm(num) => {
+                write!(f, "{}", num)?;
+            }
+            AsmVal::Loc(loc) => {
+                loc.fmt_node(f, 0)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl AsmLocation {
+    fn resolve_pseudoregister(&mut self, frame: &mut FuncStackFrame) -> Result<(), String> {
+        if let AsmLocation::PseudoReg(psr) = self {
+            *self = frame.create_or_get_location(&psr)?;
+        }
+
+        Ok(())
+    }
+
+    fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
+        if let AsmLocation::RbpOffset(rbp_offset, name) = self {
+            let rsp_offset = frame.size() as i32 + *rbp_offset;
+            assert!(rsp_offset >= 0);
+            *self = AsmLocation::RspOffset(rsp_offset as u32, name.clone());
+        }
+    }
+
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AsmLocation::Reg(name) => {
+                f.write_str(name)?;
+            }
+            AsmLocation::RspOffset(rsp_offset, _name) => {
+                write!(f, "DWORD PTR [rsp+{}]", rsp_offset)?;
+            }
+            _ => panic!("cannot handle emitting {:?}", self),
+        }
+
+        Ok(())
+    }
+
+    fn fmt_asm_comment(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AsmLocation::Reg(name) => {
+                f.write_str(name)?;
+            }
+            AsmLocation::RspOffset(rsp_offset, name) => {
+                f.write_str(name)?;
+            }
+            _ => panic!("{:?} should not be written into ASM", self),
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for AsmLocation {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        match self {
+            AsmLocation::Reg(name) => {
+                write!(f, "Reg {}", name)?;
+            }
+            AsmLocation::PseudoReg(name) => {
+                f.write_str(&name)?;
+            }
+            AsmLocation::RbpOffset(offset, name) => {
+                write!(
+                    f,
+                    "rbp{}{} ({})",
+                    if *offset >= 0 { "+" } else { "" },
+                    offset,
+                    name
+                )?;
+            }
+            AsmLocation::RspOffset(offset, name) => {
+                write!(f, "rsp+{} ({})", offset, name)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl AsmUnaryOperator {
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AsmUnaryOperator::Neg => write!(f, "neg"),
+            AsmUnaryOperator::Not => write!(f, "not"),
+        }
+    }
+}
+
+impl FmtNode for AsmUnaryOperator {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl TacGenState {
+    fn new() -> Self {
+        TacGenState {
+            next_temporary_id: 0,
+        }
+    }
+
+    fn allocate_temporary(&mut self) -> TacVar {
+        self.next_temporary_id += 1;
+        TacVar(format!("{:03}_tmp", self.next_temporary_id - 1))
+    }
+}
+
+impl FuncStackFrame {
+    fn new() -> Self {
+        Self {
+            names: HashMap::new(),
+            max_base_offset: 0,
+        }
+    }
+
+    fn create_or_get_location(&mut self, name: &str) -> Result<AsmLocation, String> {
+        if let Some(offset) = self.names.get(name) {
+            Ok(AsmLocation::RbpOffset(*offset, String::from(name)))
+        } else {
+            // For now we are only storing 4-byte values.
+            self.max_base_offset += 4;
+            let offset = -(self.max_base_offset as i32);
+
+            assert!(self.names.insert(String::from(name), offset).is_none());
+
+            Ok(AsmLocation::RbpOffset(offset, String::from(name)))
+        }
+    }
+
+    fn size(&self) -> u32 {
+        self.max_base_offset
     }
 }
 
@@ -936,7 +1031,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
     for r in SKIPPED_TOKEN_REGEXES.iter() {
         if let Some(mat) = r.find(input) {
             let range = mat.range();
-            //println!("match: {}, {}", range.start, range.end);
+            //println!("match skipped {:?}: {}, {}", r, range.start, range.end);
             return Ok(("", input.split_at(range.end).1));
         }
     }
@@ -944,7 +1039,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
     for r in TOKEN_REGEXES.iter() {
         if let Some(mat) = r.find(input) {
             let range = mat.range();
-            //println!("match: {}, {}", range.start, range.end);
+            //println!("match {:?}: {}, {}", r, range.start, range.end);
             return Ok(input.split_at(range.end));
         }
     }
@@ -974,22 +1069,6 @@ fn lex_all_tokens<'i>(input: &'i str) -> Result<Vec<&'i str>, Vec<String>> {
     Ok(tokens)
 }
 
-fn parse_program<'i, 't>(mut tokens: Tokens<'i, 't>) -> Result<AstProgram<'i>, String> {
-    let mut functions = vec![];
-    while let Ok(function) = parse_function(&mut tokens) {
-        functions.push(function);
-    }
-
-    if tokens.0.len() == 0 {
-        Ok(AstProgram { functions })
-    } else {
-        Err(format!(
-            "extra tokens after main function end: {:?}",
-            tokens
-        ))
-    }
-}
-
 fn parse_function<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstFunction<'i>, String> {
     let mut tokens = original_tokens.clone();
 
@@ -1004,31 +1083,17 @@ fn parse_function<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstFun
 
     tokens.consume_expected_next_token(")")?;
 
-    let block_items_opt;
-    if tokens.consume_expected_next_token("{").is_ok() {
-        // Parse out all the block items possible.
-        let mut block_items = vec![];
-        loop {
-            let res = parse_block_item(&mut tokens);
-            if let Ok(block_item) = res {
-                block_items.push(block_item);
-            } else {
-                break;
-            }
-        }
+    tokens.consume_expected_next_token("{")?;
 
-        tokens.consume_expected_next_token("}")?;
-        block_items_opt = Some(block_items);
-    } else {
-        tokens.consume_expected_next_token(";")?;
-        block_items_opt = None;
-    }
+    let body = parse_statement(&mut tokens)?;
+
+    tokens.consume_expected_next_token("}")?;
 
     *original_tokens = tokens;
     Ok(AstFunction {
         name,
         parameters,
-        body_opt: block_items_opt,
+        body,
     })
 }
 
@@ -1049,174 +1114,20 @@ fn parse_function_parameter<'i, 't>(
     Ok(var_name)
 }
 
-fn parse_block_item<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
-    if let Ok(declaration) = parse_declaration(tokens) {
-        Ok(AstBlockItem::Declaration(declaration))
-    } else {
-        parse_statement(tokens).map(|statement| AstBlockItem::Statement(statement))
-    }
-}
-
-fn parse_declaration<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<AstDeclaration, String> {
-    let mut tokens = original_tokens.clone();
-
-    tokens.consume_expected_next_token("int")?;
-    let var_name = tokens.consume_next_token()?;
-
-    let mut expr_opt = None;
-    if tokens.consume_expected_next_token("=").is_ok() {
-        expr_opt = Some(parse_expression(&mut tokens)?);
-    }
-
-    tokens.consume_expected_next_token(";")?;
-
-    *original_tokens = tokens;
-    Ok(AstDeclaration::DeclareVar(String::from(var_name), expr_opt))
-}
-
 fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
     let mut tokens = original_tokens.clone();
 
-    let statement;
-    if tokens.consume_expected_next_token(";").is_ok() {
-        statement = AstStatement::Expression(None);
-    } else if tokens.consume_expected_next_token("return").is_ok() {
-        statement = AstStatement::Return(parse_expression(&mut tokens)?);
-        tokens.consume_expected_next_token(";")?;
-    } else if tokens.consume_expected_next_token("if").is_ok() {
-        tokens.consume_expected_next_token("(")?;
-        let expr = parse_expression(&mut tokens)?;
-        tokens.consume_expected_next_token(")")?;
-        let positive = parse_statement(&mut tokens)?;
+    tokens.consume_expected_next_token("return")?;
 
-        let negative;
-        if tokens.consume_expected_next_token("else").is_ok() {
-            negative = Some(Box::new(parse_statement(&mut tokens)?));
-        } else {
-            negative = None;
-        }
-
-        statement = AstStatement::Conditional(expr, Box::new(positive), negative);
-    } else if tokens.consume_expected_next_token("for").is_ok() {
-        tokens.consume_expected_next_token("(")?;
-
-        if tokens.consume_expected_next_token(";").is_ok() {
-            let (condition, post_expr_opt, body) = parse_remaining_for_statement(&mut tokens)?;
-            statement = AstStatement::For(None, condition, post_expr_opt, Box::new(body));
-        } else if let Ok(initial_declaration) = parse_declaration(&mut tokens) {
-            let (condition, post_expr_opt, body) = parse_remaining_for_statement(&mut tokens)?;
-            statement = AstStatement::ForDecl(
-                initial_declaration,
-                condition,
-                post_expr_opt,
-                Box::new(body),
-            );
-        } else {
-            let initial_expression = parse_expression(&mut tokens)?;
-            tokens.consume_expected_next_token(";")?;
-            let (condition, post_expr_opt, body) = parse_remaining_for_statement(&mut tokens)?;
-            statement = AstStatement::For(
-                Some(initial_expression),
-                condition,
-                post_expr_opt,
-                Box::new(body),
-            );
-        }
-    } else if tokens.consume_expected_next_token("while").is_ok() {
-        tokens.consume_expected_next_token("(")?;
-        let condition = parse_expression(&mut tokens)?;
-        tokens.consume_expected_next_token(")")?;
-
-        let body = parse_statement(&mut tokens)?;
-
-        statement = AstStatement::While(condition, Box::new(body));
-    } else if tokens.consume_expected_next_token("do").is_ok() {
-        let body = parse_statement(&mut tokens)?;
-        tokens.consume_expected_next_token("while")?;
-        tokens.consume_expected_next_token("(")?;
-        let condition = parse_expression(&mut tokens)?;
-        tokens.consume_expected_next_token(")")?;
-        tokens.consume_expected_next_token(";")?;
-
-        statement = AstStatement::DoWhile(condition, Box::new(body));
-    } else if tokens.consume_expected_next_token("{").is_ok() {
-        let mut block_items = vec![];
-
-        while let Ok(block_item) = parse_block_item(&mut tokens) {
-            block_items.push(block_item);
-        }
-
-        tokens.consume_expected_next_token("}")?;
-        statement = AstStatement::Compound(Box::new(block_items));
-    } else if tokens.consume_expected_next_token("break").is_ok() {
-        statement = AstStatement::Break;
-        tokens.consume_expected_next_token(";")?;
-    } else if tokens.consume_expected_next_token("continue").is_ok() {
-        statement = AstStatement::Continue;
-        tokens.consume_expected_next_token(";")?;
-    } else {
-        statement = AstStatement::Expression(Some(parse_expression(&mut tokens)?));
-        tokens.consume_expected_next_token(";")?;
-    }
+    let statement = AstStatement::Return(parse_expression(&mut tokens)?);
+    tokens.consume_expected_next_token(";")?;
 
     *original_tokens = tokens;
     Ok(statement)
 }
 
-fn parse_remaining_for_statement<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<(AstExpression, Option<AstExpression>, AstStatement), String> {
-    let mut tokens = original_tokens.clone();
-
-    // Empty condition is turned into a constant "true" value.
-    let condition;
-    if tokens.consume_expected_next_token(";").is_ok() {
-        condition = AstExpression::Constant(1);
-    } else {
-        condition = parse_expression(&mut tokens)?;
-        tokens.consume_expected_next_token(";")?;
-    }
-
-    let post_expr_opt;
-    if tokens.consume_expected_next_token(")").is_ok() {
-        post_expr_opt = None;
-    } else {
-        post_expr_opt = Some(parse_expression(&mut tokens)?);
-        tokens.consume_expected_next_token(")")?;
-    }
-
-    let body = parse_statement(&mut tokens)?;
-
-    *original_tokens = tokens;
-    Ok((condition, post_expr_opt, body))
-}
-
-fn parse_func_call<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
-    let mut tokens = original_tokens.clone();
-
-    let function_name = tokens.consume_identifier()?;
-    tokens.consume_expected_next_token("(")?;
-
-    let mut arguments = vec![];
-    loop {
-        if tokens.consume_expected_next_token(")").is_ok() {
-            break;
-        }
-
-        if arguments.len() != 0 {
-            tokens.consume_expected_next_token(",")?;
-        }
-
-        arguments.push(parse_expression(&mut tokens)?);
-    }
-
-    *original_tokens = tokens;
-    Ok(AstExpression::FuncCall(
-        function_name.to_string(),
-        arguments,
-    ))
+fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+    parse_unary_expression(original_tokens)
 }
 
 fn parse_unary_expression<'i, 't>(
@@ -1224,98 +1135,47 @@ fn parse_unary_expression<'i, 't>(
 ) -> Result<AstExpression, String> {
     let mut tokens = original_tokens.clone();
 
-    if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
-        *original_tokens = tokens;
+    let ret = if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
         Ok(AstExpression::Constant(integer_literal))
-    } else if tokens.consume_expected_next_token("(").is_ok() {
+    } else if let Ok(_) = tokens.consume_expected_next_token("(") {
         let inner = parse_expression(&mut tokens)?;
         tokens.consume_expected_next_token(")")?;
-        *original_tokens = tokens;
         Ok(inner)
     } else if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
         let inner = parse_unary_expression(&mut tokens)?;
-        *original_tokens = tokens;
         Ok(AstExpression::UnaryOperator(operator, Box::new(inner)))
-    } else if let Ok(func_call) = parse_func_call(&mut tokens) {
-        *original_tokens = tokens;
-        Ok(func_call)
     } else {
-        let variable_name = tokens.consume_identifier()?;
+        Err(String::from("unknown unary expression"))
+    };
+
+    if ret.is_ok() {
         *original_tokens = tokens;
-        Ok(AstExpression::Variable(String::from(variable_name)))
     }
+
+    ret
 }
 
-fn parse_binary_operator_level<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-    level: u32,
-) -> Result<AstExpression, String> {
-    let mut tokens = original_tokens.clone();
+fn generate_program_code(mode: Mode, ast_program: &AstProgram) -> Result<String, String> {
+    let tac_program = ast_program.to_tac()?;
 
-    if level == 0 {
-        let expr = parse_unary_expression(&mut tokens)?;
-        *original_tokens = tokens;
-        Ok(expr)
-    } else {
-        let mut expr = parse_binary_operator_level(&mut tokens, level - 1)?;
+    println!("tac:\n{}", display_with(|f| { tac_program.fmt_node(f, 0) }));
 
-        while let Ok(operator) = tokens.consume_and_parse_next_binary_operator(level) {
-            let rhs = parse_binary_operator_level(&mut tokens, level - 1)?;
-            expr = AstExpression::BinaryOperator(operator, Box::new(expr), Box::new(rhs));
+    match mode {
+        Mode::All | Mode::CodegenOnly => {
+            let mut asm_program = tac_program.to_asm()?;
+
+            println!("asm:\n{}", display_with(|f| asm_program.fmt_node(f, 0)));
+
+            asm_program.finalize()?;
+
+            println!(
+                "\nasm after fixup:\n{}",
+                display_with(|f| asm_program.fmt_node(f, 0))
+            );
+
+            asm_program.emit_code()
         }
-
-        *original_tokens = tokens;
-        Ok(expr)
-    }
-}
-
-fn parse_assignment_expression<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<AstExpression, String> {
-    let mut tokens = original_tokens.clone();
-
-    let variable_name = tokens.consume_identifier()?;
-    tokens.consume_expected_next_token("=")?;
-
-    let expr = parse_expression(&mut tokens)?;
-    *original_tokens = tokens;
-    Ok(AstExpression::Assign(
-        String::from(variable_name),
-        Box::new(expr),
-    ))
-}
-
-fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
-    if let Ok(assignment) = parse_assignment_expression(original_tokens) {
-        Ok(assignment)
-    } else {
-        parse_conditional_expression(original_tokens)
-    }
-}
-
-fn parse_conditional_expression<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<AstExpression, String> {
-    let mut tokens = original_tokens.clone();
-
-    // Parse logical-or expression
-    let expr1 = parse_binary_operator_level(&mut tokens, MAX_EXPRESSION_LEVEL)?;
-
-    if tokens.consume_expected_next_token("?").is_ok() {
-        // parse full expression
-        let expr2 = parse_expression(&mut tokens)?;
-        tokens.consume_expected_next_token(":")?;
-        let expr3 = parse_conditional_expression(&mut tokens)?;
-
-        *original_tokens = tokens;
-        Ok(AstExpression::Conditional(
-            Box::new(expr1),
-            Box::new(expr2),
-            Box::new(expr3),
-        ))
-    } else {
-        *original_tokens = tokens;
-        Ok(expr1)
+        _ => Ok(String::new()),
     }
 }
 
@@ -1329,616 +1189,8 @@ fn get_register_name(register_name: &str, width: u32) -> String {
     }
 }
 
-fn generate_program_code(ast_program: &AstProgram) -> Result<String, String> {
-    const HEADER: &str = r"INCLUDELIB msvcrt.lib
-.DATA
-
-.CODE
-";
-    const FOOTER: &str = r"
-END";
-
-    let mut asm = String::from(HEADER);
-    let mut codegen_state = CodegenGlobalState::new();
-
-    for function in &ast_program.functions {
-        asm += &generate_function_code(&mut codegen_state, function)?;
-        asm += "\n";
-    }
-
-    asm += FOOTER;
-    Ok(asm)
-}
-
-fn generate_function_code(
-    global_state: &mut CodegenGlobalState,
-    ast_function: &AstFunction,
-) -> Result<String, String> {
-    if let Some(body) = ast_function.body_opt.as_ref() {
-        let mut block_state_temp = CodegenBlockState::new_for_scan(ast_function);
-
-        // Compute frame size
-        let mut global_state_temp = global_state.clone();
-        for block_item in body {
-            generate_block_item_code(global_state, &mut block_state_temp, block_item);
-        }
-
-        let mut block_state =
-            CodegenBlockState::new(ast_function, Some(block_state_temp.get_frame_size()));
-        let mut code = format!(
-            "{} PROC\n    sub rsp,{}",
-            ast_function.name,
-            block_state.get_frame_size()
-        );
-
-        for block_item in body {
-            let result = generate_block_item_code(global_state, &mut block_state, block_item);
-            if let Ok(block_item_code) = result {
-                code += &block_item_code;
-            } else {
-                return result;
-            }
-        }
-
-        // Add a default return of 0 in case the code in the function body didn't put a return statement.
-        Ok(code
-            + &format!(
-                "\n    add rsp,{}\n    ret\n{} ENDP",
-                block_state.get_frame_size(),
-                ast_function.name
-            ))
-    } else {
-        Ok(format!("EXTERN {} :PROC", ast_function.name))
-    }
-}
-
-fn generate_block_item_code(
-    global_state: &mut CodegenGlobalState,
-    block_state: &mut CodegenBlockState,
-    ast_block_item: &AstBlockItem,
-) -> Result<String, String> {
-    match ast_block_item {
-        AstBlockItem::Statement(statement) => {
-            generate_statement_code(global_state, block_state, statement)
-        }
-        AstBlockItem::Declaration(declaration) => {
-            generate_declaration_code(global_state, block_state, declaration)
-        }
-    }
-}
-
-fn generate_declaration_code(
-    global_state: &mut CodegenGlobalState,
-    block_state: &mut CodegenBlockState,
-    ast_declaration: &AstDeclaration,
-) -> Result<String, String> {
-    match ast_declaration {
-        AstDeclaration::DeclareVar(name, expr_opt) => {
-            if !block_state.add_stack_var(&name) {
-                return Err(format!("variable {} already defined", name));
-            }
-
-            let mut code = String::new();
-            if let Some(expr) = expr_opt {
-                let result = generate_expression_code(global_state, block_state, expr);
-                if let Ok(expr_code) = result {
-                    code += &expr_code;
-
-                    // The assignment expression is in rax and should be stored at the variable's location.
-                    code += &format!(
-                        "\n    mov {},rax ; {} <- rax",
-                        block_state.get_var_location_str(&name).unwrap(),
-                        &name
-                    );
-                } else {
-                    return result;
-                }
-            }
-            Ok(code)
-        }
-    }
-}
-
-fn generate_statement_code(
-    global_state: &mut CodegenGlobalState,
-    block_state: &mut CodegenBlockState,
-    ast_statement: &AstStatement,
-) -> Result<String, String> {
-    match ast_statement {
-        AstStatement::Return(expr) => {
-            let expr_code = generate_expression_code(global_state, block_state, expr)?;
-            Ok(format!(
-                "{}\n    add rsp,{}\n    ret",
-                expr_code,
-                block_state.get_frame_size()
-            ))
-        }
-        AstStatement::Expression(Some(expr)) => {
-            generate_expression_code(global_state, block_state, expr)
-        }
-        AstStatement::Expression(None) => Ok(String::new()),
-        AstStatement::Conditional(condition, positive, negative_opt) => {
-            let after_pos_label = global_state.consume_jump_label();
-            let mut code = generate_expression_code(global_state, block_state, condition)?;
-
-            // Check if the conditional expression was true or false.
-            code += "\n    cmp rax,0";
-
-            // If it was false, jump to the section after the positive portion.
-            code += &format!("\n    je _j{}", after_pos_label);
-
-            // Otherwise, execute the positive section.
-            code += "\n    ";
-            code += &generate_statement_code(global_state, block_state, positive)?;
-
-            // Check if there is an else clause.
-            if let Some(negative) = negative_opt {
-                let negative_code = generate_statement_code(global_state, block_state, negative)?;
-                let after_neg_label = global_state.consume_jump_label();
-                // At the end of the positive section, jump over the negative section so that both aren't executed.
-                code += &format!("\n    jmp _j{}", after_neg_label);
-
-                // Start of the negative section.
-                code += &format!("\n    _j{}:", after_pos_label);
-                code += "\n    ";
-                code += &negative_code;
-                code += &format!("\n    _j{}:", after_neg_label);
-            } else {
-                // There was no else clause, so the label after the positive section is the end.
-                code += &format!("\n    _j{}:", after_pos_label);
-            }
-
-            Ok(code)
-        }
-        AstStatement::Compound(block_items) => {
-            let mut code = String::new();
-            let mut inner_block_state = block_state.nest();
-            for block_item in block_items.iter() {
-                code +=
-                    &generate_block_item_code(global_state, &mut inner_block_state, block_item)?;
-            }
-
-            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
-
-            Ok(code)
-        }
-        AstStatement::For(expr_opt, condition, post_expr_opt, body) => {
-            let mut code = String::new();
-
-            // The header of the for loop is in its own scope, for declarations.
-            let mut inner_block_state = block_state.nest();
-
-            if let Some(pre_expression) = expr_opt.as_ref() {
-                code += &generate_expression_code(
-                    global_state,
-                    &mut inner_block_state,
-                    pre_expression,
-                )?;
-            }
-
-            code += &generate_remaining_for_loop_code(
-                global_state,
-                &mut inner_block_state,
-                condition,
-                body,
-                post_expr_opt,
-            )?;
-
-            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
-
-            Ok(code)
-        }
-        AstStatement::ForDecl(declaration, condition, post_expr_opt, body) => {
-            let mut code = String::new();
-
-            // The header of the for loop is in its own scope, for declarations.
-            let mut inner_block_state = block_state.nest();
-            code += &generate_declaration_code(global_state, &mut inner_block_state, declaration)?;
-            code += &generate_remaining_for_loop_code(
-                global_state,
-                &mut inner_block_state,
-                condition,
-                body,
-                post_expr_opt,
-            )?;
-
-            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
-
-            Ok(code)
-        }
-        AstStatement::While(condition, body) => {
-            let before_loop_condition_label = global_state.consume_jump_label();
-            let after_loop_label = global_state.consume_jump_label();
-
-            let mut code = format!("\n    _j{}:", before_loop_condition_label);
-            code += &generate_expression_code(global_state, block_state, condition)?;
-
-            // Check if the conditional expression was true or false.
-            code += "\n    cmp rax,0";
-
-            // If it was false, jump to after the loop body.
-            code += &format!("\n    je _j{}", after_loop_label);
-
-            // Set up the jump labels for break and continue.
-            let mut inner_block_state =
-                block_state.enter_loop(after_loop_label, before_loop_condition_label);
-
-            // The loop condition was true, so now include the body's code.
-            code += "\n    ";
-            code += &generate_statement_code(global_state, &mut inner_block_state, body)?;
-
-            // At the end of the loop body, jump back to before the loop condition so it can be evaluated again.
-            code += &format!("\n    jmp _j{}", before_loop_condition_label);
-
-            // The label after the end of the loop, so the condition can jump here if false.
-            code += &format!("\n    _j{}:", after_loop_label);
-
-            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
-
-            Ok(code)
-        }
-        AstStatement::DoWhile(condition, body) => {
-            let before_loop_body = global_state.consume_jump_label();
-            let before_loop_condition_label = global_state.consume_jump_label();
-            let after_loop_label = global_state.consume_jump_label();
-
-            let mut code = format!("\n    _j{}:", before_loop_body);
-
-            // Set up the jump labels for break and continue.
-            let mut inner_block_state =
-                block_state.enter_loop(after_loop_label, before_loop_condition_label);
-
-            code += &generate_statement_code(global_state, &mut inner_block_state, body)?;
-
-            code += &format!("\n    _j{}:", before_loop_condition_label);
-
-            // After the loop body, check the condition.
-            code += &generate_expression_code(global_state, &mut inner_block_state, condition)?;
-
-            // Check if the conditional expression was true or false.
-            code += "\n    cmp rax,0";
-
-            // If it was true, jump back to the start of the loop body. Otherwise just continue.
-            code += &format!("\n    jne _j{}", before_loop_body);
-            code += &format!("\n    _j{}:", after_loop_label);
-
-            block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
-
-            Ok(code)
-        }
-        AstStatement::Break => {
-            if let Some(break_label) = block_state.break_label {
-                Ok(format!("\n    jmp _j{}", break_label))
-            } else {
-                Err(String::from("break statement used outside of loop"))
-            }
-        }
-        AstStatement::Continue => {
-            if let Some(continue_label) = block_state.continue_label {
-                Ok(format!("\n    jmp _j{}", continue_label))
-            } else {
-                Err(String::from("continue statement used outside of loop"))
-            }
-        }
-    }
-}
-
-fn generate_remaining_for_loop_code(
-    global_state: &mut CodegenGlobalState,
-    block_state: &mut CodegenBlockState,
-    condition: &AstExpression,
-    body: &AstStatement,
-    post_expr_opt: &Option<AstExpression>,
-) -> Result<String, String> {
-    let before_loop_condition_label = global_state.consume_jump_label();
-    let after_body_label = global_state.consume_jump_label();
-    let after_loop_label = global_state.consume_jump_label();
-
-    let mut code = format!("\n    _j{}:", before_loop_condition_label);
-    code += &generate_expression_code(global_state, block_state, condition)?;
-
-    // Check if the conditional expression was true or false.
-    code += "\n    cmp rax,0";
-
-    // If it was false, jump to after the loop body.
-    code += &format!("\n    je _j{}", after_loop_label);
-
-    // Set up the jump labels for break and continue.
-    let mut inner_block_state = block_state.enter_loop(after_loop_label, after_body_label);
-
-    // The loop condition was true, so now include the body's code.
-    code += "\n    ";
-    code += &generate_statement_code(global_state, &mut inner_block_state, body)?;
-
-    // Just before the loop body is a label for the target of a continue statement, which is just before the post
-    // expression.
-    code += &format!("\n    _j{}:", after_body_label);
-
-    // After the loop body, evaluate the post-expression, if present.
-    if let Some(post_expression) = post_expr_opt.as_ref() {
-        code += &generate_expression_code(global_state, &mut inner_block_state, post_expression)?;
-    }
-
-    // At the end of the loop body, jump back to before the loop condition so it can be evaluated again.
-    code += &format!("\n    jmp _j{}", before_loop_condition_label);
-
-    // The label after the end of the loop, so the condition can jump here if false.
-    code += &format!("\n    _j{}:", after_loop_label);
-
-    block_state.update_lowest_local_offset_from_base_from_nested(&inner_block_state);
-
-    Ok(code)
-}
-
-fn generate_binary_operator_code(
-    operator: &AstBinaryOperator,
-    global_state: &mut CodegenGlobalState,
-    block_state: &mut CodegenBlockState,
-    rhs_code: &str,
-    lhs_temp_location: &str,
-) -> String {
-    match operator {
-        AstBinaryOperator::Or => {
-            let label = global_state.consume_jump_label();
-            format!("\n    cmp rax,0\n    mov rax,0\n    setne al\n    jne _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
-        }
-        AstBinaryOperator::And => {
-            let label = global_state.consume_jump_label();
-            format!("\n    cmp rax,0\n    je _j{}\n{}\n    cmp rax,0\n    mov rax,0\n    setne al\n    _j{}:", label, rhs_code, label)
-        }
-        _ => {
-            // The left side of the operator's code was emitted just before this, and stores the result in rax. Move it
-            // to temp stack space so that rax can be repurposed for the right hand side expression.
-            let mut code = format!("\n    mov {},rax ; lhs_temp <- rax", lhs_temp_location);
-
-            // Emit the right side code and then the code for the operand that combines it with the left side code from
-            // its temp location.
-            code += rhs_code;
-            code += &match operator {
-                AstBinaryOperator::Equals => format!(
-                    "\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    sete al",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::NotEquals => format!(
-                    "\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setne al",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::LessThan => format!(
-                    "\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setl al",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::GreaterThan => format!(
-                    "\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setg al",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::LessThanEqual => format!(
-                    "\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setle al",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::GreaterThanEqual => format!(
-                    "\n    mov r10,{}\n    cmp r10,rax\n    mov rax,0\n    setge al",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::Plus => {
-                    format!("\n    mov r10,{}\n    add rax,r10", lhs_temp_location)
-                }
-                AstBinaryOperator::Minus => format!(
-                    "\n    mov r10,{}\n    sub r10,rax\n    mov rax,r10",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::Multiply => format!(
-                    "\n    mov r10,rax\n    mov rax,{}\n    imul rax,r10",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::Divide => format!(
-                    "\n    mov r10,rax\n    mov rax,{}\n    cdq\n    idiv r10d",
-                    lhs_temp_location
-                ),
-                AstBinaryOperator::Or => panic!("unexpected"),
-                AstBinaryOperator::And => panic!("unexpected"),
-            };
-
-            code
-        }
-    }
-}
-
-fn generate_expression_code(
-    global_state: &mut CodegenGlobalState,
-    block_state: &mut CodegenBlockState,
-    ast_node: &AstExpression,
-) -> Result<String, String> {
-    match ast_node {
-        AstExpression::Constant(val) => Ok(format!("\n    mov rax,{}", val)),
-        AstExpression::Variable(name) => block_state
-            .get_var_location_str(&name)
-            .ok_or(format!("unknown variable {}", name))
-            .map(|location| format!("\n    mov rax,{} ; rax <- {}", &location, &name)),
-        AstExpression::UnaryOperator(operator, expr) => generate_expression_code(
-            global_state,
-            block_state,
-            &expr,
-        )
-        .and_then(|inner_factor_code| match operator {
-            AstUnaryOperator::Negation => Ok(format!("{}\n    neg rax", inner_factor_code)),
-            AstUnaryOperator::BitwiseNot => Ok(format!("{}\n    not rax", inner_factor_code)),
-            AstUnaryOperator::LogicalNot => Ok(format!(
-                "{}\n    cmp rax,0\n    mov rax,0\n    sete al",
-                inner_factor_code
-            )),
-        }),
-        AstExpression::BinaryOperator(operator, left, right) => {
-            // The left hand side is emitted first. Like all expressions, the result is stored in rax. Then we need to
-            // allocate temp space to hold that lhs result before performing the rhs.
-            let left_code = generate_expression_code(global_state, block_state, &left)?;
-
-            let lhs_temp_offset_from_sp = block_state.push_temp();
-            let right_code = generate_expression_code(global_state, block_state, &right)?;
-
-            let result = Ok(left_code
-                + &generate_binary_operator_code(
-                    &operator,
-                    global_state,
-                    block_state,
-                    &right_code,
-                    &format!("[rsp+{}]", lhs_temp_offset_from_sp),
-                ));
-            block_state.pop_temp();
-
-            result
-        }
-        AstExpression::Assign(name, expr) => {
-            generate_expression_code(global_state, block_state, expr).and_then(|expr_code| {
-                block_state
-                    .get_var_location_str(&name)
-                    .ok_or(format!("unknown variable {}", name))
-                    .and_then(|location| {
-                        Ok(format!(
-                            "{}\n    mov {},rax ; {} <- rax",
-                            expr_code, &location, &name
-                        ))
-                    })
-            })
-        }
-        AstExpression::Conditional(condition, positive, negative) => {
-            let after_pos_label = global_state.consume_jump_label();
-            let mut code = generate_expression_code(global_state, block_state, condition)?;
-
-            // Check if the conditional expression was true or false.
-            code += "\n    cmp rax,0";
-
-            // If it was false, jump to the section after the positive portion.
-            code += &format!("\n    je _j{}", after_pos_label);
-
-            // Otherwise, execute the positive section.
-            code += "\n    ";
-            code += &generate_expression_code(global_state, block_state, positive)?;
-
-            let negative_code = generate_expression_code(global_state, block_state, negative)?;
-            let after_neg_label = global_state.consume_jump_label();
-            // At the end of the positive section, jump over the negative section so that both aren't executed.
-            code += &format!("\n    jmp _j{}", after_neg_label);
-
-            // Start of the negative section.
-            code += &format!("\n    _j{}:", after_pos_label);
-            code += "\n    ";
-            code += &negative_code;
-            code += &format!("\n    _j{}:", after_neg_label);
-
-            Ok(code)
-        }
-        AstExpression::FuncCall(name, args) => {
-            let mut code = String::new();
-
-            // Allocate temp space for the expression results as they are computed. Store and remember them because
-            // more temp space will be allocated below when copying the parameters into the correct locations for
-            // passing to the callee. In other words, store and remember them so that we don't interleave pop with
-            // more push calls below.
-            let mut arg_sp_offsets = vec![];
-            for arg_expr in args.iter() {
-                code += &generate_expression_code(global_state, block_state, arg_expr)?;
-                let arg_temp_offset_from_sp = block_state.push_temp();
-                arg_sp_offsets.push(arg_temp_offset_from_sp);
-                code += &format!(
-                    "\n    mov [rsp+{}],rax ; temp <- rax",
-                    arg_temp_offset_from_sp
-                );
-            }
-
-            // Must reserve space for the first 4 args, whether they are used or not and even though they're being
-            // stored in registers rather than on the stack. This code looks weird because it appears to do nothing
-            // (pushes and pops without any interleaving access), but it has a side effect of recording the required
-            // frame size.
-            for _ in 0..4 {
-                block_state.push_arg();
-            }
-
-            // Push the arguments onto the stack in reverse order, as required by calling convention.
-            for _ in args.iter().rev() {
-                // Grab the last temp value location from the stored list. The length is then the index of the arg.
-                let arg_temp_offset_from_sp = arg_sp_offsets.pop().unwrap();
-
-                let dest = match arg_sp_offsets.len() {
-                    0 => String::from("rcx"),
-                    1 => String::from("rdx"),
-                    2 => String::from("r8"),
-                    3 => String::from("r9"),
-                    _ => format!("[rsp+{}]", block_state.push_arg()),
-                };
-
-                code += &format!("\n    mov r10,[rsp+{}]", arg_temp_offset_from_sp);
-                code += &format!(
-                    "\n    mov {},r10 ; arg {} <- temp",
-                    dest,
-                    arg_sp_offsets.len()
-                );
-            }
-
-            code += &format!("\n    call {}", name);
-
-            // Pop all the temp values, making sure to pop at least the 4 that are always reserved.
-            for _ in 0..std::cmp::max(args.len(), 4) {
-                block_state.pop_arg();
-            }
-
-            // Pop all the temp expression values used before setting up the parameters.
-            for _ in args.iter() {
-                block_state.pop_temp();
-            }
-
-            Ok(code)
-        }
-    }
-}
-
 fn validate_ast(ast_program: &AstProgram) -> Result<(), Vec<String>> {
     let mut errors = vec![];
-
-    for function in &ast_program.functions {
-        let mut num_definitions = 0;
-        let mut param_count_opt = None;
-        for func in &ast_program.functions {
-            if func.name == function.name {
-                // Check for multiple definitions of the same function.
-                if func.is_definition() {
-                    num_definitions += 1;
-
-                    if num_definitions > 1 {
-                        errors.push(format!(
-                            "found {} definitions of function \"{}\"",
-                            num_definitions, function.name
-                        ));
-                        return Err(errors);
-                    }
-                }
-
-                // Check for declarations of the same function with different parameter counts.
-                if let Some(param_count) = param_count_opt {
-                    if param_count != func.parameters.len() {
-                        errors.push(format!("function {} re-delcaration with wrong parameter count {}. previously defined with parameter count {}", func.name, func.parameters.len(), param_count));
-                        return Err(errors);
-                    }
-                } else {
-                    param_count_opt = Some(func.parameters.len());
-                }
-            }
-        }
-    }
-
-    let all_expressions = ast_program.collect_all_expressions();
-    for expression in &all_expressions {
-        if let AstExpression::FuncCall(name, args) = expression {
-            let func = ast_program.lookup_function_definition(&name).unwrap();
-            if func.parameters.len() != args.len() {
-                errors.push(format!(
-                    "function {} called with wrong parameter count {}. Should be {}.",
-                    &name,
-                    args.len(),
-                    func.parameters.len()
-                ));
-            }
-        }
-    }
 
     if errors.len() == 0 {
         Ok(())
@@ -1991,7 +1243,8 @@ fn assemble_and_link(
 
 // TODO should return line numbers with errors
 fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, Vec<String>> {
-    let tokens = lex_all_tokens(&input)?;
+    let token_strings = lex_all_tokens(&input)?;
+    let mut tokens = Tokens(&token_strings);
     /*
     for token in tokens.iter() {
         println!("{}", token);
@@ -2005,8 +1258,23 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
     }
 
     // TODO all parsing should return a list of errors, not just one. for now, wrap it in a single error
-    let ast = parse_program(Tokens(&tokens)).map_err(|e| vec![e])?;
-    println!("AST:\n{}\n", ast);
+    let ast = {
+        let mut functions = vec![];
+        while let Ok(function) = parse_function(&mut tokens) {
+            functions.push(function);
+        }
+
+        if tokens.0.len() == 0 {
+            Ok(AstProgram { functions })
+        } else {
+            Err(vec![format!(
+                "extra tokens after main function end: {:?}",
+                tokens
+            )])
+        }
+    }?;
+
+    println!("AST:\n{}\n", display_with(|f| ast.fmt_node(f, 0)));
 
     validate_ast(&ast)?;
 
@@ -2059,11 +1327,12 @@ fn compile_and_link(
 
         match parse_and_validate(args.mode, &input) {
             Ok(ast) => match args.mode {
-                Mode::All | Mode::CodegenOnly => {
-                    let asm = generate_program_code(&ast)?;
-                    println!("assembly:\n{}", asm);
+                Mode::All | Mode::TacOnly | Mode::CodegenOnly => {
+                    let asm = generate_program_code(args.mode, &ast)?;
 
                     if let Mode::All = args.mode {
+                        println!("\nassembly:\n{}", asm);
+
                         let exit_code = assemble_and_link(
                             &asm,
                             &args.output_path.as_ref().unwrap(),
@@ -2126,6 +1395,10 @@ enum Mode {
     /// Lex and parse only. Exit code is zero if successful.
     #[value(name = "parse", alias = "p")]
     ParseOnly,
+
+    /// Lex, parse, and generate TAC only. Exit code is zero if successful.
+    #[value(name = "tac", alias = "t")]
+    TacOnly,
 
     /// Lex, parse, and codegen only. Exit code is zero if successful.
     #[value(name = "codegen", alias = "c")]
@@ -2325,8 +1598,98 @@ mod test {
     }
 
     #[test]
-    fn test_codegen_unary_operator() {
+    fn test_codegen_unary_neg() {
         test_codegen_expression("-5", -5);
+    }
+
+    #[test]
+    fn test_codegen_unary_not() {
+        test_codegen_expression("~12", -13);
+    }
+
+    #[test]
+    fn test_codegen_unary_neg_zero() {
+        test_codegen_expression("-0", 0);
+    }
+
+    #[test]
+    fn test_codegen_unary_not_zero() {
+        test_codegen_expression("~0", -1);
+    }
+
+    #[test]
+    fn test_codegen_unary_neg_min_val() {
+        test_codegen_expression("-2147483647", -2147483647);
+    }
+
+    #[test]
+    fn test_codegen_unary_not_and_neg() {
+        test_codegen_expression("~-3", 2);
+    }
+
+    #[test]
+    fn test_codegen_unary_not_and_neg_zero() {
+        test_codegen_expression("-~0", 1);
+    }
+
+    #[test]
+    fn test_codegen_unary_not_and_neg_min_val() {
+        test_codegen_expression("~-2147483647", 2147483646);
+    }
+
+    #[test]
+    fn test_codegen_unary_grouping_outside() {
+        test_codegen_expression("(-2)", -2);
+    }
+
+    #[test]
+    fn test_codegen_unary_grouping_inside() {
+        test_codegen_expression("~(2)", -3);
+    }
+
+    #[test]
+    fn test_codegen_unary_grouping_inside_and_outside() {
+        test_codegen_expression("-(-4)", 4);
+    }
+
+    #[test]
+    fn test_codegen_unary_grouping_several() {
+        test_codegen_expression("-((((((10))))))", -10);
+    }
+
+    #[test]
+    fn test_parse_fail_extra_paren() {
+        test_codegen_mainfunc_failure("return (3));");
+    }
+
+    #[test]
+    fn test_parse_fail_unclosed_paren() {
+        test_codegen_mainfunc_failure("return (3;");
+    }
+
+    #[test]
+    fn test_parse_fail_missing_immediate() {
+        test_codegen_mainfunc_failure("return ~;");
+    }
+
+    #[test]
+    fn test_parse_fail_missing_immediate_2() {
+        test_codegen_mainfunc_failure("return -~;");
+    }
+
+    #[test]
+    fn test_parse_fail_missing_semicolon() {
+        test_codegen_mainfunc_failure("return 5");
+    }
+
+    #[test]
+    fn test_parse_fail_parens_around_operator() {
+        test_codegen_mainfunc_failure("return (-)5;");
+    }
+
+    #[test]
+    fn test_parse_fail_operator_wrong_order() {
+        test_codegen_mainfunc_failure("return 5-;");
     }
 
     #[test]
