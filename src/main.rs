@@ -255,6 +255,7 @@ enum AstBinaryOperator {
     Multiply,
     Divide,
     Modulus,
+    BitwiseAnd,
 }
 
 #[derive(Debug)]
@@ -298,6 +299,7 @@ enum TacBinaryOperator {
     Multiply,
     Divide,
     Modulus,
+    BitwiseAnd,
 }
 
 #[derive(Debug)]
@@ -348,6 +350,7 @@ enum AsmBinaryOperator {
     Add,
     Subtract,
     Imul,
+    And,
 }
 
 struct TacGenState {
@@ -465,11 +468,12 @@ impl AstBinaryOperator {
     // 50.
     fn precedence(&self) -> u8 {
         match self {
-            AstBinaryOperator::Add => 0,
-            AstBinaryOperator::Subtract => 0,
-            AstBinaryOperator::Multiply => 1,
-            AstBinaryOperator::Divide => 1,
-            AstBinaryOperator::Modulus => 1,
+            AstBinaryOperator::BitwiseAnd => 0,
+            AstBinaryOperator::Add => 1,
+            AstBinaryOperator::Subtract => 1,
+            AstBinaryOperator::Multiply => 2,
+            AstBinaryOperator::Divide => 2,
+            AstBinaryOperator::Modulus => 2,
         }
     }
 
@@ -480,6 +484,7 @@ impl AstBinaryOperator {
             AstBinaryOperator::Multiply => TacBinaryOperator::Multiply,
             AstBinaryOperator::Divide => TacBinaryOperator::Divide,
             AstBinaryOperator::Modulus => TacBinaryOperator::Modulus,
+            AstBinaryOperator::BitwiseAnd => TacBinaryOperator::BitwiseAnd,
         }
     }
 }
@@ -492,6 +497,7 @@ impl FmtNode for AstBinaryOperator {
             AstBinaryOperator::Multiply => "*",
             AstBinaryOperator::Divide => "/",
             AstBinaryOperator::Modulus => "%",
+            AstBinaryOperator::BitwiseAnd => "&",
         })
     }
 }
@@ -505,6 +511,7 @@ impl std::str::FromStr for AstBinaryOperator {
             "*" => Ok(AstBinaryOperator::Multiply),
             "/" => Ok(AstBinaryOperator::Divide),
             "%" => Ok(AstBinaryOperator::Modulus),
+            "&" => Ok(AstBinaryOperator::BitwiseAnd),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -774,6 +781,7 @@ impl TacBinaryOperator {
             TacBinaryOperator::Add => AsmBinaryOperator::Add,
             TacBinaryOperator::Subtract => AsmBinaryOperator::Subtract,
             TacBinaryOperator::Multiply => AsmBinaryOperator::Imul,
+            TacBinaryOperator::BitwiseAnd => AsmBinaryOperator::And,
             TacBinaryOperator::Divide | TacBinaryOperator::Modulus => {
                 panic!("divide/modulus should have been handled elsewhere")
             }
@@ -789,6 +797,7 @@ impl fmt::Display for TacBinaryOperator {
             TacBinaryOperator::Multiply => "*",
             TacBinaryOperator::Divide => "/",
             TacBinaryOperator::Modulus => "%",
+            TacBinaryOperator::BitwiseAnd => "&",
         })
     }
 }
@@ -1299,6 +1308,7 @@ impl AsmBinaryOperator {
             AsmBinaryOperator::Add => "add",
             AsmBinaryOperator::Subtract => "sub",
             AsmBinaryOperator::Imul => "imul",
+            AsmBinaryOperator::And => "and",
         })
     }
 }
@@ -1309,6 +1319,7 @@ impl FmtNode for AsmBinaryOperator {
             AsmBinaryOperator::Add => "+",
             AsmBinaryOperator::Subtract => "-",
             AsmBinaryOperator::Imul => "*",
+            AsmBinaryOperator::And => "&",
         })
     }
 }
@@ -1380,6 +1391,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^/").expect("failed to compile regex"),
             Regex::new(r"^\*").expect("failed to compile regex"),
             Regex::new(r"^%").expect("failed to compile regex"),
+            Regex::new(r"^&").expect("failed to compile regex"),
             Regex::new(r"^<").expect("failed to compile regex"),
             Regex::new(r"^>").expect("failed to compile regex"),
             Regex::new(r"^=").expect("failed to compile regex"),
@@ -2250,6 +2262,11 @@ mod test {
     #[test]
     fn test_codegen_modulus() {
         test_codegen_expression("10 % 3", 1);
+    }
+
+    #[test]
+    fn test_codegen_bitand_associativity() {
+        test_codegen_expression("7 * 1 & 3 * 1", 3);
     }
 
     #[test]
