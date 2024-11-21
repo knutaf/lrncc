@@ -256,6 +256,8 @@ enum AstBinaryOperator {
     Divide,
     Modulus,
     BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
 }
 
 #[derive(Debug)]
@@ -300,6 +302,8 @@ enum TacBinaryOperator {
     Divide,
     Modulus,
     BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
 }
 
 #[derive(Debug)]
@@ -351,6 +355,8 @@ enum AsmBinaryOperator {
     Subtract,
     Imul,
     And,
+    Or,
+    Xor,
 }
 
 struct TacGenState {
@@ -468,12 +474,14 @@ impl AstBinaryOperator {
     // 50.
     fn precedence(&self) -> u8 {
         match self {
-            AstBinaryOperator::BitwiseAnd => 0,
-            AstBinaryOperator::Add => 1,
-            AstBinaryOperator::Subtract => 1,
-            AstBinaryOperator::Multiply => 2,
-            AstBinaryOperator::Divide => 2,
-            AstBinaryOperator::Modulus => 2,
+            AstBinaryOperator::BitwiseOr => 0,
+            AstBinaryOperator::BitwiseXor => 1,
+            AstBinaryOperator::BitwiseAnd => 2,
+            AstBinaryOperator::Add => 3,
+            AstBinaryOperator::Subtract => 3,
+            AstBinaryOperator::Multiply => 4,
+            AstBinaryOperator::Divide => 4,
+            AstBinaryOperator::Modulus => 4,
         }
     }
 
@@ -485,6 +493,8 @@ impl AstBinaryOperator {
             AstBinaryOperator::Divide => TacBinaryOperator::Divide,
             AstBinaryOperator::Modulus => TacBinaryOperator::Modulus,
             AstBinaryOperator::BitwiseAnd => TacBinaryOperator::BitwiseAnd,
+            AstBinaryOperator::BitwiseOr => TacBinaryOperator::BitwiseOr,
+            AstBinaryOperator::BitwiseXor => TacBinaryOperator::BitwiseXor,
         }
     }
 }
@@ -498,6 +508,8 @@ impl FmtNode for AstBinaryOperator {
             AstBinaryOperator::Divide => "/",
             AstBinaryOperator::Modulus => "%",
             AstBinaryOperator::BitwiseAnd => "&",
+            AstBinaryOperator::BitwiseOr => "|",
+            AstBinaryOperator::BitwiseXor => "^",
         })
     }
 }
@@ -512,6 +524,8 @@ impl std::str::FromStr for AstBinaryOperator {
             "/" => Ok(AstBinaryOperator::Divide),
             "%" => Ok(AstBinaryOperator::Modulus),
             "&" => Ok(AstBinaryOperator::BitwiseAnd),
+            "|" => Ok(AstBinaryOperator::BitwiseOr),
+            "^" => Ok(AstBinaryOperator::BitwiseXor),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -782,6 +796,8 @@ impl TacBinaryOperator {
             TacBinaryOperator::Subtract => AsmBinaryOperator::Subtract,
             TacBinaryOperator::Multiply => AsmBinaryOperator::Imul,
             TacBinaryOperator::BitwiseAnd => AsmBinaryOperator::And,
+            TacBinaryOperator::BitwiseOr => AsmBinaryOperator::Or,
+            TacBinaryOperator::BitwiseXor => AsmBinaryOperator::Xor,
             TacBinaryOperator::Divide | TacBinaryOperator::Modulus => {
                 panic!("divide/modulus should have been handled elsewhere")
             }
@@ -798,6 +814,8 @@ impl fmt::Display for TacBinaryOperator {
             TacBinaryOperator::Divide => "/",
             TacBinaryOperator::Modulus => "%",
             TacBinaryOperator::BitwiseAnd => "&",
+            TacBinaryOperator::BitwiseOr => "|",
+            TacBinaryOperator::BitwiseXor => "^",
         })
     }
 }
@@ -1309,6 +1327,8 @@ impl AsmBinaryOperator {
             AsmBinaryOperator::Subtract => "sub",
             AsmBinaryOperator::Imul => "imul",
             AsmBinaryOperator::And => "and",
+            AsmBinaryOperator::Or => "or",
+            AsmBinaryOperator::Xor => "xor",
         })
     }
 }
@@ -1320,6 +1340,8 @@ impl FmtNode for AsmBinaryOperator {
             AsmBinaryOperator::Subtract => "-",
             AsmBinaryOperator::Imul => "*",
             AsmBinaryOperator::And => "&",
+            AsmBinaryOperator::Or => "|",
+            AsmBinaryOperator::Xor => "^",
         })
     }
 }
@@ -1392,6 +1414,8 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^\*").expect("failed to compile regex"),
             Regex::new(r"^%").expect("failed to compile regex"),
             Regex::new(r"^&").expect("failed to compile regex"),
+            Regex::new(r"^\|").expect("failed to compile regex"),
+            Regex::new(r"^\^").expect("failed to compile regex"),
             Regex::new(r"^<").expect("failed to compile regex"),
             Regex::new(r"^>").expect("failed to compile regex"),
             Regex::new(r"^=").expect("failed to compile regex"),
@@ -2267,6 +2291,16 @@ mod test {
     #[test]
     fn test_codegen_bitand_associativity() {
         test_codegen_expression("7 * 1 & 3 * 1", 3);
+    }
+
+    #[test]
+    fn test_codegen_or_xor_associativity() {
+        test_codegen_expression("7 ^ 3 | 3 ^ 1", 6);
+    }
+
+    #[test]
+    fn test_codegen_and_xor_associativity() {
+        test_codegen_expression("7 ^ 3 & 6 ^ 2", 7);
     }
 
     #[test]
