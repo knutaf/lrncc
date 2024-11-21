@@ -239,12 +239,22 @@ enum AstStatement {
 enum AstExpression {
     Constant(u32),
     UnaryOperator(AstUnaryOperator, Box<AstExpression>),
+    BinaryOperator(Box<AstExpression>, AstBinaryOperator, Box<AstExpression>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
 enum AstUnaryOperator {
     Negation,
     BitwiseNot,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AstBinaryOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulus,
 }
 
 #[derive(Debug)]
@@ -263,6 +273,7 @@ struct TacFunction {
 enum TacInstruction {
     Return(TacVal),
     UnaryOp(TacUnaryOperator, TacVal, TacVar),
+    BinaryOp(TacVal, TacBinaryOperator, TacVal, TacVar),
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +292,15 @@ enum TacUnaryOperator {
 }
 
 #[derive(Debug)]
+enum TacBinaryOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulus,
+}
+
+#[derive(Debug)]
 struct AsmProgram {
     functions: Vec<AsmFunction>,
 }
@@ -296,6 +316,9 @@ struct AsmFunction {
 enum AsmInstruction {
     Mov(AsmVal, AsmLocation),
     UnaryOp(AsmUnaryOperator, AsmLocation),
+    BinaryOp(AsmBinaryOperator, AsmVal, AsmLocation),
+    Idiv(AsmVal),
+    Cdq,
     AllocateStack(u32),
     Ret(u32),
 }
@@ -318,6 +341,13 @@ enum AsmLocation {
 enum AsmUnaryOperator {
     Neg,
     Not,
+}
+
+#[derive(Debug, Clone)]
+enum AsmBinaryOperator {
+    Add,
+    Subtract,
+    Imul,
 }
 
 struct TacGenState {
@@ -430,6 +460,56 @@ impl std::str::FromStr for AstUnaryOperator {
     }
 }
 
+impl AstBinaryOperator {
+    // This specifies the precedence of operators when parentheses are not used. For example, 5 * 3 + 2 * 2 is 19, not
+    // 50.
+    fn precedence(&self) -> u8 {
+        match self {
+            AstBinaryOperator::Add => 0,
+            AstBinaryOperator::Subtract => 0,
+            AstBinaryOperator::Multiply => 1,
+            AstBinaryOperator::Divide => 1,
+            AstBinaryOperator::Modulus => 1,
+        }
+    }
+
+    fn to_tac(&self) -> TacBinaryOperator {
+        match self {
+            AstBinaryOperator::Add => TacBinaryOperator::Add,
+            AstBinaryOperator::Subtract => TacBinaryOperator::Subtract,
+            AstBinaryOperator::Multiply => TacBinaryOperator::Multiply,
+            AstBinaryOperator::Divide => TacBinaryOperator::Divide,
+            AstBinaryOperator::Modulus => TacBinaryOperator::Modulus,
+        }
+    }
+}
+
+impl FmtNode for AstBinaryOperator {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        f.write_str(match self {
+            AstBinaryOperator::Add => "+",
+            AstBinaryOperator::Subtract => "-",
+            AstBinaryOperator::Multiply => "*",
+            AstBinaryOperator::Divide => "/",
+            AstBinaryOperator::Modulus => "%",
+        })
+    }
+}
+
+impl std::str::FromStr for AstBinaryOperator {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "+" => Ok(AstBinaryOperator::Add),
+            "-" => Ok(AstBinaryOperator::Subtract),
+            "*" => Ok(AstBinaryOperator::Multiply),
+            "/" => Ok(AstBinaryOperator::Divide),
+            "%" => Ok(AstBinaryOperator::Modulus),
+            _ => Err(format!("unknown operator {}", s)),
+        }
+    }
+}
+
 impl AstExpression {
     fn to_tac(
         &self,
@@ -448,6 +528,18 @@ impl AstExpression {
                 ));
                 TacVal::Var(tempvar)
             }
+            AstExpression::BinaryOperator(ast_exp_left, ast_binary_op, ast_exp_right) => {
+                let tac_exp_left_var = ast_exp_left.to_tac(tacgen_state, instructions)?;
+                let tac_exp_right_var = ast_exp_right.to_tac(tacgen_state, instructions)?;
+                let tempvar = tacgen_state.allocate_temporary();
+                instructions.push(TacInstruction::BinaryOp(
+                    tac_exp_left_var,
+                    ast_binary_op.to_tac(),
+                    tac_exp_right_var,
+                    tempvar.clone(),
+                ));
+                TacVal::Var(tempvar)
+            }
         })
     }
 }
@@ -459,6 +551,15 @@ impl FmtNode for AstExpression {
             AstExpression::UnaryOperator(operator, expr) => {
                 operator.fmt_node(f, 0)?;
                 expr.fmt_node(f, 0)?;
+            }
+            AstExpression::BinaryOperator(left, operator, right) => {
+                write!(f, "(")?;
+                left.fmt_node(f, 0)?;
+                write!(f, " ")?;
+                operator.fmt_node(f, 0)?;
+                write!(f, " ")?;
+                right.fmt_node(f, 0)?;
+                write!(f, ")")?;
             }
         }
 
@@ -516,6 +617,66 @@ impl TacInstruction {
                 func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_asm_loc.clone()));
                 func_body.push(AsmInstruction::UnaryOp(unary_op.to_asm()?, dest_asm_loc));
             }
+
+            // Divide and modulus have weird assembly instructions for them, so we need to treat them specially.
+            TacInstruction::BinaryOp(
+                left_val,
+                binary_op @ (TacBinaryOperator::Divide | TacBinaryOperator::Modulus),
+                right_val,
+                dest_var,
+            ) => {
+                // idiv takes the numerator in EDX:EAX (that's low 32 bits in EAX and high 32 bits in EDX). Since we're
+                // operating only on 32 bits, move the value to EAX first.
+                func_body.push(AsmInstruction::Mov(
+                    left_val.to_asm()?,
+                    AsmLocation::Reg("eax"),
+                ));
+
+                // cdq sign extends EAX into EDX. Wow, it's purpose-built for this.
+                func_body.push(AsmInstruction::Cdq);
+
+                // The idiv instruction takes only the denominator as an argument, implicitly operating on EDX:EAX as
+                // the numerator.
+                func_body.push(AsmInstruction::Idiv(right_val.to_asm()?));
+
+                // The result of idiv is stored with quotient in EAX and remainer in EDX.
+                let result_loc = AsmLocation::Reg(if let TacBinaryOperator::Divide = binary_op {
+                    "eax"
+                } else {
+                    assert!(if let TacBinaryOperator::Modulus = binary_op {
+                        true
+                    } else {
+                        false
+                    });
+
+                    "edx"
+                });
+
+                // Move from idiv's result register to the intended destination.
+                func_body.push(AsmInstruction::Mov(
+                    AsmVal::Loc(result_loc),
+                    dest_var.to_asm()?,
+                ));
+            }
+
+            // Other binary operators are handled in a much more straightforward way. They take the left hand side of
+            // the operator in the destination register.
+            TacInstruction::BinaryOp(left_val, binary_op, right_val, dest_var) => {
+                // Normal binary operators take the left hand side in the destination register, so move it there first.
+                let dest_asm_loc = dest_var.to_asm()?;
+                func_body.push(AsmInstruction::Mov(
+                    left_val.to_asm()?,
+                    dest_asm_loc.clone(),
+                ));
+
+                // The operator takes the left and right sides as arguments, with left also implicitly being treated as
+                // the destination.
+                func_body.push(AsmInstruction::BinaryOp(
+                    binary_op.to_asm()?,
+                    right_val.to_asm()?,
+                    dest_asm_loc,
+                ));
+            }
         }
 
         Ok(())
@@ -537,6 +698,15 @@ impl FmtNode for TacInstruction {
                 unary_op.fmt(f)?;
                 write!(f, " ")?;
                 src.fmt_node(f, 0)?;
+            }
+            TacInstruction::BinaryOp(left_val, binary_op, right_val, dest_var) => {
+                dest_var.fmt_node(f, 0)?;
+                write!(f, " = ")?;
+                left_val.fmt_node(f, 0)?;
+                write!(f, " ")?;
+                binary_op.fmt(f)?;
+                write!(f, " ")?;
+                right_val.fmt_node(f, 0)?;
             }
         }
 
@@ -598,6 +768,31 @@ impl fmt::Display for TacUnaryOperator {
     }
 }
 
+impl TacBinaryOperator {
+    fn to_asm(&self) -> Result<AsmBinaryOperator, String> {
+        Ok(match self {
+            TacBinaryOperator::Add => AsmBinaryOperator::Add,
+            TacBinaryOperator::Subtract => AsmBinaryOperator::Subtract,
+            TacBinaryOperator::Multiply => AsmBinaryOperator::Imul,
+            TacBinaryOperator::Divide | TacBinaryOperator::Modulus => {
+                panic!("divide/modulus should have been handled elsewhere")
+            }
+        })
+    }
+}
+
+impl fmt::Display for TacBinaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            TacBinaryOperator::Add => "+",
+            TacBinaryOperator::Subtract => "-",
+            TacBinaryOperator::Multiply => "*",
+            TacBinaryOperator::Divide => "/",
+            TacBinaryOperator::Modulus => "%",
+        })
+    }
+}
+
 impl AsmProgram {
     fn finalize(&mut self) -> Result<(), String> {
         for func in self.functions.iter_mut() {
@@ -645,15 +840,20 @@ impl AsmFunction {
         for inst in self.body.iter_mut() {
             match inst {
                 AsmInstruction::Mov(src_val, dest_loc) => {
-                    if let AsmVal::Loc(src_loc) = src_val {
-                        src_loc.resolve_pseudoregister(&mut frame)?;
-                    }
-
+                    src_val.resolve_pseudoregister(&mut frame)?;
                     dest_loc.resolve_pseudoregister(&mut frame)?;
                 }
                 AsmInstruction::UnaryOp(_, dest_loc) => {
                     dest_loc.resolve_pseudoregister(&mut frame)?;
                 }
+                AsmInstruction::BinaryOp(_, src_val, dest_loc) => {
+                    src_val.resolve_pseudoregister(&mut frame)?;
+                    dest_loc.resolve_pseudoregister(&mut frame)?;
+                }
+                AsmInstruction::Idiv(denom_val) => {
+                    denom_val.resolve_pseudoregister(&mut frame)?;
+                }
+                AsmInstruction::Cdq => {}
                 AsmInstruction::AllocateStack(_) => {}
                 AsmInstruction::Ret(_) => {}
             }
@@ -678,21 +878,91 @@ impl AsmFunction {
         while i < self.body.len() {
             // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store it
             // in a temporary register.
-            if let AsmInstruction::Mov(
-                ref src_loc @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
-                ref mut dest_loc @ AsmLocation::RspOffset(_, _),
-            ) = &mut self.body[i]
-            {
-                let real_dest = dest_loc.clone();
-                *dest_loc = AsmLocation::Reg("r10d");
+            match &mut self.body[i] {
+                AsmInstruction::Mov(
+                    ref _src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+                    ref mut dest_loc @ AsmLocation::RspOffset(_, _),
+                ) => {
+                    let real_dest = dest_loc.clone();
+                    *dest_loc = AsmLocation::Reg("r10d");
 
-                self.body.insert(
-                    i + 1,
-                    AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r10d")), real_dest),
-                );
+                    self.body.insert(
+                        i + 1,
+                        AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r10d")), real_dest),
+                    );
 
-                // We don't need to examine the next instruction since we just inserted it and know it's correct.
-                i += 1;
+                    // We made a change, so rerun the loop on this index in case further fixups are needed.
+                    continue;
+                }
+
+                // Multiply doesn't allow a memory address as the destination. Fix it up so the destination is a
+                // temporary register and then written to the destination memory address.
+                AsmInstruction::BinaryOp(
+                    AsmBinaryOperator::Imul,
+                    _src_val,
+                    ref mut dest_loc @ AsmLocation::RspOffset(_, _),
+                ) => {
+                    let real_dest = dest_loc.clone();
+
+                    // Rewrite the multiply instruction itself to operate against a temporary register instead of a
+                    // memory address.
+                    *dest_loc = AsmLocation::Reg("r11d");
+
+                    // Insert a mov before the multiply, to put the destination value in the temporary register.
+                    self.body.insert(
+                        i,
+                        AsmInstruction::Mov(
+                            AsmVal::Loc(real_dest.clone()),
+                            AsmLocation::Reg("r11d"),
+                        ),
+                    );
+
+                    // Insert a mov instruction after the multiply, to put the destination value into the intended
+                    // memory address.
+                    self.body.insert(
+                        i + 2,
+                        AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r11d")), real_dest),
+                    );
+
+                    // We made a change, so rerun the loop on this index in case further fixups are needed.
+                    continue;
+                }
+
+                // For any binary operator that uses a stack offset for both right hand side and dest, x64 assembly
+                // requires that we first store the destination in a temporary register.
+                AsmInstruction::BinaryOp(
+                    _binary_op,
+                    ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+                    ref _dest_loc @ AsmLocation::RspOffset(_, _),
+                ) => {
+                    let real_src_val = src_val.clone();
+                    *src_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
+
+                    self.body.insert(
+                        i,
+                        AsmInstruction::Mov(real_src_val, AsmLocation::Reg("r10d")),
+                    );
+
+                    // We made a change, so rerun the loop on this index in case further fixups are needed.
+                    continue;
+                }
+
+                // idiv doesn't accept an immediate value as the operand, so fixup to put the immediate in a register
+                // first.
+                AsmInstruction::Idiv(ref mut denom_val @ AsmVal::Imm(_)) => {
+                    let real_denom_val = denom_val.clone();
+                    *denom_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
+
+                    // Insert a mov before this idiv to put its immediate value in a register.
+                    self.body.insert(
+                        i,
+                        AsmInstruction::Mov(real_denom_val, AsmLocation::Reg("r10d")),
+                    );
+
+                    // We made a change, so rerun the loop on this index in case further fixups are needed.
+                    continue;
+                }
+                _ => (),
             }
 
             i += 1;
@@ -724,15 +994,20 @@ impl AsmInstruction {
     fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
         match self {
             AsmInstruction::Mov(src_val, dest_loc) => {
-                if let AsmVal::Loc(src_loc) = src_val {
-                    src_loc.convert_to_rsp_offset(frame);
-                }
-
+                src_val.convert_to_rsp_offset(frame);
                 dest_loc.convert_to_rsp_offset(frame);
             }
             AsmInstruction::UnaryOp(_, dest_loc) => {
                 dest_loc.convert_to_rsp_offset(frame);
             }
+            AsmInstruction::BinaryOp(_, src_val, dest_loc) => {
+                src_val.convert_to_rsp_offset(frame);
+                dest_loc.convert_to_rsp_offset(frame);
+            }
+            AsmInstruction::Idiv(denom_val) => {
+                denom_val.convert_to_rsp_offset(frame);
+            }
+            AsmInstruction::Cdq => {}
             AsmInstruction::AllocateStack(_) => {}
             AsmInstruction::Ret(_) => {}
         }
@@ -768,6 +1043,43 @@ impl AsmInstruction {
                         unary_op.emit_code(f)?;
                         write!(f, " ")?;
                         dest_loc.fmt_asm_comment(f)
+                    },
+                )?;
+            }
+            AsmInstruction::BinaryOp(binary_op, src_val, dest_loc) => {
+                format_code_and_comment(
+                    f,
+                    |f| {
+                        binary_op.emit_code(f)?;
+                        write!(f, " ")?;
+                        dest_loc.emit_code(f)?;
+                        write!(f, ",")?;
+                        src_val.emit_code(f)
+                    },
+                    |f| {
+                        dest_loc.fmt_asm_comment(f)?;
+                        write!(f, " <- ")?;
+                        dest_loc.fmt_asm_comment(f)?;
+                        write!(f, " ")?;
+                        binary_op.fmt_node(f, 0)?;
+                        write!(f, " ")?;
+                        src_val.fmt_asm_comment(f)
+                    },
+                )?;
+            }
+            AsmInstruction::Cdq => {
+                writeln!(f, "    cdq")?;
+            }
+            AsmInstruction::Idiv(denom_val) => {
+                format_code_and_comment(
+                    f,
+                    |f| {
+                        write!(f, "idiv ")?;
+                        denom_val.emit_code(f)
+                    },
+                    |f| {
+                        write!(f, "edx:eax <- idiv ")?;
+                        denom_val.fmt_asm_comment(f)
                     },
                 )?;
             }
@@ -808,6 +1120,22 @@ impl FmtNode for AsmInstruction {
                 write!(f, " ")?;
                 dest_loc.fmt_node(f, 0)?;
             }
+            AsmInstruction::BinaryOp(binary_op, src_val, dest_loc) => {
+                dest_loc.fmt_node(f, 0)?;
+                write!(f, " ")?;
+                binary_op.fmt_node(f, 0)?;
+                write!(f, " ")?;
+                src_val.fmt_node(f, 0)?;
+                write!(f, " -> ")?;
+                dest_loc.fmt_node(f, 0)?;
+            }
+            AsmInstruction::Cdq => {
+                f.write_str("Cdq")?;
+            }
+            AsmInstruction::Idiv(denom_val) => {
+                write!(f, "Idiv ")?;
+                denom_val.fmt_node(f, 0)?;
+            }
             AsmInstruction::AllocateStack(size) => {
                 write!(f, "AllocateStack {}", size)?;
             }
@@ -821,6 +1149,20 @@ impl FmtNode for AsmInstruction {
 }
 
 impl AsmVal {
+    fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
+        if let AsmVal::Loc(loc) = self {
+            loc.convert_to_rsp_offset(frame);
+        }
+    }
+
+    fn resolve_pseudoregister(&mut self, frame: &mut FuncStackFrame) -> Result<(), String> {
+        if let AsmVal::Loc(loc) = self {
+            return loc.resolve_pseudoregister(frame);
+        }
+
+        Ok(())
+    }
+
     fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             AsmVal::Imm(num) => {
@@ -899,7 +1241,7 @@ impl AsmLocation {
             AsmLocation::Reg(name) => {
                 f.write_str(name)?;
             }
-            AsmLocation::RspOffset(rsp_offset, name) => {
+            AsmLocation::RspOffset(_rsp_offset, name) => {
                 f.write_str(name)?;
             }
             _ => panic!("{:?} should not be written into ASM", self),
@@ -948,6 +1290,26 @@ impl AsmUnaryOperator {
 impl FmtNode for AsmUnaryOperator {
     fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+impl AsmBinaryOperator {
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            AsmBinaryOperator::Add => "add",
+            AsmBinaryOperator::Subtract => "sub",
+            AsmBinaryOperator::Imul => "imul",
+        })
+    }
+}
+
+impl FmtNode for AsmBinaryOperator {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        f.write_str(match self {
+            AsmBinaryOperator::Add => "+",
+            AsmBinaryOperator::Subtract => "-",
+            AsmBinaryOperator::Imul => "*",
+        })
     }
 }
 
@@ -1017,6 +1379,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^\+").expect("failed to compile regex"),
             Regex::new(r"^/").expect("failed to compile regex"),
             Regex::new(r"^\*").expect("failed to compile regex"),
+            Regex::new(r"^%").expect("failed to compile regex"),
             Regex::new(r"^<").expect("failed to compile regex"),
             Regex::new(r"^>").expect("failed to compile regex"),
             Regex::new(r"^=").expect("failed to compile regex"),
@@ -1127,12 +1490,47 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
 }
 
 fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
-    parse_unary_expression(original_tokens)
+    fn parse_expression_with_precedence<'i, 't>(
+        original_tokens: &mut Tokens<'i, 't>,
+        min_precedence_allowed: u8,
+    ) -> Result<AstExpression, String> {
+        // Always try for at least one factor in an expression.
+        let mut left = parse_factor(original_tokens)?;
+
+        // The tokens we clone here might be committed, or we might not find a valid expression within.
+        let mut tokens = original_tokens.clone();
+
+        loop {
+            // Attempt to parse a binary operator expression.
+            if let Ok(operator) = tokens.consume_and_parse_next_token::<AstBinaryOperator>() {
+                // Only allow parsing a binary operator with same or higher precedence, or else it messes up the
+                // precedence ordering. This is called precedence climbing.
+                if operator.precedence() >= min_precedence_allowed {
+                    // If the right hand side is itself going to encounter a binary expression, it can only be a
+                    // strictly higher precedence, or else it shouldn't be part of the right-hand-side expression.
+                    let right =
+                        parse_expression_with_precedence(&mut tokens, operator.precedence() + 1)?;
+
+                    // This binary operation now becomes the left hand side of the expression.
+                    left = AstExpression::BinaryOperator(Box::new(left), operator, Box::new(right));
+
+                    // Since we successfully consumed an expression, commit the tokens we consumed for this.
+                    *original_tokens = tokens.clone();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(left)
+    }
+
+    parse_expression_with_precedence(original_tokens, 0)
 }
 
-fn parse_unary_expression<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<AstExpression, String> {
+fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
     let mut tokens = original_tokens.clone();
 
     let ret = if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
@@ -1142,10 +1540,10 @@ fn parse_unary_expression<'i, 't>(
         tokens.consume_expected_next_token(")")?;
         Ok(inner)
     } else if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
-        let inner = parse_unary_expression(&mut tokens)?;
+        let inner = parse_factor(&mut tokens)?;
         Ok(AstExpression::UnaryOperator(operator, Box::new(inner)))
     } else {
-        Err(String::from("unknown unary expression"))
+        Err(String::from("unknown factor"))
     };
 
     if ret.is_ok() {
@@ -1189,8 +1587,9 @@ fn get_register_name(register_name: &str, width: u32) -> String {
     }
 }
 
-fn validate_ast(ast_program: &AstProgram) -> Result<(), Vec<String>> {
-    let mut errors = vec![];
+// TODO: later we will need to do various validation on the AST, but not yet
+fn validate_ast(_ast_program: &AstProgram) -> Result<(), Vec<String>> {
+    let errors = vec![];
 
     if errors.len() == 0 {
         Ok(())
@@ -1199,6 +1598,7 @@ fn validate_ast(ast_program: &AstProgram) -> Result<(), Vec<String>> {
     }
 }
 
+// TODO: should have proper error handling in here
 fn assemble_and_link(
     code: &str,
     output_exe_path: &str,
@@ -1264,17 +1664,17 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
             functions.push(function);
         }
 
-        if tokens.0.len() == 0 {
-            Ok(AstProgram { functions })
-        } else {
-            Err(vec![format!(
-                "extra tokens after main function end: {:?}",
-                tokens
-            )])
-        }
-    }?;
+        AstProgram { functions }
+    };
 
     println!("AST:\n{}\n", display_with(|f| ast.fmt_node(f, 0)));
+
+    if tokens.0.len() != 0 {
+        return Err(vec![format!(
+            "extra tokens after main function end: {:?}",
+            tokens
+        )]);
+    }
 
     validate_ast(&ast)?;
 
@@ -1420,7 +1820,7 @@ struct LcArgs {
 }
 
 fn main() {
-    let mut args = LcArgs::parse();
+    let args = LcArgs::parse();
 
     if let Mode::All = args.mode {
         if args.output_path.is_none() {
@@ -1683,6 +2083,11 @@ mod test {
     }
 
     #[test]
+    fn test_parse_fail_missing_semicolon_binary_op() {
+        test_codegen_mainfunc_failure("return 5 + 6");
+    }
+
+    #[test]
     fn test_parse_fail_parens_around_operator() {
         test_codegen_mainfunc_failure("return (-)5;");
     }
@@ -1690,6 +2095,41 @@ mod test {
     #[test]
     fn test_parse_fail_operator_wrong_order() {
         test_codegen_mainfunc_failure("return 5-;");
+    }
+
+    #[test]
+    fn test_parse_fail_double_operator() {
+        test_codegen_mainfunc_failure("return 1 * / 2;");
+    }
+
+    #[test]
+    fn test_parse_fail_unbalanced_paren() {
+        test_codegen_mainfunc_failure("return 1 + (2;");
+    }
+
+    #[test]
+    fn test_parse_fail_missing_opening_paren() {
+        test_codegen_mainfunc_failure("return 1 + 2);");
+    }
+
+    #[test]
+    fn test_parse_fail_unexpected_paren() {
+        test_codegen_mainfunc_failure("return 1 (- 2);");
+    }
+
+    #[test]
+    fn test_parse_fail_misplaced_semicolon_paren() {
+        test_codegen_mainfunc_failure("return 1 + (2;)");
+    }
+
+    #[test]
+    fn test_parse_fail_missing_first_binary_operand() {
+        test_codegen_mainfunc_failure("return / 2;");
+    }
+
+    #[test]
+    fn test_parse_fail_missing_second_binary_operand() {
+        test_codegen_mainfunc_failure("return 2 / ;");
     }
 
     #[test]
@@ -1763,13 +2203,53 @@ mod test {
     }
 
     #[test]
-    fn test_codegen_operator_precedence() {
+    fn test_codegen_all_operator_precedence() {
         test_codegen_expression("-1 * -2 + 3 >= 5 == 1 && (6 - 6) || 7", 1);
     }
 
     #[test]
-    fn test_codegen_operator_precedence2() {
-        test_codegen_expression("1 * 2 + 3 * 4", 14);
+    fn test_codegen_arithmetic_operator_precedence() {
+        test_codegen_expression("1 * 2 + 3 * -4", -10);
+    }
+
+    #[test]
+    fn test_codegen_arithmetic_operator_associativity_minus() {
+        test_codegen_expression("5 - 2 - 1", 2);
+    }
+
+    #[test]
+    fn test_codegen_arithmetic_operator_associativity_div() {
+        test_codegen_expression("12 / 3 / 2", 2);
+    }
+
+    #[test]
+    fn test_codegen_arithmetic_operator_associativity_grouping() {
+        test_codegen_expression("(3 / 2 * 4) + (5 - 4 + 3)", 8);
+    }
+
+    #[test]
+    fn test_codegen_arithmetic_operator_associativity_grouping_2() {
+        test_codegen_expression("5 * 4 / 2 - 3 % (2 + 1)", 10);
+    }
+
+    #[test]
+    fn test_codegen_sub_neg() {
+        test_codegen_expression("2- -1", 3);
+    }
+
+    #[test]
+    fn test_codegen_unop_add() {
+        test_codegen_expression("~2 + 3", 0);
+    }
+
+    #[test]
+    fn test_codegen_unop_parens() {
+        test_codegen_expression("~(1 + 2)", -4);
+    }
+
+    #[test]
+    fn test_codegen_modulus() {
+        test_codegen_expression("10 % 3", 1);
     }
 
     #[test]
