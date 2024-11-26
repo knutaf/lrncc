@@ -258,6 +258,8 @@ enum AstBinaryOperator {
     BitwiseAnd,
     BitwiseOr,
     BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 #[derive(Debug)]
@@ -304,6 +306,8 @@ enum TacBinaryOperator {
     BitwiseAnd,
     BitwiseOr,
     BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 #[derive(Debug)]
@@ -357,6 +361,8 @@ enum AsmBinaryOperator {
     And,
     Or,
     Xor,
+    Shl,
+    Sar,
 }
 
 struct TacGenState {
@@ -477,11 +483,13 @@ impl AstBinaryOperator {
             AstBinaryOperator::BitwiseOr => 0,
             AstBinaryOperator::BitwiseXor => 1,
             AstBinaryOperator::BitwiseAnd => 2,
-            AstBinaryOperator::Add => 3,
-            AstBinaryOperator::Subtract => 3,
-            AstBinaryOperator::Multiply => 4,
-            AstBinaryOperator::Divide => 4,
-            AstBinaryOperator::Modulus => 4,
+            AstBinaryOperator::ShiftLeft => 3,
+            AstBinaryOperator::ShiftRight => 3,
+            AstBinaryOperator::Add => 4,
+            AstBinaryOperator::Subtract => 4,
+            AstBinaryOperator::Multiply => 5,
+            AstBinaryOperator::Divide => 5,
+            AstBinaryOperator::Modulus => 5,
         }
     }
 
@@ -495,6 +503,8 @@ impl AstBinaryOperator {
             AstBinaryOperator::BitwiseAnd => TacBinaryOperator::BitwiseAnd,
             AstBinaryOperator::BitwiseOr => TacBinaryOperator::BitwiseOr,
             AstBinaryOperator::BitwiseXor => TacBinaryOperator::BitwiseXor,
+            AstBinaryOperator::ShiftLeft => TacBinaryOperator::ShiftLeft,
+            AstBinaryOperator::ShiftRight => TacBinaryOperator::ShiftRight,
         }
     }
 }
@@ -510,6 +520,8 @@ impl FmtNode for AstBinaryOperator {
             AstBinaryOperator::BitwiseAnd => "&",
             AstBinaryOperator::BitwiseOr => "|",
             AstBinaryOperator::BitwiseXor => "^",
+            AstBinaryOperator::ShiftLeft => "<<",
+            AstBinaryOperator::ShiftRight => ">>",
         })
     }
 }
@@ -526,6 +538,8 @@ impl std::str::FromStr for AstBinaryOperator {
             "&" => Ok(AstBinaryOperator::BitwiseAnd),
             "|" => Ok(AstBinaryOperator::BitwiseOr),
             "^" => Ok(AstBinaryOperator::BitwiseXor),
+            "<<" => Ok(AstBinaryOperator::ShiftLeft),
+            ">>" => Ok(AstBinaryOperator::ShiftRight),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -798,6 +812,8 @@ impl TacBinaryOperator {
             TacBinaryOperator::BitwiseAnd => AsmBinaryOperator::And,
             TacBinaryOperator::BitwiseOr => AsmBinaryOperator::Or,
             TacBinaryOperator::BitwiseXor => AsmBinaryOperator::Xor,
+            TacBinaryOperator::ShiftLeft => AsmBinaryOperator::Shl,
+            TacBinaryOperator::ShiftRight => AsmBinaryOperator::Sar,
             TacBinaryOperator::Divide | TacBinaryOperator::Modulus => {
                 panic!("divide/modulus should have been handled elsewhere")
             }
@@ -816,6 +832,8 @@ impl fmt::Display for TacBinaryOperator {
             TacBinaryOperator::BitwiseAnd => "&",
             TacBinaryOperator::BitwiseOr => "|",
             TacBinaryOperator::BitwiseXor => "^",
+            TacBinaryOperator::ShiftLeft => "<<",
+            TacBinaryOperator::ShiftRight => ">>",
         })
     }
 }
@@ -901,11 +919,39 @@ impl AsmFunction {
             inst.convert_to_rsp_offset(&frame);
         }
 
-        let mut i = 0;
+        let mut i;
+
+        i = 0;
         while i < self.body.len() {
-            // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store it
-            // in a temporary register.
+            // Shift left and shift right only allow immedate or CL (that's 8-bit ecx) register as the right hand
+            // side. If the rhs isn't in there already, move it first.
+            if let AsmInstruction::BinaryOp(
+                AsmBinaryOperator::Shl | AsmBinaryOperator::Sar,
+                ref mut src_val,
+                _dest_loc,
+            ) = &mut self.body[i]
+            {
+                if src_val.get_base_reg_name() != Some("cx") {
+                    let real_src_val = src_val.clone();
+                    *src_val = AsmVal::Loc(AsmLocation::Reg("cl"));
+
+                    self.body.insert(
+                        i,
+                        AsmInstruction::Mov(real_src_val, AsmLocation::Reg("ecx")),
+                    );
+
+                    continue;
+                }
+            }
+
+            i += 1;
+        }
+
+        i = 0;
+        while i < self.body.len() {
             match &mut self.body[i] {
+                // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store
+                // it in a temporary register.
                 AsmInstruction::Mov(
                     ref _src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
                     ref mut dest_loc @ AsmLocation::RspOffset(_, _),
@@ -1176,6 +1222,13 @@ impl FmtNode for AsmInstruction {
 }
 
 impl AsmVal {
+    fn get_base_reg_name(&self) -> Option<&'static str> {
+        match self {
+            AsmVal::Loc(loc) => loc.get_base_reg_name(),
+            _ => None,
+        }
+    }
+
     fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
         if let AsmVal::Loc(loc) = self {
             loc.convert_to_rsp_offset(frame);
@@ -1233,6 +1286,16 @@ impl FmtNode for AsmVal {
 }
 
 impl AsmLocation {
+    fn get_base_reg_name(&self) -> Option<&'static str> {
+        match self {
+            AsmLocation::Reg(name) => Some(match *name {
+                "rcx" | "ecx" | "cx" | "cl" => "cx",
+                _ => "not ecx", // TODO: fill in
+            }),
+            _ => None,
+        }
+    }
+
     fn resolve_pseudoregister(&mut self, frame: &mut FuncStackFrame) -> Result<(), String> {
         if let AsmLocation::PseudoReg(psr) = self {
             *self = frame.create_or_get_location(&psr)?;
@@ -1329,6 +1392,8 @@ impl AsmBinaryOperator {
             AsmBinaryOperator::And => "and",
             AsmBinaryOperator::Or => "or",
             AsmBinaryOperator::Xor => "xor",
+            AsmBinaryOperator::Shl => "shl",
+            AsmBinaryOperator::Sar => "sar",
         })
     }
 }
@@ -1342,6 +1407,8 @@ impl FmtNode for AsmBinaryOperator {
             AsmBinaryOperator::And => "&",
             AsmBinaryOperator::Or => "|",
             AsmBinaryOperator::Xor => "^",
+            AsmBinaryOperator::Shl => "<<",
+            AsmBinaryOperator::Sar => ">>",
         })
     }
 }
@@ -1401,6 +1468,8 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^>=").expect("failed to compile regex"),
             Regex::new(r"^--").expect("failed to compile regex"),
             Regex::new(r"^\+\+").expect("failed to compile regex"),
+            Regex::new(r"^<<").expect("failed to compile regex"),
+            Regex::new(r"^>>").expect("failed to compile regex"),
             Regex::new(r"^\{").expect("failed to compile regex"),
             Regex::new(r"^\}").expect("failed to compile regex"),
             Regex::new(r"^\(").expect("failed to compile regex"),
@@ -2169,6 +2238,11 @@ mod test {
     }
 
     #[test]
+    fn test_parse_fail_double_bitwise_or() {
+        test_codegen_mainfunc_failure("return 1 | | 2;");
+    }
+
+    #[test]
     fn test_codegen_expression_binary_operation() {
         test_codegen_expression("5 + 6", 11);
     }
@@ -2301,6 +2375,51 @@ mod test {
     #[test]
     fn test_codegen_and_xor_associativity() {
         test_codegen_expression("7 ^ 3 & 6 ^ 2", 7);
+    }
+
+    #[test]
+    fn test_codegen_shl_immediate() {
+        test_codegen_expression("5 << 2", 20);
+    }
+
+    #[test]
+    fn test_codegen_shl_tempvar() {
+        test_codegen_expression("5 << (2 * 1)", 20);
+    }
+
+    #[test]
+    fn test_codegen_sar_immediate() {
+        test_codegen_expression("20 >> 2", 5);
+    }
+
+    #[test]
+    fn test_codegen_sar_tempvar() {
+        test_codegen_expression("20 >> (2 * 1)", 5);
+    }
+
+    #[test]
+    fn test_codegen_shift_associativity() {
+        test_codegen_expression("33 << 4 >> 2", 132);
+    }
+
+    #[test]
+    fn test_codegen_shift_associativity_2() {
+        test_codegen_expression("33 >> 2 << 1", 16);
+    }
+
+    #[test]
+    fn test_codegen_shift_precedence() {
+        test_codegen_expression("40 << 4 + 12 >> 1", 0x00140000);
+    }
+
+    #[test]
+    fn test_codegen_sar_negative() {
+        test_codegen_expression("-5 >> 1", -3);
+    }
+
+    #[test]
+    fn test_codegen_bitwise_precedence() {
+        test_codegen_expression("80 >> 2 | 1 ^ 5 & 7 << 1", 21);
     }
 
     #[test]
