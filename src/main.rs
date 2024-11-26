@@ -1288,10 +1288,22 @@ impl FmtNode for AsmVal {
 impl AsmLocation {
     fn get_base_reg_name(&self) -> Option<&'static str> {
         match self {
-            AsmLocation::Reg(name) => Some(match *name {
-                "rcx" | "ecx" | "cx" | "cl" => "cx",
-                _ => "not ecx", // TODO: fill in
-            }),
+            AsmLocation::Reg("rax" | "eax" | "ax" | "al") => Some("ax"),
+            AsmLocation::Reg("rbx" | "ebx" | "bx" | "bl") => Some("bx"),
+            AsmLocation::Reg("rcx" | "ecx" | "cx" | "cl") => Some("cx"),
+            AsmLocation::Reg("rdx" | "edx" | "dx" | "dl") => Some("dx"),
+            AsmLocation::Reg("rsi" | "esi" | "si" | "sil") => Some("si"),
+            AsmLocation::Reg("rdi" | "edi" | "di" | "dil") => Some("di"),
+            AsmLocation::Reg("rbp" | "ebp" | "bp" | "bpl") => Some("bp"),
+            AsmLocation::Reg("rsp" | "esp" | "sp" | "spl") => Some("sp"),
+            AsmLocation::Reg("r8" | "r8d" | "r8w" | "r8b" | "r8l") => Some("r8"),
+            AsmLocation::Reg("r9" | "r9d" | "r9w" | "r9b" | "r9l") => Some("r9"),
+            AsmLocation::Reg("r10" | "r10d" | "r10w" | "r10b" | "r10l") => Some("r10"),
+            AsmLocation::Reg("r11" | "r11d" | "r11w" | "r11b" | "r11l") => Some("r11"),
+            AsmLocation::Reg("r12" | "r12d" | "r12w" | "r12b" | "r12l") => Some("r12"),
+            AsmLocation::Reg("r13" | "r13d" | "r13w" | "r13b" | "r13l") => Some("r13"),
+            AsmLocation::Reg("r14" | "r14d" | "r14w" | "r14b" | "r14l") => Some("r14"),
+            AsmLocation::Reg("r15" | "r15d" | "r15w" | "r15b" | "r15l") => Some("r15"),
             _ => None,
         }
     }
