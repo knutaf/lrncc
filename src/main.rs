@@ -921,10 +921,10 @@ impl AsmFunction {
 
         let mut i;
 
+        // Shift left and shift right only allow immedate or CL (that's 8-bit ecx) register as the right hand side. If
+        // the rhs isn't in there already, move it first.
         i = 0;
         while i < self.body.len() {
-            // Shift left and shift right only allow immedate or CL (that's 8-bit ecx) register as the right hand
-            // side. If the rhs isn't in there already, move it first.
             if let AsmInstruction::BinaryOp(
                 AsmBinaryOperator::Shl | AsmBinaryOperator::Sar,
                 ref mut src_val,
@@ -940,6 +940,7 @@ impl AsmFunction {
                         AsmInstruction::Mov(real_src_val, AsmLocation::Reg("ecx")),
                     );
 
+                    // We made a change, so rerun the loop on this index in case further fixups are needed.
                     continue;
                 }
             }
@@ -947,95 +948,106 @@ impl AsmFunction {
             i += 1;
         }
 
+        // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store it in a
+        // temporary register.
         i = 0;
         while i < self.body.len() {
-            match &mut self.body[i] {
-                // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store
-                // it in a temporary register.
-                AsmInstruction::Mov(
-                    ref _src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
-                    ref mut dest_loc @ AsmLocation::RspOffset(_, _),
-                ) => {
-                    let real_dest = dest_loc.clone();
-                    *dest_loc = AsmLocation::Reg("r10d");
+            if let AsmInstruction::Mov(
+                ref _src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+                ref mut dest_loc @ AsmLocation::RspOffset(_, _),
+            ) = &mut self.body[i]
+            {
+                let real_dest = dest_loc.clone();
+                *dest_loc = AsmLocation::Reg("r10d");
 
-                    self.body.insert(
-                        i + 1,
-                        AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r10d")), real_dest),
-                    );
+                self.body.insert(
+                    i + 1,
+                    AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r10d")), real_dest),
+                );
 
-                    // We made a change, so rerun the loop on this index in case further fixups are needed.
-                    continue;
-                }
+                // We made a change, so rerun the loop on this index in case further fixups are needed.
+                continue;
+            }
 
-                // Multiply doesn't allow a memory address as the destination. Fix it up so the destination is a
-                // temporary register and then written to the destination memory address.
-                AsmInstruction::BinaryOp(
-                    AsmBinaryOperator::Imul,
-                    _src_val,
-                    ref mut dest_loc @ AsmLocation::RspOffset(_, _),
-                ) => {
-                    let real_dest = dest_loc.clone();
+            i += 1;
+        }
 
-                    // Rewrite the multiply instruction itself to operate against a temporary register instead of a
-                    // memory address.
-                    *dest_loc = AsmLocation::Reg("r11d");
+        // Multiply doesn't allow a memory address as the destination. Fix it up so the destination is a temporary
+        // register and then written to the destination memory address.
+        i = 0;
+        while i < self.body.len() {
+            if let AsmInstruction::BinaryOp(
+                AsmBinaryOperator::Imul,
+                _src_val,
+                ref mut dest_loc @ AsmLocation::RspOffset(_, _),
+            ) = &mut self.body[i]
+            {
+                let real_dest = dest_loc.clone();
 
-                    // Insert a mov before the multiply, to put the destination value in the temporary register.
-                    self.body.insert(
-                        i,
-                        AsmInstruction::Mov(
-                            AsmVal::Loc(real_dest.clone()),
-                            AsmLocation::Reg("r11d"),
-                        ),
-                    );
+                // Rewrite the multiply instruction itself to operate against a temporary register instead of a
+                // memory address.
+                *dest_loc = AsmLocation::Reg("r11d");
 
-                    // Insert a mov instruction after the multiply, to put the destination value into the intended
-                    // memory address.
-                    self.body.insert(
-                        i + 2,
-                        AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r11d")), real_dest),
-                    );
+                // Insert a mov before the multiply, to put the destination value in the temporary register.
+                self.body.insert(
+                    i,
+                    AsmInstruction::Mov(AsmVal::Loc(real_dest.clone()), AsmLocation::Reg("r11d")),
+                );
 
-                    // We made a change, so rerun the loop on this index in case further fixups are needed.
-                    continue;
-                }
+                // Insert a mov instruction after the multiply, to put the destination value into the intended
+                // memory address.
+                self.body.insert(
+                    i + 2,
+                    AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r11d")), real_dest),
+                );
 
-                // For any binary operator that uses a stack offset for both right hand side and dest, x64 assembly
-                // requires that we first store the destination in a temporary register.
-                AsmInstruction::BinaryOp(
-                    _binary_op,
-                    ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
-                    ref _dest_loc @ AsmLocation::RspOffset(_, _),
-                ) => {
-                    let real_src_val = src_val.clone();
-                    *src_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
+                // We made a change, so rerun the loop on this index in case further fixups are needed.
+                continue;
+            }
 
-                    self.body.insert(
-                        i,
-                        AsmInstruction::Mov(real_src_val, AsmLocation::Reg("r10d")),
-                    );
+            i += 1;
+        }
 
-                    // We made a change, so rerun the loop on this index in case further fixups are needed.
-                    continue;
-                }
+        // For any binary operator that uses a stack offset for both right hand side and dest, x64 assembly requires
+        // that we first store the destination in a temporary register.
+        i = 0;
+        while i < self.body.len() {
+            if let AsmInstruction::BinaryOp(
+                _binary_op,
+                ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+                ref _dest_loc @ AsmLocation::RspOffset(_, _),
+            ) = &mut self.body[i]
+            {
+                let real_src_val = src_val.clone();
+                *src_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
 
-                // idiv doesn't accept an immediate value as the operand, so fixup to put the immediate in a register
-                // first.
-                AsmInstruction::Idiv(ref mut denom_val @ AsmVal::Imm(_)) => {
-                    let real_denom_val = denom_val.clone();
-                    *denom_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
+                self.body.insert(
+                    i,
+                    AsmInstruction::Mov(real_src_val, AsmLocation::Reg("r10d")),
+                );
 
-                    // Insert a mov before this idiv to put its immediate value in a register.
-                    self.body.insert(
-                        i,
-                        AsmInstruction::Mov(real_denom_val, AsmLocation::Reg("r10d")),
-                    );
+                // We made a change, so rerun the loop on this index in case further fixups are needed.
+                continue;
+            }
 
-                    // We made a change, so rerun the loop on this index in case further fixups are needed.
-                    continue;
-                }
-                _ => (),
+            i += 1;
+        }
+
+        // idiv doesn't accept an immediate value as the operand, so fixup to put the immediate in a register first.
+        i = 0;
+        while i < self.body.len() {
+            if let AsmInstruction::Idiv(ref mut denom_val @ AsmVal::Imm(_)) = &mut self.body[i] {
+                let real_denom_val = denom_val.clone();
+                *denom_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
+
+                // Insert a mov before this idiv to put its immediate value in a register.
+                self.body.insert(
+                    i,
+                    AsmInstruction::Mov(real_denom_val, AsmLocation::Reg("r10d")),
+                );
+
+                // We made a change, so rerun the loop on this index in case further fixups are needed.
+                continue;
             }
 
             i += 1;
