@@ -246,6 +246,7 @@ enum AstExpression {
 enum AstUnaryOperator {
     Negation,
     BitwiseNot,
+    Not,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -260,6 +261,14 @@ enum AstBinaryOperator {
     BitwiseXor,
     ShiftLeft,
     ShiftRight,
+    And,
+    Or,
+    Equal,
+    NotEqual,
+    LessThan,
+    LessOrEqual,
+    GreaterThan,
+    GreaterOrEqual,
 }
 
 #[derive(Debug)]
@@ -274,17 +283,25 @@ struct TacFunction {
     body: Vec<TacInstruction>,
 }
 
+#[derive(Debug, Clone)]
+struct TacIdentifier(String);
+
 #[derive(Debug)]
 enum TacInstruction {
     Return(TacVal),
     UnaryOp(TacUnaryOperator, TacVal, TacVar),
     BinaryOp(TacVal, TacBinaryOperator, TacVal, TacVar),
+    CopyVal(TacVal, TacVar),
+    Jump(TacIdentifier),
+    JumpIfZero(TacVal, TacIdentifier),
+    JumpIfNotZero(TacVal, TacIdentifier),
+    Label(TacIdentifier),
 }
 
 #[derive(Debug, Clone)]
 struct TacVar(String);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TacVal {
     Constant(u32),
     Var(TacVar),
@@ -294,6 +311,7 @@ enum TacVal {
 enum TacUnaryOperator {
     Negation,
     BitwiseNot,
+    Not,
 }
 
 #[derive(Debug)]
@@ -308,6 +326,12 @@ enum TacBinaryOperator {
     BitwiseXor,
     ShiftLeft,
     ShiftRight,
+    Equal,
+    NotEqual,
+    LessThan,
+    LessOrEqual,
+    GreaterThan,
+    GreaterOrEqual,
 }
 
 #[derive(Debug)]
@@ -323,6 +347,9 @@ struct AsmFunction {
 }
 
 #[derive(Debug, Clone)]
+struct AsmLabel(String);
+
+#[derive(Debug, Clone)]
 enum AsmInstruction {
     Mov(AsmVal, AsmLocation),
     UnaryOp(AsmUnaryOperator, AsmLocation),
@@ -331,6 +358,11 @@ enum AsmInstruction {
     Cdq,
     AllocateStack(u32),
     Ret(u32),
+    Cmp(AsmVal, AsmVal),
+    SetCc(AsmCondCode, AsmLocation),
+    Jmp(AsmLabel),
+    JmpCc(AsmCondCode, AsmLabel),
+    Label(AsmLabel),
 }
 
 #[derive(Debug, Clone)]
@@ -365,8 +397,19 @@ enum AsmBinaryOperator {
     Sar,
 }
 
+#[derive(Debug, Clone)]
+enum AsmCondCode {
+    E,
+    NE,
+    L,
+    LE,
+    G,
+    GE,
+}
+
 struct TacGenState {
     next_temporary_id: u32,
+    next_label_id: u32,
 }
 
 struct FuncStackFrame {
@@ -451,6 +494,7 @@ impl AstUnaryOperator {
         match self {
             AstUnaryOperator::Negation => TacUnaryOperator::Negation,
             AstUnaryOperator::BitwiseNot => TacUnaryOperator::BitwiseNot,
+            AstUnaryOperator::Not => TacUnaryOperator::Not,
         }
     }
 }
@@ -460,6 +504,7 @@ impl FmtNode for AstUnaryOperator {
         f.write_str(match self {
             AstUnaryOperator::Negation => "-",
             AstUnaryOperator::BitwiseNot => "~",
+            AstUnaryOperator::Not => "!",
         })
     }
 }
@@ -470,6 +515,7 @@ impl std::str::FromStr for AstUnaryOperator {
         match s {
             "-" => Ok(AstUnaryOperator::Negation),
             "~" => Ok(AstUnaryOperator::BitwiseNot),
+            "!" => Ok(AstUnaryOperator::Not),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -480,16 +526,24 @@ impl AstBinaryOperator {
     // 50.
     fn precedence(&self) -> u8 {
         match self {
-            AstBinaryOperator::BitwiseOr => 0,
-            AstBinaryOperator::BitwiseXor => 1,
-            AstBinaryOperator::BitwiseAnd => 2,
-            AstBinaryOperator::ShiftLeft => 3,
-            AstBinaryOperator::ShiftRight => 3,
-            AstBinaryOperator::Add => 4,
-            AstBinaryOperator::Subtract => 4,
-            AstBinaryOperator::Multiply => 5,
-            AstBinaryOperator::Divide => 5,
-            AstBinaryOperator::Modulus => 5,
+            AstBinaryOperator::Or => 0,
+            AstBinaryOperator::And => 1,
+            AstBinaryOperator::BitwiseOr => 2,
+            AstBinaryOperator::BitwiseXor => 3,
+            AstBinaryOperator::BitwiseAnd => 4,
+            AstBinaryOperator::Equal => 5,
+            AstBinaryOperator::NotEqual => 5,
+            AstBinaryOperator::LessThan => 6,
+            AstBinaryOperator::LessOrEqual => 6,
+            AstBinaryOperator::GreaterThan => 6,
+            AstBinaryOperator::GreaterOrEqual => 6,
+            AstBinaryOperator::ShiftLeft => 7,
+            AstBinaryOperator::ShiftRight => 7,
+            AstBinaryOperator::Add => 8,
+            AstBinaryOperator::Subtract => 8,
+            AstBinaryOperator::Multiply => 9,
+            AstBinaryOperator::Divide => 9,
+            AstBinaryOperator::Modulus => 9,
         }
     }
 
@@ -505,6 +559,15 @@ impl AstBinaryOperator {
             AstBinaryOperator::BitwiseXor => TacBinaryOperator::BitwiseXor,
             AstBinaryOperator::ShiftLeft => TacBinaryOperator::ShiftLeft,
             AstBinaryOperator::ShiftRight => TacBinaryOperator::ShiftRight,
+            AstBinaryOperator::And | AstBinaryOperator::Or => {
+                panic!("should have been handled elsewhere")
+            }
+            AstBinaryOperator::Equal => TacBinaryOperator::Equal,
+            AstBinaryOperator::NotEqual => TacBinaryOperator::NotEqual,
+            AstBinaryOperator::LessThan => TacBinaryOperator::LessThan,
+            AstBinaryOperator::LessOrEqual => TacBinaryOperator::LessOrEqual,
+            AstBinaryOperator::GreaterThan => TacBinaryOperator::GreaterThan,
+            AstBinaryOperator::GreaterOrEqual => TacBinaryOperator::GreaterOrEqual,
         }
     }
 }
@@ -522,6 +585,14 @@ impl FmtNode for AstBinaryOperator {
             AstBinaryOperator::BitwiseXor => "^",
             AstBinaryOperator::ShiftLeft => "<<",
             AstBinaryOperator::ShiftRight => ">>",
+            AstBinaryOperator::And => "&&",
+            AstBinaryOperator::Or => "||",
+            AstBinaryOperator::Equal => "==",
+            AstBinaryOperator::NotEqual => "!=",
+            AstBinaryOperator::LessThan => "<",
+            AstBinaryOperator::LessOrEqual => "<=",
+            AstBinaryOperator::GreaterThan => ">",
+            AstBinaryOperator::GreaterOrEqual => ">=",
         })
     }
 }
@@ -540,6 +611,14 @@ impl std::str::FromStr for AstBinaryOperator {
             "^" => Ok(AstBinaryOperator::BitwiseXor),
             "<<" => Ok(AstBinaryOperator::ShiftLeft),
             ">>" => Ok(AstBinaryOperator::ShiftRight),
+            "&&" => Ok(AstBinaryOperator::And),
+            "||" => Ok(AstBinaryOperator::Or),
+            "==" => Ok(AstBinaryOperator::Equal),
+            "!=" => Ok(AstBinaryOperator::NotEqual),
+            "<" => Ok(AstBinaryOperator::LessThan),
+            "<=" => Ok(AstBinaryOperator::LessOrEqual),
+            ">" => Ok(AstBinaryOperator::GreaterThan),
+            ">=" => Ok(AstBinaryOperator::GreaterOrEqual),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -561,6 +640,75 @@ impl AstExpression {
                     tac_exp_inner_var,
                     tempvar.clone(),
                 ));
+                TacVal::Var(tempvar)
+            }
+            // Logical AND and OR are short-circuit and can't be treated as regular binary operators.
+            AstExpression::BinaryOperator(
+                ast_exp_left,
+                binary_op @ (AstBinaryOperator::And | AstBinaryOperator::Or),
+                ast_exp_right,
+            ) => {
+                let is_and = if let AstBinaryOperator::And = binary_op {
+                    true
+                } else {
+                    false
+                };
+
+                let tempvar = tacgen_state.allocate_temporary();
+
+                let shortcircuit_label = tacgen_state.allocate_label(if is_and {
+                    "and_shortcircuit"
+                } else {
+                    "or_shortcircuit"
+                });
+
+                let end_label =
+                    tacgen_state.allocate_label(if is_and { "and_end" } else { "or_end" });
+
+                // First emit code to calculate the left hand side.
+                let tac_exp_left_var = ast_exp_left.to_tac(tacgen_state, instructions)?;
+
+                // Test if the left hand side would already give a conclusive answer for the operator, i.e. 0 for AND
+                // or 1 for OR. Then we can jump to the short circuit handling.
+                instructions.push((if is_and {
+                    TacInstruction::JumpIfZero
+                } else {
+                    TacInstruction::JumpIfNotZero
+                })(
+                    tac_exp_left_var, shortcircuit_label.clone()
+                ));
+
+                // If we made it this far, the right hand side has to be executed.
+                let tac_exp_right_var = ast_exp_right.to_tac(tacgen_state, instructions)?;
+
+                // Test if the right hand side is conclusive, and if so, also jump to the same short circuit handler.
+                instructions.push((if is_and {
+                    TacInstruction::JumpIfZero
+                } else {
+                    TacInstruction::JumpIfNotZero
+                })(
+                    tac_exp_right_var, shortcircuit_label.clone()
+                ));
+
+                // If we made it this far, then the result must be 1 for AND or 0 for OR. Copy it to the result and jump
+                // over the short circuit handling code, to the end.
+                instructions.push(TacInstruction::CopyVal(
+                    TacVal::Constant(if is_and { 1 } else { 0 }),
+                    tempvar.clone(),
+                ));
+
+                instructions.push(TacInstruction::Jump(end_label.clone()));
+
+                // And here is the short circuit handling code, to set the result to the value that would cause a short
+                // circuit for the operator: 0 for AND, or 1 for OR. And then fall through to the end.
+                instructions.push(TacInstruction::Label(shortcircuit_label));
+                instructions.push(TacInstruction::CopyVal(
+                    TacVal::Constant(if is_and { 0 } else { 1 }),
+                    tempvar.clone(),
+                ));
+
+                instructions.push(TacInstruction::Label(end_label));
+
                 TacVal::Var(tempvar)
             }
             AstExpression::BinaryOperator(ast_exp_left, ast_binary_op, ast_exp_right) => {
@@ -640,12 +788,31 @@ impl FmtNode for TacFunction {
     }
 }
 
+impl TacIdentifier {
+    fn to_asm(&self) -> Result<AsmLabel, String> {
+        Ok(AsmLabel::new(&self.0))
+    }
+}
+
 impl TacInstruction {
     fn to_asm(&self, func_body: &mut Vec<AsmInstruction>) -> Result<(), String> {
         match self {
             TacInstruction::Return(val) => {
                 func_body.push(AsmInstruction::Mov(val.to_asm()?, AsmLocation::Reg("eax")));
                 func_body.push(AsmInstruction::Ret(0));
+            }
+
+            // !a is the same as (a == 0), so do a comparison to zero and set if equal.
+            TacInstruction::UnaryOp(TacUnaryOperator::Not, src_val, dest_var) => {
+                // Compare the value to zero.
+                func_body.push(AsmInstruction::Cmp(AsmVal::Imm(0), src_val.to_asm()?));
+
+                // Clear the destination before the SetCc.
+                let dest_asm_loc = dest_var.to_asm()?;
+                func_body.push(AsmInstruction::Mov(AsmVal::Imm(0), dest_asm_loc.clone()));
+
+                // Set if equal to zero.
+                func_body.push(AsmInstruction::SetCc(AsmCondCode::E, dest_asm_loc));
             }
             TacInstruction::UnaryOp(unary_op, src_val, dest_var) => {
                 let dest_asm_loc = dest_var.to_asm()?;
@@ -694,6 +861,31 @@ impl TacInstruction {
                 ));
             }
 
+            // Relational operators are converted to a SetCc with a different condition code each.
+            TacInstruction::BinaryOp(
+                left_val,
+                comparison_op @ (TacBinaryOperator::Equal
+                | TacBinaryOperator::NotEqual
+                | TacBinaryOperator::LessThan
+                | TacBinaryOperator::LessOrEqual
+                | TacBinaryOperator::GreaterThan
+                | TacBinaryOperator::GreaterOrEqual),
+                right_val,
+                dest_var,
+            ) => {
+                func_body.push(AsmInstruction::Cmp(right_val.to_asm()?, left_val.to_asm()?));
+
+                let dest_asm_loc = dest_var.to_asm()?;
+
+                // Zero out the destination because the SetCc instruction only writes the low 1 byte.
+                func_body.push(AsmInstruction::Mov(AsmVal::Imm(0), dest_asm_loc.clone()));
+
+                func_body.push(AsmInstruction::SetCc(
+                    comparison_op.get_condition_code(),
+                    dest_asm_loc,
+                ));
+            }
+
             // Other binary operators are handled in a much more straightforward way. They take the left hand side of
             // the operator in the destination register.
             TacInstruction::BinaryOp(left_val, binary_op, right_val, dest_var) => {
@@ -711,6 +903,30 @@ impl TacInstruction {
                     right_val.to_asm()?,
                     dest_asm_loc,
                 ));
+            }
+            TacInstruction::CopyVal(src_val, dest_loc) => {
+                func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_loc.to_asm()?));
+            }
+            TacInstruction::Jump(ident) => {
+                func_body.push(AsmInstruction::Jmp(ident.to_asm()?));
+            }
+            jump_type @ (TacInstruction::JumpIfZero(val, ident)
+            | TacInstruction::JumpIfNotZero(val, ident)) => {
+                // First compare to zero.
+                func_body.push(AsmInstruction::Cmp(AsmVal::Imm(0), val.to_asm()?));
+
+                // Then jump if they were equal or not equal, depending on the jump type.
+                func_body.push(AsmInstruction::JmpCc(
+                    if let TacInstruction::JumpIfZero(_, _) = jump_type {
+                        AsmCondCode::E
+                    } else {
+                        AsmCondCode::NE
+                    },
+                    ident.to_asm()?,
+                ));
+            }
+            TacInstruction::Label(ident) => {
+                func_body.push(AsmInstruction::Label(ident.to_asm()?));
             }
         }
 
@@ -742,6 +958,28 @@ impl FmtNode for TacInstruction {
                 binary_op.fmt(f)?;
                 write!(f, " ")?;
                 right_val.fmt_node(f, 0)?;
+            }
+            TacInstruction::CopyVal(src_val, dest_loc) => {
+                dest_loc.fmt_node(f, 0)?;
+                write!(f, " = ")?;
+                src_val.fmt_node(f, 0)?;
+            }
+            TacInstruction::Jump(ident) => {
+                write!(f, "jump :{}", ident.0)?;
+            }
+            TacInstruction::JumpIfZero(val, ident) => {
+                write!(f, "jump :{} if ", ident.0)?;
+                val.fmt_node(f, 0)?;
+                write!(f, " == 0")?;
+            }
+            TacInstruction::JumpIfNotZero(val, ident) => {
+                write!(f, "jump :{} if ", ident.0)?;
+                val.fmt_node(f, 0)?;
+                write!(f, " != 0")?;
+            }
+            TacInstruction::Label(ident) => {
+                writeln!(f)?;
+                write!(f, "{}:", ident.0)?;
             }
         }
 
@@ -790,6 +1028,7 @@ impl TacUnaryOperator {
         Ok(match self {
             TacUnaryOperator::Negation => AsmUnaryOperator::Neg,
             TacUnaryOperator::BitwiseNot => AsmUnaryOperator::Not,
+            TacUnaryOperator::Not => panic!("unary not handled differently"),
         })
     }
 }
@@ -799,6 +1038,7 @@ impl fmt::Display for TacUnaryOperator {
         f.write_str(match self {
             TacUnaryOperator::Negation => "Negate",
             TacUnaryOperator::BitwiseNot => "BitwiseNot",
+            TacUnaryOperator::Not => "Not",
         })
     }
 }
@@ -817,7 +1057,25 @@ impl TacBinaryOperator {
             TacBinaryOperator::Divide | TacBinaryOperator::Modulus => {
                 panic!("divide/modulus should have been handled elsewhere")
             }
+            TacBinaryOperator::Equal
+            | TacBinaryOperator::NotEqual
+            | TacBinaryOperator::LessThan
+            | TacBinaryOperator::LessOrEqual
+            | TacBinaryOperator::GreaterThan
+            | TacBinaryOperator::GreaterOrEqual => panic!("relational operators handled elsewhere"),
         })
+    }
+
+    fn get_condition_code(&self) -> AsmCondCode {
+        match self {
+            TacBinaryOperator::Equal => AsmCondCode::E,
+            TacBinaryOperator::NotEqual => AsmCondCode::NE,
+            TacBinaryOperator::LessThan => AsmCondCode::L,
+            TacBinaryOperator::LessOrEqual => AsmCondCode::LE,
+            TacBinaryOperator::GreaterThan => AsmCondCode::G,
+            TacBinaryOperator::GreaterOrEqual => AsmCondCode::GE,
+            _ => panic!("shouldn't call this on other binary operator types"),
+        }
     }
 }
 
@@ -834,6 +1092,12 @@ impl fmt::Display for TacBinaryOperator {
             TacBinaryOperator::BitwiseXor => "^",
             TacBinaryOperator::ShiftLeft => "<<",
             TacBinaryOperator::ShiftRight => ">>",
+            TacBinaryOperator::Equal => "==",
+            TacBinaryOperator::NotEqual => "!=",
+            TacBinaryOperator::LessThan => "<",
+            TacBinaryOperator::LessOrEqual => "<=",
+            TacBinaryOperator::GreaterThan => ">",
+            TacBinaryOperator::GreaterOrEqual => ">=",
         })
     }
 }
@@ -901,6 +1165,16 @@ impl AsmFunction {
                 AsmInstruction::Cdq => {}
                 AsmInstruction::AllocateStack(_) => {}
                 AsmInstruction::Ret(_) => {}
+                AsmInstruction::Cmp(src1_val, src2_val) => {
+                    src1_val.resolve_pseudoregister(&mut frame)?;
+                    src2_val.resolve_pseudoregister(&mut frame)?;
+                }
+                AsmInstruction::SetCc(_cond_code, dest_loc) => {
+                    dest_loc.resolve_pseudoregister(&mut frame)?;
+                }
+                AsmInstruction::Jmp(_label) => {}
+                AsmInstruction::JmpCc(_cond_code, _label) => {}
+                AsmInstruction::Label(_label) => {}
             }
         }
 
@@ -1008,6 +1282,51 @@ impl AsmFunction {
             i += 1;
         }
 
+        // Cmp of course can't take immediates for both left and right sides, because otherwise the value is known at
+        // compile time. So move the right hand side into a destination register first.
+        i = 0;
+        while i < self.body.len() {
+            if let AsmInstruction::Cmp(_src_val, ref mut dest_val @ AsmVal::Imm(_)) =
+                &mut self.body[i]
+            {
+                let real_dest_val = dest_val.clone();
+                *dest_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
+
+                self.body.insert(
+                    i,
+                    AsmInstruction::Mov(real_dest_val, AsmLocation::Reg("r10d")),
+                );
+
+                // We made a change, so rerun the loop on this index in case further fixups are needed.
+                continue;
+            }
+
+            i += 1;
+        }
+
+        // Cmp doesn't support memory addresses for both operands, so move the left hand side into a register first.
+        i = 0;
+        while i < self.body.len() {
+            if let AsmInstruction::Cmp(
+                ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+                ref _dest_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+            ) = &mut self.body[i]
+            {
+                let real_src_val = src_val.clone();
+                *src_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
+
+                self.body.insert(
+                    i,
+                    AsmInstruction::Mov(real_src_val, AsmLocation::Reg("r10d")),
+                );
+
+                // We made a change, so rerun the loop on this index in case further fixups are needed.
+                continue;
+            }
+
+            i += 1;
+        }
+
         // For any binary operator that uses a stack offset for both right hand side and dest, x64 assembly requires
         // that we first store the destination in a temporary register.
         i = 0;
@@ -1075,6 +1394,22 @@ impl FmtNode for AsmFunction {
     }
 }
 
+impl AsmLabel {
+    fn new(name: &str) -> Self {
+        Self(format!("$L{}", name))
+    }
+
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FmtNode for AsmLabel {
+    fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl AsmInstruction {
     fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
         match self {
@@ -1095,6 +1430,16 @@ impl AsmInstruction {
             AsmInstruction::Cdq => {}
             AsmInstruction::AllocateStack(_) => {}
             AsmInstruction::Ret(_) => {}
+            AsmInstruction::Cmp(src1_val, src2_val) => {
+                src1_val.convert_to_rsp_offset(frame);
+                src2_val.convert_to_rsp_offset(frame);
+            }
+            AsmInstruction::SetCc(_cond_code, dest_loc) => {
+                dest_loc.convert_to_rsp_offset(frame);
+            }
+            AsmInstruction::Jmp(_label) => {}
+            AsmInstruction::JmpCc(_cond_code, _label) => {}
+            AsmInstruction::Label(_label) => {}
         }
     }
 
@@ -1105,9 +1450,9 @@ impl AsmInstruction {
                     f,
                     |f| {
                         write!(f, "mov ")?;
-                        dest_loc.emit_code(f)?;
+                        dest_loc.emit_code(f, 4)?;
                         write!(f, ",")?;
-                        src_val.emit_code(f)
+                        src_val.emit_code(f, 4)
                     },
                     |f| {
                         dest_loc.fmt_asm_comment(f)?;
@@ -1122,7 +1467,7 @@ impl AsmInstruction {
                     |f| {
                         unary_op.emit_code(f)?;
                         write!(f, " ")?;
-                        dest_loc.emit_code(f)
+                        dest_loc.emit_code(f, 4)
                     },
                     |f| {
                         unary_op.emit_code(f)?;
@@ -1132,14 +1477,20 @@ impl AsmInstruction {
                 )?;
             }
             AsmInstruction::BinaryOp(binary_op, src_val, dest_loc) => {
+                // sar and shl require only 1-byte operand for the shift amount.
+                let src_size = match binary_op {
+                    AsmBinaryOperator::Shl | AsmBinaryOperator::Sar => 1,
+                    _ => 4,
+                };
+
                 format_code_and_comment(
                     f,
                     |f| {
                         binary_op.emit_code(f)?;
                         write!(f, " ")?;
-                        dest_loc.emit_code(f)?;
+                        dest_loc.emit_code(f, 4)?;
                         write!(f, ",")?;
-                        src_val.emit_code(f)
+                        src_val.emit_code(f, src_size)
                     },
                     |f| {
                         dest_loc.fmt_asm_comment(f)?;
@@ -1160,7 +1511,7 @@ impl AsmInstruction {
                     f,
                     |f| {
                         write!(f, "idiv ")?;
-                        denom_val.emit_code(f)
+                        denom_val.emit_code(f, 4)
                     },
                     |f| {
                         write!(f, "edx:eax <- idiv ")?;
@@ -1184,6 +1535,62 @@ impl AsmInstruction {
 
                 writeln!(f, "    ret")?;
             }
+            AsmInstruction::Cmp(src1_val, src2_val) => {
+                format_code_and_comment(
+                    f,
+                    |f| {
+                        write!(f, "cmp ")?;
+                        src2_val.emit_code(f, 4)?;
+                        write!(f, ",")?;
+                        src1_val.emit_code(f, 4)
+                    },
+                    |f| {
+                        src2_val.fmt_asm_comment(f)?;
+                        write!(f, " cmp ")?;
+                        src1_val.fmt_asm_comment(f)
+                    },
+                )?;
+            }
+            AsmInstruction::SetCc(cond_code, dest_loc) => {
+                format_code_and_comment(
+                    f,
+                    |f| {
+                        // Makes an instruction like setne
+                        write!(f, "set")?;
+                        cond_code.emit_code(f)?;
+
+                        write!(f, " ")?;
+
+                        // SetCc only allows 1-byte destination operand.
+                        dest_loc.emit_code(f, 1)
+                    },
+                    |f| {
+                        write!(f, "set")?;
+                        cond_code.emit_code(f)?;
+                        write!(f, " ")?;
+                        dest_loc.fmt_asm_comment(f)
+                    },
+                )?;
+            }
+            AsmInstruction::Jmp(label) => {
+                write!(f, "    jmp ")?;
+                label.emit_code(f)?;
+                writeln!(f)?;
+            }
+            AsmInstruction::JmpCc(cond_code, label) => {
+                // Together this makes assembly instructions like jge, jne, etc..
+                write!(f, "    j")?;
+                cond_code.emit_code(f)?;
+
+                write!(f, " ")?;
+                label.emit_code(f)?;
+                writeln!(f)?;
+            }
+            AsmInstruction::Label(label) => {
+                writeln!(f)?;
+                label.emit_code(f)?;
+                writeln!(f, ":")?;
+            }
         }
 
         Ok(())
@@ -1195,30 +1602,30 @@ impl FmtNode for AsmInstruction {
         Self::write_indent(f, indent_levels)?;
         match self {
             AsmInstruction::Mov(src_val, dest_loc) => {
-                write!(f, "Mov ")?;
+                f.write_str("Mov ")?;
                 src_val.fmt_node(f, 0)?;
-                write!(f, " -> ")?;
+                f.write_str(" -> ")?;
                 dest_loc.fmt_node(f, 0)?;
             }
             AsmInstruction::UnaryOp(unary_op, dest_loc) => {
                 unary_op.fmt_node(f, 0)?;
-                write!(f, " ")?;
+                f.write_str(" ")?;
                 dest_loc.fmt_node(f, 0)?;
             }
             AsmInstruction::BinaryOp(binary_op, src_val, dest_loc) => {
                 dest_loc.fmt_node(f, 0)?;
-                write!(f, " ")?;
+                f.write_str(" ")?;
                 binary_op.fmt_node(f, 0)?;
-                write!(f, " ")?;
+                f.write_str(" ")?;
                 src_val.fmt_node(f, 0)?;
-                write!(f, " -> ")?;
+                f.write_str(" -> ")?;
                 dest_loc.fmt_node(f, 0)?;
             }
             AsmInstruction::Cdq => {
                 f.write_str("Cdq")?;
             }
             AsmInstruction::Idiv(denom_val) => {
-                write!(f, "Idiv ")?;
+                f.write_str("Idiv ")?;
                 denom_val.fmt_node(f, 0)?;
             }
             AsmInstruction::AllocateStack(size) => {
@@ -1226,6 +1633,28 @@ impl FmtNode for AsmInstruction {
             }
             AsmInstruction::Ret(size) => {
                 write!(f, "Ret (dealloc {} stack)", size)?;
+            }
+            AsmInstruction::Cmp(src1_val, src2_val) => {
+                f.write_str("Cmp ")?;
+                src1_val.fmt_node(f, 0)?;
+                f.write_str(", ")?;
+                src2_val.fmt_node(f, 0)?;
+            }
+            AsmInstruction::SetCc(cond_code, dest_loc) => {
+                write!(f, "Set{} ", cond_code)?;
+                dest_loc.fmt_node(f, 0)?;
+            }
+            AsmInstruction::Jmp(label) => {
+                write!(f, "Jmp ")?;
+                label.fmt_node(f, 0)?;
+            }
+            AsmInstruction::JmpCc(cond_code, label) => {
+                write!(f, "Jmp{} ", cond_code)?;
+                label.fmt_node(f, 0)?;
+            }
+            AsmInstruction::Label(label) => {
+                label.fmt_node(f, 0)?;
+                write!(f, ":")?;
             }
         }
 
@@ -1255,13 +1684,13 @@ impl AsmVal {
         Ok(())
     }
 
-    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn emit_code(&self, f: &mut fmt::Formatter, size: u8) -> fmt::Result {
         match self {
             AsmVal::Imm(num) => {
                 write!(f, "{}", num)?;
             }
             AsmVal::Loc(loc) => {
-                loc.emit_code(f)?;
+                loc.emit_code(f, size)?;
             }
         }
 
@@ -1336,13 +1765,58 @@ impl AsmLocation {
         }
     }
 
-    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn emit_code(&self, f: &mut fmt::Formatter, size: u8) -> fmt::Result {
         match self {
             AsmLocation::Reg(name) => {
-                f.write_str(name)?;
+                f.write_str(match (self.get_base_reg_name().unwrap(), size) {
+                    ("ax", 1) => "al",
+                    ("ax", 4) => "eax",
+                    ("bx", 1) => "bl",
+                    ("bx", 4) => "ebx",
+                    ("cx", 1) => "cl",
+                    ("cx", 4) => "ecx",
+                    ("dx", 1) => "dl",
+                    ("dx", 4) => "edx",
+                    ("si", 1) => "sil",
+                    ("si", 4) => "esi",
+                    ("di", 1) => "dil",
+                    ("di", 4) => "edi",
+                    ("bp", 1) => "bpl",
+                    ("bp", 4) => "ebp",
+                    ("sp", 1) => "spl",
+                    ("sp", 4) => "esp",
+                    ("r8", 1) => "r8b",
+                    ("r8", 4) => "r8d",
+                    ("r9", 1) => "r9b",
+                    ("r9", 4) => "r9d",
+                    ("r10", 1) => "r10b",
+                    ("r10", 4) => "r10d",
+                    ("r11", 1) => "r11b",
+                    ("r11", 4) => "r11d",
+                    ("r12", 1) => "r12b",
+                    ("r12", 4) => "r12d",
+                    ("r13", 1) => "r13b",
+                    ("r13", 4) => "r13d",
+                    ("r14", 1) => "r14b",
+                    ("r14", 4) => "r14d",
+                    ("r15", 1) => "r15b",
+                    ("r15", 4) => "r15d",
+                    _ => panic!("unknown reg name and size {}, {}", name, size),
+                })?;
             }
             AsmLocation::RspOffset(rsp_offset, _name) => {
-                write!(f, "DWORD PTR [rsp+{}]", rsp_offset)?;
+                write!(
+                    f,
+                    "{} PTR [rsp+{}]",
+                    match size {
+                        1 => "BYTE",
+                        2 => "WORD",
+                        4 => "DWORD",
+                        8 => "QWORD",
+                        _ => panic!("unhandled pointer size {}", size),
+                    },
+                    rsp_offset
+                )?;
             }
             _ => panic!("cannot handle emitting {:?}", self),
         }
@@ -1437,16 +1911,48 @@ impl FmtNode for AsmBinaryOperator {
     }
 }
 
+impl AsmCondCode {
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            AsmCondCode::E => "e",
+            AsmCondCode::NE => "ne",
+            AsmCondCode::L => "l",
+            AsmCondCode::LE => "le",
+            AsmCondCode::G => "g",
+            AsmCondCode::GE => "ge",
+        })
+    }
+}
+
+impl fmt::Display for AsmCondCode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            AsmCondCode::E => "E",
+            AsmCondCode::NE => "NE",
+            AsmCondCode::L => "L",
+            AsmCondCode::LE => "LE",
+            AsmCondCode::G => "G",
+            AsmCondCode::GE => "GE",
+        })
+    }
+}
+
 impl TacGenState {
     fn new() -> Self {
         TacGenState {
             next_temporary_id: 0,
+            next_label_id: 0,
         }
     }
 
     fn allocate_temporary(&mut self) -> TacVar {
         self.next_temporary_id += 1;
         TacVar(format!("{:03}_tmp", self.next_temporary_id - 1))
+    }
+
+    fn allocate_label(&mut self, prefix: &str) -> TacIdentifier {
+        self.next_label_id += 1;
+        TacIdentifier(format!("{}_{:03}", prefix, self.next_label_id - 1))
     }
 }
 
@@ -2132,8 +2638,14 @@ mod test {
     }
 
     #[test]
-    fn test_codegen_unary_not() {
+    fn test_codegen_unary_bitnot() {
         test_codegen_expression("~12", -13);
+    }
+
+    #[test]
+    fn test_codegen_unary_not() {
+        test_codegen_expression("!5", 0);
+        test_codegen_expression("!0", 1);
     }
 
     #[test]
@@ -2142,7 +2654,7 @@ mod test {
     }
 
     #[test]
-    fn test_codegen_unary_not_zero() {
+    fn test_codegen_unary_bitnot_zero() {
         test_codegen_expression("~0", -1);
     }
 
@@ -2152,17 +2664,17 @@ mod test {
     }
 
     #[test]
-    fn test_codegen_unary_not_and_neg() {
+    fn test_codegen_unary_bitnot_and_neg() {
         test_codegen_expression("~-3", 2);
     }
 
     #[test]
-    fn test_codegen_unary_not_and_neg_zero() {
+    fn test_codegen_unary_bitnot_and_neg_zero() {
         test_codegen_expression("-~0", 1);
     }
 
     #[test]
-    fn test_codegen_unary_not_and_neg_min_val() {
+    fn test_codegen_unary_bitnot_and_neg_min_val() {
         test_codegen_expression("~-2147483647", 2147483646);
     }
 
@@ -2184,6 +2696,17 @@ mod test {
     #[test]
     fn test_codegen_unary_grouping_several() {
         test_codegen_expression("-((((((10))))))", -10);
+    }
+
+    #[test]
+    fn test_codegen_unary_not_and_neg() {
+        test_codegen_expression("!-3", 0);
+    }
+
+    #[test]
+    fn test_codegen_unary_not_and_arithmetic() {
+        test_codegen_expression("!(4-4)", 1);
+        test_codegen_expression("!(4 - 5)", 0);
     }
 
     #[test]
@@ -2262,8 +2785,38 @@ mod test {
     }
 
     #[test]
+    fn test_parse_fail_relational_missing_first_operand() {
+        test_codegen_mainfunc_failure("return <= 2;");
+    }
+
+    #[test]
+    fn test_parse_fail_relational_missing_second_operand() {
+        test_codegen_mainfunc_failure("return 1 < > 3;");
+    }
+
+    #[test]
+    fn test_parse_fail_and_missing_second_operand() {
+        test_codegen_mainfunc_failure("return 2 && ~;");
+    }
+
+    #[test]
+    fn test_parse_fail_or_missing_semicolon() {
+        test_codegen_mainfunc_failure("return 2 || 4");
+    }
+
+    #[test]
+    fn test_parse_fail_unary_not_missing_semicolon() {
+        test_codegen_mainfunc_failure("return !10");
+    }
+
+    #[test]
     fn test_parse_fail_double_bitwise_or() {
         test_codegen_mainfunc_failure("return 1 | | 2;");
+    }
+
+    #[test]
+    fn test_parse_fail_unary_not_missing_operand() {
+        test_codegen_mainfunc_failure("return 10 <= !;");
     }
 
     #[test]
@@ -2287,49 +2840,81 @@ mod test {
     }
 
     #[test]
-    #[ignore]
+    fn test_codegen_and_false() {
+        test_codegen_expression("(10 && 0) + (0 && 4) + (0 && 0)", 0);
+    }
+
+    #[test]
+    fn test_codegen_and_true() {
+        test_codegen_expression("1 && -1", 1);
+    }
+
+    #[test]
+    fn test_codegen_and_shortcircuit() {
+        test_codegen_expression("0 && (1 / 0)", 0);
+    }
+
+    #[test]
+    fn test_codegen_or_shortcircuit() {
+        test_codegen_expression("1 || (1 / 0)", 1);
+    }
+
+    #[test]
+    fn test_codegen_multi_shortcircuit() {
+        test_codegen_expression("0 || 0 && (1 / 0)", 0);
+    }
+
+    #[test]
+    fn test_codegen_and_or_precedence() {
+        test_codegen_expression("1 || 0 && 2", 1);
+    }
+
+    #[test]
+    fn test_codegen_and_or_precedence_2() {
+        test_codegen_expression("(1 || 0) && 0", 0);
+    }
+
+    #[test]
     fn test_codegen_relational_lt() {
         test_codegen_expression("1234 < 1234", 0);
         test_codegen_expression("1234 < 1235", 1);
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_relational_gt() {
         test_codegen_expression("1234 > 1234", 0);
         test_codegen_expression("1234 > 1233", 1);
+        test_codegen_expression("(1 > 2) + (1 > 1)", 0);
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_relational_le() {
         test_codegen_expression("1234 <= 1234", 1);
         test_codegen_expression("1234 <= 1233", 0);
+        test_codegen_expression("1 <= -1", 0);
+        test_codegen_expression("(0 <= 2) + (0 <= 0)", 2);
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_relational_ge() {
         test_codegen_expression("1234 >= 1234", 1);
         test_codegen_expression("1234 >= 1235", 0);
+        test_codegen_expression("(1 >= 1) + (1 >= -4)", 2);
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_equality_eq() {
         test_codegen_expression("1234 == 1234", 1);
         test_codegen_expression("1234 == 1235", 0);
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_equality_ne() {
         test_codegen_expression("1234 != 1234", 0);
         test_codegen_expression("1234 != 1235", 1);
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_logical_and() {
         test_codegen_expression("0 && 1 && 2", 0);
         test_codegen_expression("5 && 6 && 7", 1);
@@ -2337,7 +2922,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_logical_or() {
         test_codegen_expression("0 || 0 || 1", 1);
         test_codegen_expression("1 || 0 || 0", 1);
@@ -2345,9 +2929,38 @@ mod test {
     }
 
     #[test]
-    #[ignore]
+    fn test_codegen_equals_precedence() {
+        test_codegen_expression("0 == 0 != 0", 1);
+    }
+
+    #[test]
+    fn test_codegen_equals_relational_precedence() {
+        test_codegen_expression("2 == 2 >= 0", 0);
+    }
+
+    #[test]
+    fn test_codegen_equals_or_precedence() {
+        test_codegen_expression("2 == 2 || 0", 1);
+    }
+
+    #[test]
+    fn test_codegen_relational_associativity() {
+        test_codegen_expression("5 >= 0 > 1 <= 0", 1);
+    }
+
+    #[test]
+    fn test_codegen_compare_arithmetic_results() {
+        test_codegen_expression("~2 * -2 == 1 + 5", 1);
+    }
+
+    #[test]
     fn test_codegen_all_operator_precedence() {
         test_codegen_expression("-1 * -2 + 3 >= 5 == 1 && (6 - 6) || 7", 1);
+    }
+
+    #[test]
+    fn test_codegen_all_operator_precedence_2() {
+        test_codegen_expression("(0 == 0 && 3 == 2 + 1 > 1) + 1", 1);
     }
 
     #[test]
@@ -2453,6 +3066,31 @@ mod test {
     #[test]
     fn test_codegen_bitwise_precedence() {
         test_codegen_expression("80 >> 2 | 1 ^ 5 & 7 << 1", 21);
+    }
+
+    #[test]
+    fn test_codegen_arithmetic_and_booleans() {
+        test_codegen_expression("~(0 && 1) - -(4 || 3)", 0);
+    }
+
+    #[test]
+    fn test_codegen_bitand_equals_precedence() {
+        test_codegen_expression("4 & 7 == 4", 0);
+    }
+
+    #[test]
+    fn test_codegen_bitor_notequals_precedence() {
+        test_codegen_expression("4 | 7 != 4", 5);
+    }
+
+    #[test]
+    fn test_codegen_shift_relational_precedence() {
+        test_codegen_expression("20 >> 4 <= 3 << 1", 1);
+    }
+
+    #[test]
+    fn test_codegen_xor_relational_precedence() {
+        test_codegen_expression("5 ^ 7 < 5", 5);
     }
 
     #[test]
