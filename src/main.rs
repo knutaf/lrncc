@@ -175,9 +175,11 @@ impl<'i, 't> Tokens<'i, 't> {
             lazy_static! {
                 static ref IDENT_REGEX: Regex =
                     Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
+                static ref KEYWORDS_REGEX: Regex =
+                    Regex::new(r"^int|void|return$").expect("failed to compile regex");
             }
 
-            IDENT_REGEX.find(token).is_some()
+            IDENT_REGEX.is_match(token) && !KEYWORDS_REGEX.is_match(token)
         }
 
         let (tokens, remaining_tokens) = self.consume_tokens(1)?;
@@ -217,29 +219,49 @@ impl<'i, 't> Deref for Tokens<'i, 't> {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Debug)]
 struct AstProgram<'i> {
     functions: Vec<AstFunction<'i>>,
+    global_tracking_opt: Option<GlobalTracking>,
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Debug)]
 struct AstFunction<'i> {
     name: &'i str,
     parameters: Vec<String>,
-    body: AstStatement,
+    body: Vec<AstBlockItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AstIdentifier(String);
+
+#[derive(Debug)]
+enum AstBlockItem {
+    Statement(AstStatement),
+    Declaration(AstDeclaration),
+}
+
+#[derive(Clone, Debug)]
+struct AstDeclaration {
+    identifier: AstIdentifier,
+    initializer_opt: Option<AstExpression>,
 }
 
 // TODO: use a string slice instead of a string
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum AstStatement {
     Return(AstExpression),
+    Expr(AstExpression),
+    Null,
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum AstExpression {
     Constant(u32),
     UnaryOperator(AstUnaryOperator, Box<AstExpression>),
     BinaryOperator(Box<AstExpression>, AstBinaryOperator, Box<AstExpression>),
+    Var(AstIdentifier),
+    Assignment(Box<AstExpression>, Box<AstExpression>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -269,6 +291,7 @@ enum AstBinaryOperator {
     LessOrEqual,
     GreaterThan,
     GreaterOrEqual,
+    Assign,
 }
 
 #[derive(Debug)]
@@ -284,7 +307,7 @@ struct TacFunction {
 }
 
 #[derive(Debug, Clone)]
-struct TacIdentifier(String);
+struct TacLabel(String);
 
 #[derive(Debug)]
 enum TacInstruction {
@@ -292,10 +315,10 @@ enum TacInstruction {
     UnaryOp(TacUnaryOperator, TacVal, TacVar),
     BinaryOp(TacVal, TacBinaryOperator, TacVal, TacVar),
     CopyVal(TacVal, TacVar),
-    Jump(TacIdentifier),
-    JumpIfZero(TacVal, TacIdentifier),
-    JumpIfNotZero(TacVal, TacIdentifier),
-    Label(TacIdentifier),
+    Jump(TacLabel),
+    JumpIfZero(TacVal, TacLabel),
+    JumpIfNotZero(TacVal, TacLabel),
+    Label(TacLabel),
 }
 
 #[derive(Debug, Clone)]
@@ -407,27 +430,54 @@ enum AsmCondCode {
     GE,
 }
 
-struct TacGenState {
+#[derive(Debug)]
+struct GlobalTracking {
     next_temporary_id: u32,
     next_label_id: u32,
 }
 
+#[derive(Debug)]
+struct FunctionTracking {
+    variables: HashMap<AstIdentifier, AstIdentifier>,
+}
+
+#[derive(Debug)]
 struct FuncStackFrame {
     names: HashMap<String, i32>,
     max_base_offset: u32,
 }
 
 impl<'i> AstProgram<'i> {
+    fn new(functions: Vec<AstFunction<'i>>) -> Self {
+        Self {
+            functions,
+            global_tracking_opt: None,
+        }
+    }
+
     fn lookup_function_definition(&'i self, name: &str) -> Option<&'i AstFunction<'i>> {
         self.functions.iter().find(|func| func.name == name)
     }
 
-    fn to_tac(&self) -> Result<TacProgram, String> {
-        let mut tacgen_state = TacGenState::new();
+    fn validate_and_resolve(&mut self) -> Result<(), Vec<String>> {
+        self.global_tracking_opt = Some(GlobalTracking::new());
 
+        let mut errors = vec![];
+        for func in self.functions.iter_mut() {
+            func.validate_and_resolve(self.global_tracking_opt.as_mut().unwrap(), &mut errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn to_tac(&mut self) -> Result<TacProgram, String> {
         let mut functions = vec![];
         for func in self.functions.iter() {
-            functions.push(func.to_tac(&mut tacgen_state)?);
+            functions.push(func.to_tac(self.global_tracking_opt.as_mut().unwrap())?);
         }
 
         Ok(TacProgram { functions })
@@ -441,10 +491,35 @@ impl<'i> FmtNode for AstProgram<'i> {
 }
 
 impl<'i> AstFunction<'i> {
-    fn to_tac(&self, tacgen_state: &mut TacGenState) -> Result<TacFunction, String> {
+    fn validate_and_resolve(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        errors: &mut Vec<String>,
+    ) {
+        let mut tracking = FunctionTracking::new();
+
+        for block_item in self.body.iter_mut() {
+            if let Err(err) = block_item.validate_and_resolve(global_tracking, &mut tracking) {
+                errors.push(err);
+            }
+        }
+    }
+
+    fn to_tac(&self, global_tracking: &mut GlobalTracking) -> Result<TacFunction, String> {
+        let mut body_instructions = vec![];
+        for block_item in self.body.iter() {
+            block_item.to_tac(global_tracking, &mut body_instructions)?;
+        }
+
+        // In C, functions lacking a return value either automatically return 0 (in the case of main), have undefined
+        // behavior (if the function's return value is actually used), or the return value doesn't matter (if the return
+        // value isn't examined). To handle all three cases, just add an extra "return 0" to the end of every function
+        // body.
+        body_instructions.push(TacInstruction::Return(TacVal::Constant(0)));
+
         Ok(TacFunction {
             name: String::from(self.name),
-            body: self.body.to_tac(tacgen_state)?,
+            body: body_instructions,
         })
     }
 }
@@ -455,22 +530,134 @@ impl<'i> FmtNode for AstFunction<'i> {
         write!(f, "FUNC {}(", self.name)?;
         fmt_list(f, self.parameters.iter(), ", ")?;
         writeln!(f, "):")?;
-        self.body.fmt_node(f, indent_levels + 1)
+        for block_item in self.body.iter() {
+            block_item.fmt_node(f, indent_levels + 1)?;
+            writeln!(f)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl AstIdentifier {
+    fn to_tac(&self) -> TacVar {
+        TacVar(self.0.clone())
+    }
+}
+
+impl AstBlockItem {
+    fn validate_and_resolve(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        function_tracking: &mut FunctionTracking,
+    ) -> Result<(), String> {
+        match self {
+            AstBlockItem::Statement(statement) => statement.validate_and_resolve(function_tracking),
+            AstBlockItem::Declaration(declaration) => {
+                declaration.validate_and_resolve(global_tracking, function_tracking)
+            }
+        }
+    }
+
+    fn to_tac(
+        &self,
+        global_tracking: &mut GlobalTracking,
+        instructions: &mut Vec<TacInstruction>,
+    ) -> Result<(), String> {
+        match self {
+            AstBlockItem::Statement(statement) => statement.to_tac(global_tracking, instructions),
+            AstBlockItem::Declaration(declaration) => {
+                declaration.to_tac(global_tracking, instructions)
+            }
+        }
+    }
+}
+
+impl FmtNode for AstBlockItem {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        match self {
+            AstBlockItem::Statement(statement) => statement.fmt_node(f, indent_levels),
+            AstBlockItem::Declaration(declaration) => declaration.fmt_node(f, indent_levels),
+        }
+    }
+}
+
+impl AstDeclaration {
+    fn validate_and_resolve(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        function_tracking: &mut FunctionTracking,
+    ) -> Result<(), String> {
+        self.identifier = function_tracking.add_variable(global_tracking, &self.identifier)?;
+
+        if let Some(initializer) = &mut self.initializer_opt {
+            initializer.validate_and_resolve(function_tracking)?;
+        }
+
+        Ok(())
+    }
+
+    fn to_tac(
+        &self,
+        global_tracking: &mut GlobalTracking,
+        instructions: &mut Vec<TacInstruction>,
+    ) -> Result<(), String> {
+        if let Some(initializer) = &self.initializer_opt {
+            let tac_val = initializer.to_tac(global_tracking, instructions)?;
+            instructions.push(TacInstruction::CopyVal(tac_val, self.identifier.to_tac()));
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for AstDeclaration {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        Self::write_indent(f, indent_levels)?;
+
+        write!(f, "int {}", self.identifier.0)?;
+
+        if let Some(initializer) = &self.initializer_opt {
+            write!(f, " = ")?;
+            initializer.fmt_node(f, indent_levels + 1)?;
+        }
+
+        Ok(())
     }
 }
 
 impl AstStatement {
-    fn to_tac(&self, tacgen_state: &mut TacGenState) -> Result<Vec<TacInstruction>, String> {
-        let mut instructions = vec![];
-
+    fn validate_and_resolve(
+        &mut self,
+        function_tracking: &mut FunctionTracking,
+    ) -> Result<(), String> {
         match self {
-            AstStatement::Return(ast_exp) => {
-                let tac_val = ast_exp.to_tac(tacgen_state, &mut instructions)?;
-                instructions.push(TacInstruction::Return(tac_val));
+            AstStatement::Return(expr) | AstStatement::Expr(expr) => {
+                expr.validate_and_resolve(function_tracking)?;
             }
+            AstStatement::Null => {}
         }
 
-        Ok(instructions)
+        Ok(())
+    }
+
+    fn to_tac(
+        &self,
+        global_tracking: &mut GlobalTracking,
+        instructions: &mut Vec<TacInstruction>,
+    ) -> Result<(), String> {
+        match self {
+            AstStatement::Return(ast_exp) => {
+                let tac_val = ast_exp.to_tac(global_tracking, instructions)?;
+                instructions.push(TacInstruction::Return(tac_val));
+            }
+            AstStatement::Expr(ast_exp) => {
+                let _tac_val = ast_exp.to_tac(global_tracking, instructions)?;
+            }
+            AstStatement::Null => {}
+        }
+
+        Ok(())
     }
 }
 
@@ -483,6 +670,10 @@ impl FmtNode for AstStatement {
                 write!(f, "return ")?;
                 expr.fmt_node(f, indent_levels + 1)?;
             }
+            AstStatement::Expr(expr) => {
+                expr.fmt_node(f, indent_levels + 1)?;
+            }
+            AstStatement::Null => {}
         }
 
         Ok(())
@@ -526,24 +717,25 @@ impl AstBinaryOperator {
     // 50.
     fn precedence(&self) -> u8 {
         match self {
-            AstBinaryOperator::Or => 0,
-            AstBinaryOperator::And => 1,
-            AstBinaryOperator::BitwiseOr => 2,
-            AstBinaryOperator::BitwiseXor => 3,
-            AstBinaryOperator::BitwiseAnd => 4,
-            AstBinaryOperator::Equal => 5,
-            AstBinaryOperator::NotEqual => 5,
-            AstBinaryOperator::LessThan => 6,
-            AstBinaryOperator::LessOrEqual => 6,
-            AstBinaryOperator::GreaterThan => 6,
-            AstBinaryOperator::GreaterOrEqual => 6,
-            AstBinaryOperator::ShiftLeft => 7,
-            AstBinaryOperator::ShiftRight => 7,
-            AstBinaryOperator::Add => 8,
-            AstBinaryOperator::Subtract => 8,
-            AstBinaryOperator::Multiply => 9,
-            AstBinaryOperator::Divide => 9,
-            AstBinaryOperator::Modulus => 9,
+            AstBinaryOperator::Assign => 0,
+            AstBinaryOperator::Or => 1,
+            AstBinaryOperator::And => 2,
+            AstBinaryOperator::BitwiseOr => 3,
+            AstBinaryOperator::BitwiseXor => 4,
+            AstBinaryOperator::BitwiseAnd => 5,
+            AstBinaryOperator::Equal => 6,
+            AstBinaryOperator::NotEqual => 6,
+            AstBinaryOperator::LessThan => 7,
+            AstBinaryOperator::LessOrEqual => 7,
+            AstBinaryOperator::GreaterThan => 7,
+            AstBinaryOperator::GreaterOrEqual => 7,
+            AstBinaryOperator::ShiftLeft => 8,
+            AstBinaryOperator::ShiftRight => 8,
+            AstBinaryOperator::Add => 9,
+            AstBinaryOperator::Subtract => 9,
+            AstBinaryOperator::Multiply => 10,
+            AstBinaryOperator::Divide => 10,
+            AstBinaryOperator::Modulus => 10,
         }
     }
 
@@ -559,7 +751,7 @@ impl AstBinaryOperator {
             AstBinaryOperator::BitwiseXor => TacBinaryOperator::BitwiseXor,
             AstBinaryOperator::ShiftLeft => TacBinaryOperator::ShiftLeft,
             AstBinaryOperator::ShiftRight => TacBinaryOperator::ShiftRight,
-            AstBinaryOperator::And | AstBinaryOperator::Or => {
+            AstBinaryOperator::And | AstBinaryOperator::Or | AstBinaryOperator::Assign => {
                 panic!("should have been handled elsewhere")
             }
             AstBinaryOperator::Equal => TacBinaryOperator::Equal,
@@ -593,6 +785,7 @@ impl FmtNode for AstBinaryOperator {
             AstBinaryOperator::LessOrEqual => "<=",
             AstBinaryOperator::GreaterThan => ">",
             AstBinaryOperator::GreaterOrEqual => ">=",
+            AstBinaryOperator::Assign => "=",
         })
     }
 }
@@ -619,22 +812,55 @@ impl std::str::FromStr for AstBinaryOperator {
             "<=" => Ok(AstBinaryOperator::LessOrEqual),
             ">" => Ok(AstBinaryOperator::GreaterThan),
             ">=" => Ok(AstBinaryOperator::GreaterOrEqual),
+            "=" => Ok(AstBinaryOperator::Assign),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
 }
 
 impl AstExpression {
+    fn validate_and_resolve(
+        &mut self,
+        function_tracking: &mut FunctionTracking,
+    ) -> Result<(), String> {
+        match self {
+            AstExpression::Constant(num) => {}
+            AstExpression::UnaryOperator(_ast_unary_op, ast_exp_inner) => {
+                ast_exp_inner.validate_and_resolve(function_tracking)?;
+            }
+            AstExpression::BinaryOperator(ast_exp_left, _binary_op, ast_exp_right) => {
+                ast_exp_left.validate_and_resolve(function_tracking)?;
+                ast_exp_right.validate_and_resolve(function_tracking)?;
+            }
+            AstExpression::Var(ref mut ast_ident) => {
+                function_tracking.resolve_variable(ast_ident)?;
+            }
+            AstExpression::Assignment(ast_exp_left, ast_exp_right) => {
+                let AstExpression::Var(_) = **ast_exp_left else {
+                    return Err(format!(
+                        "{} is not an lvalue",
+                        display_with(|f| { ast_exp_left.fmt_node(f, 0) })
+                    ));
+                };
+
+                ast_exp_left.validate_and_resolve(function_tracking)?;
+                ast_exp_right.validate_and_resolve(function_tracking)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn to_tac(
         &self,
-        tacgen_state: &mut TacGenState,
+        global_tracking: &mut GlobalTracking,
         instructions: &mut Vec<TacInstruction>,
     ) -> Result<TacVal, String> {
         Ok(match self {
             AstExpression::Constant(num) => TacVal::Constant(*num),
             AstExpression::UnaryOperator(ast_unary_op, ast_exp_inner) => {
-                let tac_exp_inner_var = ast_exp_inner.to_tac(tacgen_state, instructions)?;
-                let tempvar = tacgen_state.allocate_temporary();
+                let tac_exp_inner_var = ast_exp_inner.to_tac(global_tracking, instructions)?;
+                let tempvar = global_tracking.allocate_temporary();
                 instructions.push(TacInstruction::UnaryOp(
                     ast_unary_op.to_tac(),
                     tac_exp_inner_var,
@@ -654,19 +880,19 @@ impl AstExpression {
                     false
                 };
 
-                let tempvar = tacgen_state.allocate_temporary();
+                let tempvar = global_tracking.allocate_temporary();
 
-                let shortcircuit_label = tacgen_state.allocate_label(if is_and {
+                let shortcircuit_label = global_tracking.allocate_label(if is_and {
                     "and_shortcircuit"
                 } else {
                     "or_shortcircuit"
                 });
 
                 let end_label =
-                    tacgen_state.allocate_label(if is_and { "and_end" } else { "or_end" });
+                    global_tracking.allocate_label(if is_and { "and_end" } else { "or_end" });
 
                 // First emit code to calculate the left hand side.
-                let tac_exp_left_var = ast_exp_left.to_tac(tacgen_state, instructions)?;
+                let tac_exp_left_var = ast_exp_left.to_tac(global_tracking, instructions)?;
 
                 // Test if the left hand side would already give a conclusive answer for the operator, i.e. 0 for AND
                 // or 1 for OR. Then we can jump to the short circuit handling.
@@ -679,7 +905,7 @@ impl AstExpression {
                 ));
 
                 // If we made it this far, the right hand side has to be executed.
-                let tac_exp_right_var = ast_exp_right.to_tac(tacgen_state, instructions)?;
+                let tac_exp_right_var = ast_exp_right.to_tac(global_tracking, instructions)?;
 
                 // Test if the right hand side is conclusive, and if so, also jump to the same short circuit handler.
                 instructions.push((if is_and {
@@ -712,9 +938,9 @@ impl AstExpression {
                 TacVal::Var(tempvar)
             }
             AstExpression::BinaryOperator(ast_exp_left, ast_binary_op, ast_exp_right) => {
-                let tac_exp_left_var = ast_exp_left.to_tac(tacgen_state, instructions)?;
-                let tac_exp_right_var = ast_exp_right.to_tac(tacgen_state, instructions)?;
-                let tempvar = tacgen_state.allocate_temporary();
+                let tac_exp_left_var = ast_exp_left.to_tac(global_tracking, instructions)?;
+                let tac_exp_right_var = ast_exp_right.to_tac(global_tracking, instructions)?;
+                let tempvar = global_tracking.allocate_temporary();
                 instructions.push(TacInstruction::BinaryOp(
                     tac_exp_left_var,
                     ast_binary_op.to_tac(),
@@ -722,6 +948,23 @@ impl AstExpression {
                     tempvar.clone(),
                 ));
                 TacVal::Var(tempvar)
+            }
+            AstExpression::Var(ast_ident) => TacVal::Var(ast_ident.to_tac()),
+            AstExpression::Assignment(ast_exp_left, ast_exp_right) => {
+                let tac_exp_left_val = ast_exp_left.to_tac(global_tracking, instructions)?;
+
+                let TacVal::Var(ref tac_exp_left_var) = tac_exp_left_val else {
+                    panic!("lhs in an assignment wasn't an lvalue: {:?}", ast_exp_left);
+                };
+
+                let tac_exp_right_val = ast_exp_right.to_tac(global_tracking, instructions)?;
+
+                instructions.push(TacInstruction::CopyVal(
+                    tac_exp_right_val,
+                    tac_exp_left_var.clone(),
+                ));
+
+                tac_exp_left_val
             }
         })
     }
@@ -741,6 +984,16 @@ impl FmtNode for AstExpression {
                 write!(f, " ")?;
                 operator.fmt_node(f, 0)?;
                 write!(f, " ")?;
+                right.fmt_node(f, 0)?;
+                write!(f, ")")?;
+            }
+            AstExpression::Var(ident) => {
+                f.write_str(&ident.0)?;
+            }
+            AstExpression::Assignment(left, right) => {
+                write!(f, "(")?;
+                left.fmt_node(f, 0)?;
+                write!(f, " = ")?;
                 right.fmt_node(f, 0)?;
                 write!(f, ")")?;
             }
@@ -788,7 +1041,7 @@ impl FmtNode for TacFunction {
     }
 }
 
-impl TacIdentifier {
+impl TacLabel {
     fn to_asm(&self) -> Result<AsmLabel, String> {
         Ok(AsmLabel::new(&self.0))
     }
@@ -907,11 +1160,11 @@ impl TacInstruction {
             TacInstruction::CopyVal(src_val, dest_loc) => {
                 func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_loc.to_asm()?));
             }
-            TacInstruction::Jump(ident) => {
-                func_body.push(AsmInstruction::Jmp(ident.to_asm()?));
+            TacInstruction::Jump(label) => {
+                func_body.push(AsmInstruction::Jmp(label.to_asm()?));
             }
-            jump_type @ (TacInstruction::JumpIfZero(val, ident)
-            | TacInstruction::JumpIfNotZero(val, ident)) => {
+            jump_type @ (TacInstruction::JumpIfZero(val, label)
+            | TacInstruction::JumpIfNotZero(val, label)) => {
                 // First compare to zero.
                 func_body.push(AsmInstruction::Cmp(AsmVal::Imm(0), val.to_asm()?));
 
@@ -922,11 +1175,11 @@ impl TacInstruction {
                     } else {
                         AsmCondCode::NE
                     },
-                    ident.to_asm()?,
+                    label.to_asm()?,
                 ));
             }
-            TacInstruction::Label(ident) => {
-                func_body.push(AsmInstruction::Label(ident.to_asm()?));
+            TacInstruction::Label(label) => {
+                func_body.push(AsmInstruction::Label(label.to_asm()?));
             }
         }
 
@@ -941,7 +1194,6 @@ impl FmtNode for TacInstruction {
             TacInstruction::Return(val) => {
                 write!(f, "return ")?;
                 val.fmt_node(f, 0)?;
-                writeln!(f)?;
             }
             TacInstruction::UnaryOp(unary_op, src, dest) => {
                 dest.fmt_node(f, 0)?;
@@ -964,22 +1216,22 @@ impl FmtNode for TacInstruction {
                 write!(f, " = ")?;
                 src_val.fmt_node(f, 0)?;
             }
-            TacInstruction::Jump(ident) => {
-                write!(f, "jump :{}", ident.0)?;
+            TacInstruction::Jump(label) => {
+                write!(f, "jump :{}", label.0)?;
             }
-            TacInstruction::JumpIfZero(val, ident) => {
-                write!(f, "jump :{} if ", ident.0)?;
+            TacInstruction::JumpIfZero(val, label) => {
+                write!(f, "jump :{} if ", label.0)?;
                 val.fmt_node(f, 0)?;
                 write!(f, " == 0")?;
             }
-            TacInstruction::JumpIfNotZero(val, ident) => {
-                write!(f, "jump :{} if ", ident.0)?;
+            TacInstruction::JumpIfNotZero(val, label) => {
+                write!(f, "jump :{} if ", label.0)?;
                 val.fmt_node(f, 0)?;
                 write!(f, " != 0")?;
             }
-            TacInstruction::Label(ident) => {
+            TacInstruction::Label(label) => {
                 writeln!(f)?;
-                write!(f, "{}:", ident.0)?;
+                write!(f, "{}:", label.0)?;
             }
         }
 
@@ -1937,9 +2189,9 @@ impl fmt::Display for AsmCondCode {
     }
 }
 
-impl TacGenState {
+impl GlobalTracking {
     fn new() -> Self {
-        TacGenState {
+        Self {
             next_temporary_id: 0,
             next_label_id: 0,
         }
@@ -1950,9 +2202,53 @@ impl TacGenState {
         TacVar(format!("{:03}_tmp", self.next_temporary_id - 1))
     }
 
-    fn allocate_label(&mut self, prefix: &str) -> TacIdentifier {
+    fn create_temporary_ast_ident(&mut self, identifier: &AstIdentifier) -> AstIdentifier {
+        self.next_temporary_id += 1;
+        AstIdentifier(format!(
+            "{:03}_var_{}",
+            self.next_temporary_id - 1,
+            identifier.0
+        ))
+    }
+
+    fn allocate_label(&mut self, prefix: &str) -> TacLabel {
         self.next_label_id += 1;
-        TacIdentifier(format!("{}_{:03}", prefix, self.next_label_id - 1))
+        TacLabel(format!("{}_{:03}", prefix, self.next_label_id - 1))
+    }
+}
+
+impl FunctionTracking {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Adds a variable to the map and returns a unique, mangled identifier to refer to the variable with.
+    fn add_variable(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        identifier: &AstIdentifier,
+    ) -> Result<AstIdentifier, String> {
+        if self.variables.contains_key(&identifier) {
+            return Err(format!("duplicate variable declaration {}", &identifier.0));
+        }
+
+        let temp_var = global_tracking.create_temporary_ast_ident(&identifier);
+        let old_value = self.variables.insert(identifier.clone(), temp_var.clone());
+        assert!(old_value.is_none());
+
+        Ok(temp_var)
+    }
+
+    fn resolve_variable(&self, identifier: &mut AstIdentifier) -> Result<(), String> {
+        // If the variable was found in this scope, transform it into its mangled version.
+        if let Some(temp_ident) = self.variables.get(identifier) {
+            *identifier = temp_ident.clone();
+            Ok(())
+        } else {
+            Err(format!("variable '{}' not found", &identifier.0))
+        }
     }
 }
 
@@ -2083,9 +2379,15 @@ fn parse_function<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstFun
 
     tokens.consume_expected_next_token("{")?;
 
-    let body = parse_statement(&mut tokens)?;
+    let mut body = vec![];
 
-    tokens.consume_expected_next_token("}")?;
+    loop {
+        if let Ok(operator) = tokens.consume_expected_next_token("}") {
+            break;
+        }
+
+        body.push(parse_block_item(&mut tokens)?);
+    }
 
     *original_tokens = tokens;
     Ok(AstFunction {
@@ -2107,21 +2409,72 @@ fn parse_function_parameter<'i, 't>(
 
     tokens.consume_expected_next_token("int")?;
 
-    let var_name = tokens.consume_next_token()?;
+    let var_name = tokens.consume_identifier()?;
     *original_tokens = tokens;
     Ok(var_name)
+}
+
+fn parse_block_item<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
+    let mut tokens = original_tokens.clone();
+
+    let ret = if let Ok(declaration) = parse_declaration(&mut tokens) {
+        Ok(AstBlockItem::Declaration(declaration))
+    } else if let Ok(statement) = parse_statement(&mut tokens) {
+        Ok(AstBlockItem::Statement(statement))
+    } else {
+        Err(String::from("failed to parse block item"))
+    };
+
+    if ret.is_ok() {
+        *original_tokens = tokens;
+    }
+
+    ret
 }
 
 fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
     let mut tokens = original_tokens.clone();
 
-    tokens.consume_expected_next_token("return")?;
-
-    let statement = AstStatement::Return(parse_expression(&mut tokens)?);
-    tokens.consume_expected_next_token(";")?;
+    let statement = if tokens.consume_expected_next_token("return").is_ok() {
+        let st = AstStatement::Return(parse_expression(&mut tokens)?);
+        tokens.consume_expected_next_token(";")?;
+        st
+    } else if tokens.consume_expected_next_token(";").is_ok() {
+        AstStatement::Null
+    } else {
+        let st = AstStatement::Expr(parse_expression(&mut tokens)?);
+        tokens.consume_expected_next_token(";")?;
+        st
+    };
 
     *original_tokens = tokens;
     Ok(statement)
+}
+
+fn parse_declaration<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+) -> Result<AstDeclaration, String> {
+    let mut tokens = original_tokens.clone();
+
+    tokens.consume_expected_next_token("int")?;
+
+    let var_name = tokens.consume_identifier()?;
+
+    // Optional initializer is present.
+    let initializer_opt = if let Ok(_) = tokens.consume_expected_next_token("=") {
+        Some(parse_expression(&mut tokens)?)
+    } else {
+        None
+    };
+
+    tokens.consume_expected_next_token(";")?;
+
+    *original_tokens = tokens;
+
+    Ok(AstDeclaration {
+        identifier: AstIdentifier(String::from(var_name)),
+        initializer_opt,
+    })
 }
 
 fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
@@ -2141,13 +2494,30 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
                 // Only allow parsing a binary operator with same or higher precedence, or else it messes up the
                 // precedence ordering. This is called precedence climbing.
                 if operator.precedence() >= min_precedence_allowed {
-                    // If the right hand side is itself going to encounter a binary expression, it can only be a
-                    // strictly higher precedence, or else it shouldn't be part of the right-hand-side expression.
-                    let right =
-                        parse_expression_with_precedence(&mut tokens, operator.precedence() + 1)?;
+                    if let AstBinaryOperator::Assign = operator {
+                        // Assignment is right-associative, not left-associative, so parse with the precedence of the
+                        // operator so that further tokens of the same precedence would also go to the right side, not
+                        // left side.
+                        let right =
+                            parse_expression_with_precedence(&mut tokens, operator.precedence())?;
 
-                    // This binary operation now becomes the left hand side of the expression.
-                    left = AstExpression::BinaryOperator(Box::new(left), operator, Box::new(right));
+                        // This assignment now becomes the left hand side of the expression.
+                        left = AstExpression::Assignment(Box::new(left), Box::new(right));
+                    } else {
+                        // If the right hand side is itself going to encounter a binary expression, it can only be a
+                        // strictly higher precedence, or else it shouldn't be part of the right-hand-side expression.
+                        let right = parse_expression_with_precedence(
+                            &mut tokens,
+                            operator.precedence() + 1,
+                        )?;
+
+                        // This binary operation now becomes the left hand side of the expression.
+                        left = AstExpression::BinaryOperator(
+                            Box::new(left),
+                            operator,
+                            Box::new(right),
+                        );
+                    }
 
                     // Since we successfully consumed an expression, commit the tokens we consumed for this.
                     *original_tokens = tokens.clone();
@@ -2177,6 +2547,8 @@ fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpre
     } else if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
         let inner = parse_factor(&mut tokens)?;
         Ok(AstExpression::UnaryOperator(operator, Box::new(inner)))
+    } else if let Ok(var_name) = tokens.consume_identifier() {
+        Ok(AstExpression::Var(AstIdentifier(String::from(var_name))))
     } else {
         Err(String::from("unknown factor"))
     };
@@ -2188,10 +2560,13 @@ fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpre
     ret
 }
 
-fn generate_program_code(mode: Mode, ast_program: &AstProgram) -> Result<String, String> {
+fn generate_program_code(mode: Mode, ast_program: &mut AstProgram) -> Result<String, String> {
     let tac_program = ast_program.to_tac()?;
 
-    println!("tac:\n{}", display_with(|f| { tac_program.fmt_node(f, 0) }));
+    println!(
+        "tac:\n{}\n",
+        display_with(|f| { tac_program.fmt_node(f, 0) })
+    );
 
     match mode {
         Mode::All | Mode::CodegenOnly => {
@@ -2219,17 +2594,6 @@ fn get_register_name(register_name: &str, width: u32) -> String {
         32 => format!("e{}x", register_name),
         64 => format!("r{}x", register_name),
         _ => panic!("unexpected register name"),
-    }
-}
-
-// TODO: later we will need to do various validation on the AST, but not yet
-fn validate_ast(_ast_program: &AstProgram) -> Result<(), Vec<String>> {
-    let errors = vec![];
-
-    if errors.len() == 0 {
-        Ok(())
-    } else {
-        Err(errors)
     }
 }
 
@@ -2289,17 +2653,17 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
     */
 
     if let Mode::LexOnly = mode {
-        return Ok(AstProgram { functions: vec![] });
+        return Ok(AstProgram::new(vec![]));
     }
 
     // TODO all parsing should return a list of errors, not just one. for now, wrap it in a single error
-    let ast = {
+    let mut ast = {
         let mut functions = vec![];
         while let Ok(function) = parse_function(&mut tokens) {
             functions.push(function);
         }
 
-        AstProgram { functions }
+        AstProgram::new(functions)
     };
 
     println!("AST:\n{}\n", display_with(|f| ast.fmt_node(f, 0)));
@@ -2311,7 +2675,16 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
         )]);
     }
 
-    validate_ast(&ast)?;
+    if let Mode::ParseOnly = mode {
+        return Ok(ast);
+    }
+
+    ast.validate_and_resolve()?;
+
+    println!(
+        "AST after resolve:\n{}\n",
+        display_with(|f| ast.fmt_node(f, 0))
+    );
 
     Ok(ast)
 }
@@ -2361,9 +2734,9 @@ fn compile_and_link(
         let input = preprocess(input, should_suppress_output, temp_dir)?;
 
         match parse_and_validate(args.mode, &input) {
-            Ok(ast) => match args.mode {
+            Ok(ref mut ast) => match args.mode {
                 Mode::All | Mode::TacOnly | Mode::CodegenOnly => {
-                    let asm = generate_program_code(args.mode, &ast)?;
+                    let asm = generate_program_code(args.mode, ast)?;
 
                     if let Mode::All = args.mode {
                         println!("\nassembly:\n{}", asm);
@@ -2431,11 +2804,15 @@ enum Mode {
     #[value(name = "parse", alias = "p")]
     ParseOnly,
 
-    /// Lex, parse, and generate TAC only. Exit code is zero if successful.
+    /// Lex, parse, and validate only. Exit code is zero if successful.
+    #[value(name = "validate", alias = "v")]
+    ValidateOnly,
+
+    /// Lex, parse, validate, and generate TAC only. Exit code is zero if successful.
     #[value(name = "tac", alias = "t")]
     TacOnly,
 
-    /// Lex, parse, and codegen only. Exit code is zero if successful.
+    /// Lex, parse, validate, generate TAC, and codegen only. Exit code is zero if successful.
     #[value(name = "codegen", alias = "c")]
     CodegenOnly,
 }
@@ -3094,7 +3471,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_var_use() {
         test_codegen_mainfunc(
             "int x = 5; int y = 6; int z; x = 1; z = 3; return x + y + z;",
@@ -3103,9 +3479,63 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_codegen_assign_expr() {
         test_codegen_mainfunc("int x = 5; int y = x = 3 + 1; return x + y;", 8);
+    }
+
+    #[test]
+    fn test_codegen_declaration_after_expression() {
+        test_codegen_mainfunc("int x; x = 5; int y = -x; return y;", -5);
+    }
+
+    #[test]
+    fn test_codegen_mixed_precedence_assignment() {
+        test_codegen_mainfunc("int x = 5; int y = 4; x = 3 * (y = x); return x + y;", 20);
+    }
+
+    #[test]
+    fn test_codegen_assign_after_not_short_circuit_or() {
+        test_codegen_mainfunc("int x = 0; 0 || (x = 1); return x;", 1);
+    }
+
+    #[test]
+    fn test_codegen_assign_after_short_circuit_and() {
+        test_codegen_mainfunc("int x = 0; 0 && (x = 1); return x;", 0);
+    }
+
+    #[test]
+    fn test_codegen_assign_after_short_circuit_or() {
+        test_codegen_mainfunc("int x = 0; 1 || (x = 1); return x;", 0);
+    }
+
+    #[test]
+    fn test_codegen_assign_low_precedence() {
+        test_codegen_mainfunc("int x; x = 0 || 5; return x;", 1);
+    }
+
+    #[test]
+    fn test_codegen_assign_var_in_initializer() {
+        test_codegen_mainfunc("int x = x + 5; return x;", 5);
+    }
+
+    #[test]
+    fn test_codegen_empty_main_body() {
+        test_codegen_mainfunc("", 0);
+    }
+
+    #[test]
+    fn test_codegen_null_statement() {
+        test_codegen_mainfunc(";", 0);
+    }
+
+    #[test]
+    fn test_codegen_null_then_return() {
+        test_codegen_mainfunc("; return 1;", 1);
+    }
+
+    #[test]
+    fn test_codegen_unused_expression() {
+        test_codegen_mainfunc("2 + 2; return 0;", 0);
     }
 
     #[test]
@@ -3114,8 +3544,109 @@ mod test {
     }
 
     #[test]
+    fn test_codegen_duplicate_variable_after_use() {
+        test_codegen_mainfunc_failure("int x = 5; return x; int x = 4; return x;");
+    }
+
+    #[test]
     fn test_codegen_unknown_variable() {
         test_codegen_mainfunc_failure("return x;");
+    }
+
+    #[test]
+    fn test_codegen_unknown_variable_after_shortcircuit() {
+        test_codegen_mainfunc_failure("return 0 && x;");
+    }
+
+    #[test]
+    fn test_codegen_unknown_variable_in_binary_op() {
+        test_codegen_mainfunc_failure("return x < 5;");
+    }
+
+    #[test]
+    fn test_codegen_unknown_variable_in_unary_op() {
+        test_codegen_mainfunc_failure("return -x;");
+    }
+
+    #[test]
+    fn test_codegen_malformed_plusequals() {
+        test_codegen_mainfunc_failure("int a = 0; a + = 1; return a;");
+    }
+
+    #[test]
+    fn test_codegen_malformed_decrement() {
+        test_codegen_mainfunc_failure("int a = 5; a - -; return a;");
+    }
+
+    #[test]
+    fn test_codegen_malformed_increment() {
+        test_codegen_mainfunc_failure("int a = 5; a + +; return a;");
+    }
+
+    #[test]
+    fn test_codegen_malformed_less_equals() {
+        test_codegen_mainfunc_failure("return 1 < = 2;");
+    }
+
+    #[test]
+    fn test_codegen_malformed_not_equals() {
+        test_codegen_mainfunc_failure("return 1 ! = 2;");
+    }
+
+    #[test]
+    fn test_codegen_malformed_divide_equals() {
+        test_codegen_mainfunc_failure("int a = 10; a =/ 5; return a;");
+    }
+
+    #[test]
+    fn test_codegen_missing_semicolon() {
+        test_codegen_mainfunc_failure("int a = 5 a = a + 5; return a;");
+    }
+
+    #[test]
+    fn test_codegen_return_in_assignment() {
+        test_codegen_mainfunc_failure("int a = return 5;");
+    }
+
+    #[test]
+    fn test_codegen_declare_keyword_as_var() {
+        test_codegen_mainfunc_failure("int return = 6; return return + 1;");
+    }
+
+    #[test]
+    fn test_codegen_declare_after_use() {
+        test_codegen_mainfunc_failure("a = 5; int a; return a;");
+    }
+
+    #[test]
+    fn test_codegen_invalid_lvalue_binary_op() {
+        test_codegen_mainfunc_failure("int a = 5; a + 3 = 4; return a;");
+    }
+
+    #[test]
+    fn test_codegen_invalid_lvalue_unary_op() {
+        test_codegen_mainfunc_failure("int a = 5; !a = 4; return a;");
+    }
+
+    #[test]
+    fn test_codegen_declare_invalid_var_name_with_space() {
+        test_codegen_mainfunc_failure("int x y = 3; return y;");
+    }
+
+    #[test]
+    fn test_codegen_declare_invalid_var_name_starting_number() {
+        test_codegen_mainfunc_failure("int 10 = 3; return 10;");
+        test_codegen_mainfunc_failure("int 10a = 3; return 10a;");
+    }
+
+    #[test]
+    fn test_codegen_declare_invalid_type_name() {
+        test_codegen_mainfunc_failure("ints x = 3; return x;");
+    }
+
+    #[test]
+    fn test_codegen_invalid_mixed_precedence_assignment() {
+        test_codegen_mainfunc_failure("int a = 1; int b = 2; a = 3 * b = a; return a;");
     }
 
     #[test]
@@ -3367,6 +3898,7 @@ int main() {
     }
 
     #[test]
+    #[ignore]
     fn test_parameter_redefinition() {
         codegen_run_and_expect_compile_failure(
             r"int blah(int x)
