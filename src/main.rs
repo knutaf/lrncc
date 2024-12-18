@@ -261,7 +261,7 @@ enum AstExpression {
     UnaryOperator(AstUnaryOperator, Box<AstExpression>),
     BinaryOperator(Box<AstExpression>, AstBinaryOperator, Box<AstExpression>),
     Var(AstIdentifier),
-    Assignment(Box<AstExpression>, Box<AstExpression>),
+    Assignment(Box<AstExpression>, AstBinaryOperator, Box<AstExpression>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -292,6 +292,16 @@ enum AstBinaryOperator {
     GreaterThan,
     GreaterOrEqual,
     Assign,
+    AddAssign,
+    SubtractAssign,
+    MultiplyAssign,
+    DivideAssign,
+    ModulusAssign,
+    BitwiseAndAssign,
+    BitwiseOrAssign,
+    BitwiseXorAssign,
+    ShiftLeftAssign,
+    ShiftRightAssign,
 }
 
 #[derive(Debug)]
@@ -718,6 +728,16 @@ impl AstBinaryOperator {
     fn precedence(&self) -> u8 {
         match self {
             AstBinaryOperator::Assign => 0,
+            AstBinaryOperator::AddAssign => 0,
+            AstBinaryOperator::SubtractAssign => 0,
+            AstBinaryOperator::MultiplyAssign => 0,
+            AstBinaryOperator::DivideAssign => 0,
+            AstBinaryOperator::ModulusAssign => 0,
+            AstBinaryOperator::BitwiseAndAssign => 0,
+            AstBinaryOperator::BitwiseOrAssign => 0,
+            AstBinaryOperator::BitwiseXorAssign => 0,
+            AstBinaryOperator::ShiftLeftAssign => 0,
+            AstBinaryOperator::ShiftRightAssign => 0,
             AstBinaryOperator::Or => 1,
             AstBinaryOperator::And => 2,
             AstBinaryOperator::BitwiseOr => 3,
@@ -751,7 +771,19 @@ impl AstBinaryOperator {
             AstBinaryOperator::BitwiseXor => TacBinaryOperator::BitwiseXor,
             AstBinaryOperator::ShiftLeft => TacBinaryOperator::ShiftLeft,
             AstBinaryOperator::ShiftRight => TacBinaryOperator::ShiftRight,
-            AstBinaryOperator::And | AstBinaryOperator::Or | AstBinaryOperator::Assign => {
+            AstBinaryOperator::And
+            | AstBinaryOperator::Or
+            | AstBinaryOperator::Assign
+            | AstBinaryOperator::AddAssign
+            | AstBinaryOperator::SubtractAssign
+            | AstBinaryOperator::MultiplyAssign
+            | AstBinaryOperator::DivideAssign
+            | AstBinaryOperator::ModulusAssign
+            | AstBinaryOperator::BitwiseAndAssign
+            | AstBinaryOperator::BitwiseOrAssign
+            | AstBinaryOperator::BitwiseXorAssign
+            | AstBinaryOperator::ShiftLeftAssign
+            | AstBinaryOperator::ShiftRightAssign => {
                 panic!("should have been handled elsewhere")
             }
             AstBinaryOperator::Equal => TacBinaryOperator::Equal,
@@ -760,6 +792,42 @@ impl AstBinaryOperator {
             AstBinaryOperator::LessOrEqual => TacBinaryOperator::LessOrEqual,
             AstBinaryOperator::GreaterThan => TacBinaryOperator::GreaterThan,
             AstBinaryOperator::GreaterOrEqual => TacBinaryOperator::GreaterOrEqual,
+        }
+    }
+
+    fn get_base_binary_op_from_compound_op(&self) -> AstBinaryOperator {
+        match self {
+            AstBinaryOperator::AddAssign => AstBinaryOperator::Add,
+            AstBinaryOperator::SubtractAssign => AstBinaryOperator::Subtract,
+            AstBinaryOperator::MultiplyAssign => AstBinaryOperator::Multiply,
+            AstBinaryOperator::DivideAssign => AstBinaryOperator::Divide,
+            AstBinaryOperator::ModulusAssign => AstBinaryOperator::Modulus,
+            AstBinaryOperator::BitwiseAndAssign => AstBinaryOperator::BitwiseAnd,
+            AstBinaryOperator::BitwiseOrAssign => AstBinaryOperator::BitwiseOr,
+            AstBinaryOperator::BitwiseXorAssign => AstBinaryOperator::BitwiseXor,
+            AstBinaryOperator::ShiftLeftAssign => AstBinaryOperator::ShiftLeft,
+            AstBinaryOperator::ShiftRightAssign => AstBinaryOperator::ShiftRight,
+            AstBinaryOperator::Assign
+            | AstBinaryOperator::Or
+            | AstBinaryOperator::And
+            | AstBinaryOperator::BitwiseOr
+            | AstBinaryOperator::BitwiseXor
+            | AstBinaryOperator::BitwiseAnd
+            | AstBinaryOperator::Equal
+            | AstBinaryOperator::NotEqual
+            | AstBinaryOperator::LessThan
+            | AstBinaryOperator::LessOrEqual
+            | AstBinaryOperator::GreaterThan
+            | AstBinaryOperator::GreaterOrEqual
+            | AstBinaryOperator::ShiftLeft
+            | AstBinaryOperator::ShiftRight
+            | AstBinaryOperator::Add
+            | AstBinaryOperator::Subtract
+            | AstBinaryOperator::Multiply
+            | AstBinaryOperator::Divide
+            | AstBinaryOperator::Modulus => {
+                panic!("shouldn't be called for non-compound-assignments")
+            }
         }
     }
 }
@@ -786,6 +854,16 @@ impl FmtNode for AstBinaryOperator {
             AstBinaryOperator::GreaterThan => ">",
             AstBinaryOperator::GreaterOrEqual => ">=",
             AstBinaryOperator::Assign => "=",
+            AstBinaryOperator::AddAssign => "+=",
+            AstBinaryOperator::SubtractAssign => "-=",
+            AstBinaryOperator::MultiplyAssign => "*=",
+            AstBinaryOperator::DivideAssign => "/=",
+            AstBinaryOperator::ModulusAssign => "%=",
+            AstBinaryOperator::BitwiseAndAssign => "&=",
+            AstBinaryOperator::BitwiseOrAssign => "|=",
+            AstBinaryOperator::BitwiseXorAssign => "^=",
+            AstBinaryOperator::ShiftLeftAssign => "<<=",
+            AstBinaryOperator::ShiftRightAssign => ">>=",
         })
     }
 }
@@ -813,6 +891,16 @@ impl std::str::FromStr for AstBinaryOperator {
             ">" => Ok(AstBinaryOperator::GreaterThan),
             ">=" => Ok(AstBinaryOperator::GreaterOrEqual),
             "=" => Ok(AstBinaryOperator::Assign),
+            "+=" => Ok(AstBinaryOperator::AddAssign),
+            "-=" => Ok(AstBinaryOperator::SubtractAssign),
+            "*=" => Ok(AstBinaryOperator::MultiplyAssign),
+            "/=" => Ok(AstBinaryOperator::DivideAssign),
+            "%=" => Ok(AstBinaryOperator::ModulusAssign),
+            "&=" => Ok(AstBinaryOperator::BitwiseAndAssign),
+            "|=" => Ok(AstBinaryOperator::BitwiseOrAssign),
+            "^=" => Ok(AstBinaryOperator::BitwiseXorAssign),
+            "<<=" => Ok(AstBinaryOperator::ShiftLeftAssign),
+            ">>=" => Ok(AstBinaryOperator::ShiftRightAssign),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -835,7 +923,7 @@ impl AstExpression {
             AstExpression::Var(ref mut ast_ident) => {
                 function_tracking.resolve_variable(ast_ident)?;
             }
-            AstExpression::Assignment(ast_exp_left, ast_exp_right) => {
+            AstExpression::Assignment(ast_exp_left, _operator, ast_exp_right) => {
                 let AstExpression::Var(_) = **ast_exp_left else {
                     return Err(format!(
                         "{} is not an lvalue",
@@ -938,19 +1026,19 @@ impl AstExpression {
                 TacVal::Var(tempvar)
             }
             AstExpression::BinaryOperator(ast_exp_left, ast_binary_op, ast_exp_right) => {
-                let tac_exp_left_var = ast_exp_left.to_tac(global_tracking, instructions)?;
-                let tac_exp_right_var = ast_exp_right.to_tac(global_tracking, instructions)?;
+                let tac_exp_left_val = ast_exp_left.to_tac(global_tracking, instructions)?;
+                let tac_exp_right_val = ast_exp_right.to_tac(global_tracking, instructions)?;
                 let tempvar = global_tracking.allocate_temporary();
                 instructions.push(TacInstruction::BinaryOp(
-                    tac_exp_left_var,
+                    tac_exp_left_val,
                     ast_binary_op.to_tac(),
-                    tac_exp_right_var,
+                    tac_exp_right_val,
                     tempvar.clone(),
                 ));
                 TacVal::Var(tempvar)
             }
             AstExpression::Var(ast_ident) => TacVal::Var(ast_ident.to_tac()),
-            AstExpression::Assignment(ast_exp_left, ast_exp_right) => {
+            AstExpression::Assignment(ast_exp_left, ast_binary_op, ast_exp_right) => {
                 let tac_exp_left_val = ast_exp_left.to_tac(global_tracking, instructions)?;
 
                 let TacVal::Var(ref tac_exp_left_var) = tac_exp_left_val else {
@@ -959,10 +1047,22 @@ impl AstExpression {
 
                 let tac_exp_right_val = ast_exp_right.to_tac(global_tracking, instructions)?;
 
-                instructions.push(TacInstruction::CopyVal(
-                    tac_exp_right_val,
-                    tac_exp_left_var.clone(),
-                ));
+                // Straight assignment with just the = operator is a simple copy.
+                if let AstBinaryOperator::Assign = ast_binary_op {
+                    instructions.push(TacInstruction::CopyVal(
+                        tac_exp_right_val,
+                        tac_exp_left_var.clone(),
+                    ));
+                } else {
+                    // This is a compound assignment like +=. So we have to do the binary operation, and the output can
+                    // be the left hand side variable.
+                    instructions.push(TacInstruction::BinaryOp(
+                        tac_exp_left_val.clone(),
+                        ast_binary_op.get_base_binary_op_from_compound_op().to_tac(),
+                        tac_exp_right_val,
+                        tac_exp_left_var.clone(),
+                    ));
+                }
 
                 tac_exp_left_val
             }
@@ -990,10 +1090,12 @@ impl FmtNode for AstExpression {
             AstExpression::Var(ident) => {
                 f.write_str(&ident.0)?;
             }
-            AstExpression::Assignment(left, right) => {
+            AstExpression::Assignment(left, operator, right) => {
                 write!(f, "(")?;
                 left.fmt_node(f, 0)?;
-                write!(f, " = ")?;
+                write!(f, " ")?;
+                operator.fmt_node(f, 0)?;
+                write!(f, " ")?;
                 right.fmt_node(f, 0)?;
                 write!(f, ")")?;
             }
@@ -2286,6 +2388,8 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^\/\/[^\n]*").expect("failed to compile regex"),
         ];
         static ref TOKEN_REGEXES: Vec<regex::Regex> = vec![
+            Regex::new(r"^>>=").expect("failed to compile regex"),
+            Regex::new(r"^<<=").expect("failed to compile regex"),
             Regex::new(r"^&&").expect("failed to compile regex"),
             Regex::new(r"^\|\|").expect("failed to compile regex"),
             Regex::new(r"^==").expect("failed to compile regex"),
@@ -2296,6 +2400,14 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^\+\+").expect("failed to compile regex"),
             Regex::new(r"^<<").expect("failed to compile regex"),
             Regex::new(r"^>>").expect("failed to compile regex"),
+            Regex::new(r"^\+=").expect("failed to compile regex"),
+            Regex::new(r"^-=").expect("failed to compile regex"),
+            Regex::new(r"^\*=").expect("failed to compile regex"),
+            Regex::new(r"^/=").expect("failed to compile regex"),
+            Regex::new(r"^%=").expect("failed to compile regex"),
+            Regex::new(r"^&=").expect("failed to compile regex"),
+            Regex::new(r"^\|=").expect("failed to compile regex"),
+            Regex::new(r"^\^=").expect("failed to compile regex"),
             Regex::new(r"^\{").expect("failed to compile regex"),
             Regex::new(r"^\}").expect("failed to compile regex"),
             Regex::new(r"^\(").expect("failed to compile regex"),
@@ -2494,29 +2606,48 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
                 // Only allow parsing a binary operator with same or higher precedence, or else it messes up the
                 // precedence ordering. This is called precedence climbing.
                 if operator.precedence() >= min_precedence_allowed {
-                    if let AstBinaryOperator::Assign = operator {
-                        // Assignment is right-associative, not left-associative, so parse with the precedence of the
-                        // operator so that further tokens of the same precedence would also go to the right side, not
-                        // left side.
-                        let right =
-                            parse_expression_with_precedence(&mut tokens, operator.precedence())?;
+                    match operator {
+                        AstBinaryOperator::Assign
+                        | AstBinaryOperator::AddAssign
+                        | AstBinaryOperator::SubtractAssign
+                        | AstBinaryOperator::MultiplyAssign
+                        | AstBinaryOperator::DivideAssign
+                        | AstBinaryOperator::ModulusAssign
+                        | AstBinaryOperator::BitwiseAndAssign
+                        | AstBinaryOperator::BitwiseOrAssign
+                        | AstBinaryOperator::BitwiseXorAssign
+                        | AstBinaryOperator::ShiftLeftAssign
+                        | AstBinaryOperator::ShiftRightAssign => {
+                            // Assignment is right-associative, not left-associative, so parse with the precedence of the
+                            // operator so that further tokens of the same precedence would also go to the right side, not
+                            // left side.
+                            let right = parse_expression_with_precedence(
+                                &mut tokens,
+                                operator.precedence(),
+                            )?;
 
-                        // This assignment now becomes the left hand side of the expression.
-                        left = AstExpression::Assignment(Box::new(left), Box::new(right));
-                    } else {
-                        // If the right hand side is itself going to encounter a binary expression, it can only be a
-                        // strictly higher precedence, or else it shouldn't be part of the right-hand-side expression.
-                        let right = parse_expression_with_precedence(
-                            &mut tokens,
-                            operator.precedence() + 1,
-                        )?;
+                            // This assignment now becomes the left hand side of the expression.
+                            left = AstExpression::Assignment(
+                                Box::new(left),
+                                operator,
+                                Box::new(right),
+                            );
+                        }
+                        _ => {
+                            // If the right hand side is itself going to encounter a binary expression, it can only be a
+                            // strictly higher precedence, or else it shouldn't be part of the right-hand-side expression.
+                            let right = parse_expression_with_precedence(
+                                &mut tokens,
+                                operator.precedence() + 1,
+                            )?;
 
-                        // This binary operation now becomes the left hand side of the expression.
-                        left = AstExpression::BinaryOperator(
-                            Box::new(left),
-                            operator,
-                            Box::new(right),
-                        );
+                            // This binary operation now becomes the left hand side of the expression.
+                            left = AstExpression::BinaryOperator(
+                                Box::new(left),
+                                operator,
+                                Box::new(right),
+                            );
+                        }
                     }
 
                     // Since we successfully consumed an expression, commit the tokens we consumed for this.
@@ -3006,7 +3137,10 @@ mod test {
     }
 
     fn test_codegen_mainfunc(body: &str, expected_exit_code: i32) {
-        codegen_run_and_check_exit_code(&format!("int main() {{ {} }}", body), expected_exit_code);
+        codegen_run_and_check_exit_code(
+            &format!("int main() {{\n{}\n}}", body),
+            expected_exit_code,
+        );
     }
 
     fn test_codegen_mainfunc_failure(body: &str) {
@@ -3152,8 +3286,23 @@ mod test {
         }
 
         #[test]
+        fn unknown_variable_in_bitwise_op() {
+            test_codegen_mainfunc_failure("return a >> 2;");
+        }
+
+        #[test]
         fn unknown_variable_in_unary_op() {
             test_codegen_mainfunc_failure("return -x;");
+        }
+
+        #[test]
+        fn unknown_variable_lhs_compound_assignment() {
+            test_codegen_mainfunc_failure("a += 1; return 0;");
+        }
+
+        #[test]
+        fn unknown_variable_rhs_compound_assignment() {
+            test_codegen_mainfunc_failure("int b = 10; b *= a; return 0;");
         }
 
         #[test]
@@ -3235,6 +3384,21 @@ mod test {
         #[test]
         fn invalid_mixed_precedence_assignment() {
             test_codegen_mainfunc_failure("int a = 1; int b = 2; a = 3 * b = a; return a;");
+        }
+
+        #[test]
+        fn compound_initializer() {
+            test_codegen_mainfunc_failure("int a += 0; return a;");
+        }
+
+        #[test]
+        fn invalid_unary_lvalue() {
+            test_codegen_mainfunc_failure("int a = 0; -a += 1; return a;");
+        }
+
+        #[test]
+        fn invalid_compound_lvalue() {
+            test_codegen_mainfunc_failure("int a = 10; (a += 1) -= 2;");
         }
     }
 
@@ -3655,6 +3819,178 @@ mod test {
     #[test]
     fn unused_expression() {
         test_codegen_mainfunc("2 + 2; return 0;", 0);
+    }
+
+    #[test]
+    fn bitwise_in_initializer() {
+        test_codegen_mainfunc(
+            r"
+    int a = 15;
+    int b = a ^ 5;  // 10
+    return 1 | b;   // 11",
+            11,
+        );
+    }
+
+    #[test]
+    fn bitwise_ops_vars() {
+        test_codegen_mainfunc("int a = 3; int b = 5; int c = 8; return a & b | c;", 9);
+    }
+
+    #[test]
+    fn bitwise_shl_var() {
+        test_codegen_mainfunc("int x = 3; return x << 3;", 24);
+    }
+
+    #[test]
+    fn bitwise_sar_assign() {
+        test_codegen_mainfunc(
+            "int var_to_shift = 1234; int x = 0; x = var_to_shift >> 4; return x;",
+            77,
+        );
+    }
+
+    #[test]
+    fn compound_bitwise_and() {
+        test_codegen_mainfunc("int to_and = 3; to_and &= 6; return to_and;", 2);
+    }
+
+    #[test]
+    fn compound_bitwise_or() {
+        test_codegen_mainfunc("int to_or = 1; to_or |= 30; return to_or;", 31);
+    }
+
+    #[test]
+    fn compound_bitwise_shl() {
+        test_codegen_mainfunc("int to_shiftl = 3; to_shiftl <<= 4; return to_shiftl;", 48);
+    }
+
+    #[test]
+    fn compound_bitwise_sar() {
+        test_codegen_mainfunc(
+            "int to_shiftr = 382574; to_shiftr >>= 4; return to_shiftr;",
+            23910,
+        );
+    }
+
+    #[test]
+    fn compound_bitwise_xor() {
+        test_codegen_mainfunc("int to_xor = 7; to_xor ^= 5; return to_xor;", 2);
+    }
+
+    #[test]
+    fn compound_div() {
+        test_codegen_mainfunc("int to_divide = 8; to_divide /= 4; return to_divide;", 2);
+    }
+
+    #[test]
+    fn compound_subtract() {
+        test_codegen_mainfunc(
+            "int to_subtract = 10; to_subtract -= 8; return to_subtract;",
+            2,
+        );
+    }
+
+    #[test]
+    fn compound_mod() {
+        test_codegen_mainfunc("int to_mod = 5; to_mod %= 3; return to_mod;", 2);
+    }
+
+    #[test]
+    fn compound_mult() {
+        test_codegen_mainfunc(
+            "int to_multiply = 4; to_multiply *= 3; return to_multiply;",
+            12,
+        );
+    }
+
+    #[test]
+    fn compound_add() {
+        test_codegen_mainfunc("int to_add = 0; to_add += 4; return to_add;", 4);
+    }
+
+    #[test]
+    fn compound_assignment_chained() {
+        test_codegen_mainfunc(
+            r"
+    int a = 250;
+    int b = 200;
+    int c = 100;
+    int d = 75;
+    int e = -25;
+    int f = 0;
+    int x = 0;
+    x = a += b -= c *= d /= e %= f = -7;
+    return a == 2250 && b == 2000 && c == -1800 && d == -18 && e == -4 &&
+           f == -7 && x == 2250;
+           ",
+            1,
+        );
+    }
+
+    #[test]
+    fn compound_bitwise_assignment_chained() {
+        test_codegen_mainfunc(
+            r"
+    int a = 250;
+    int b = 200;
+    int c = 100;
+    int d = 75;
+    int e = 50;
+    int f = 25;
+    int g = 10;
+    int h = 1;
+    int j = 0;
+    int x = 0;
+    x = a &= b *= c |= d = e ^= f += g >>= h <<= j = 1;
+    return (a == 40 && b == 21800 && c == 109 && d == 41 && e == 41 &&
+            f == 27 && g == 2 && h == 2 && j == 1 && x == 40);
+           ",
+            1,
+        );
+    }
+
+    #[test]
+    fn compound_assignment_lowest_precedence() {
+        test_codegen_mainfunc(
+            r"
+    int a = 10;
+    int b = 12;
+    a += 0 || b;  // a = 11
+    b *= a && 0;  // b = 0
+
+    int c = 14;
+    c -= a || b;  // c = 13
+
+    int d = 16;
+    d /= c || d; // d = 16
+    return (a == 11 && b == 0 && c == 13 && d == 16);
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn compound_bitwise_assignment_lowest_precedence() {
+        test_codegen_mainfunc(
+            r"
+    int a = 11;
+    int b = 12;
+    a &= 0 || b;  // a = 1
+    b ^= a || 1;  // b = 13
+
+    int c = 14;
+    c |= a || b;  // c = 15
+
+    int d = 16;
+    d >>= c || d;  // d = 8
+
+    int e = 18;
+    e <<= c || d; // e = 36
+    return (a == 1 && b == 13 && c == 15 && d == 8 && e == 36);
+    ",
+            1,
+        );
     }
 
     #[test]
