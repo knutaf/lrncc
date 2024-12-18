@@ -2859,79 +2859,83 @@ fn main() {
 mod test {
     use super::*;
 
-    #[test]
-    fn lex_simple() {
-        let input = r"int main() {
-    return 2;
-}";
-        assert_eq!(
-            lex_all_tokens(&input),
-            Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
-        );
-    }
+    mod lex {
+        use super::*;
 
-    #[test]
-    fn lex_no_whitespace() {
-        let input = r"int main(){return 2;}";
-        assert_eq!(
-            lex_all_tokens(&input),
-            Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
-        );
-    }
+        #[test]
+        fn simple() {
+            let input = r"int main() {
+        return 2;
+    }";
+            assert_eq!(
+                lex_all_tokens(&input),
+                Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
+            );
+        }
 
-    #[test]
-    fn lex_negative() {
-        assert_eq!(
-            lex_all_tokens("int main() { return -1; }"),
-            Ok(vec![
-                "int", "main", "(", ")", "{", "return", "-", "1", ";", "}"
-            ])
-        );
-    }
+        #[test]
+        fn no_whitespace() {
+            let input = r"int main(){return 2;}";
+            assert_eq!(
+                lex_all_tokens(&input),
+                Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
+            );
+        }
 
-    #[test]
-    fn lex_bitwise_not() {
-        assert_eq!(
-            lex_all_tokens("int main() { return ~1; }"),
-            Ok(vec![
-                "int", "main", "(", ")", "{", "return", "~", "1", ";", "}"
-            ])
-        );
-    }
+        #[test]
+        fn negative() {
+            assert_eq!(
+                lex_all_tokens("int main() { return -1; }"),
+                Ok(vec![
+                    "int", "main", "(", ")", "{", "return", "-", "1", ";", "}"
+                ])
+            );
+        }
 
-    #[test]
-    fn lex_logical_not() {
-        assert_eq!(
-            lex_all_tokens("int main() { return !1; }"),
-            Ok(vec![
-                "int", "main", "(", ")", "{", "return", "!", "1", ";", "}"
-            ])
-        );
-    }
+        #[test]
+        fn bitwise_not() {
+            assert_eq!(
+                lex_all_tokens("int main() { return ~1; }"),
+                Ok(vec![
+                    "int", "main", "(", ")", "{", "return", "~", "1", ";", "}"
+                ])
+            );
+        }
 
-    #[test]
-    fn lex_no_at() {
-        assert!(lex_all_tokens("int main() { return 0@1; }").is_err());
-    }
+        #[test]
+        fn logical_not() {
+            assert_eq!(
+                lex_all_tokens("int main() { return !1; }"),
+                Ok(vec![
+                    "int", "main", "(", ")", "{", "return", "!", "1", ";", "}"
+                ])
+            );
+        }
 
-    #[test]
-    fn lex_no_backslash() {
-        assert!(lex_all_tokens("\\").is_err());
-    }
+        #[test]
+        fn no_at() {
+            assert!(lex_all_tokens("int main() { return 0@1; }").is_err());
+        }
 
-    #[test]
-    fn lex_no_backtick() {
-        assert!(lex_all_tokens("`").is_err());
-    }
+        #[test]
+        fn no_backslash() {
+            assert!(lex_all_tokens("\\").is_err());
+        }
 
-    #[test]
-    fn lex_bad_identifier() {
-        assert!(lex_all_tokens("int main() { return 1foo; }").is_err());
-    }
+        #[test]
+        fn no_backtick() {
+            assert!(lex_all_tokens("`").is_err());
+        }
 
-    #[test]
-    fn lex_no_at_identifier() {
-        assert!(lex_all_tokens("int main() { return @b; }").is_err());
+        #[test]
+        fn bad_identifier() {
+            assert!(lex_all_tokens("int main() { return 1foo; }").is_err());
+        }
+
+        #[test]
+        fn no_at_identifier() {
+            assert!(lex_all_tokens("int main() { return @b; }").is_err());
+        }
     }
 
     fn codegen_run_and_check_exit_code_or_compile_failure(
@@ -2974,7 +2978,7 @@ mod test {
         }
     }
 
-    fn test_validate_error_count(input: &str, expected_error_count: usize) {
+    fn validate_error_count(input: &str, expected_error_count: usize) {
         match parse_and_validate(Mode::All, input) {
             Ok(ast) => {
                 // If parsing succeeded, then the caller should have expected 0 errors.
@@ -3009,263 +3013,378 @@ mod test {
         codegen_run_and_expect_compile_failure(&format!("int main() {{ {} }}", body))
     }
 
+    mod fail {
+        use super::*;
+
+        #[test]
+        fn parse_extra_paren() {
+            test_codegen_mainfunc_failure("return (3));");
+        }
+
+        #[test]
+        fn parse_unclosed_paren() {
+            test_codegen_mainfunc_failure("return (3;");
+        }
+
+        #[test]
+        fn parse_missing_immediate() {
+            test_codegen_mainfunc_failure("return ~;");
+        }
+
+        #[test]
+        fn parse_missing_immediate_2() {
+            test_codegen_mainfunc_failure("return -~;");
+        }
+
+        #[test]
+        fn parse_missing_semicolon() {
+            test_codegen_mainfunc_failure("return 5");
+        }
+
+        #[test]
+        fn parse_missing_semicolon_binary_op() {
+            test_codegen_mainfunc_failure("return 5 + 6");
+        }
+
+        #[test]
+        fn parse_parens_around_operator() {
+            test_codegen_mainfunc_failure("return (-)5;");
+        }
+
+        #[test]
+        fn parse_operator_wrong_order() {
+            test_codegen_mainfunc_failure("return 5-;");
+        }
+
+        #[test]
+        fn parse_double_operator() {
+            test_codegen_mainfunc_failure("return 1 * / 2;");
+        }
+
+        #[test]
+        fn parse_unbalanced_paren() {
+            test_codegen_mainfunc_failure("return 1 + (2;");
+        }
+
+        #[test]
+        fn parse_missing_opening_paren() {
+            test_codegen_mainfunc_failure("return 1 + 2);");
+        }
+
+        #[test]
+        fn parse_unexpected_paren() {
+            test_codegen_mainfunc_failure("return 1 (- 2);");
+        }
+
+        #[test]
+        fn parse_misplaced_semicolon_paren() {
+            test_codegen_mainfunc_failure("return 1 + (2;)");
+        }
+
+        #[test]
+        fn parse_missing_first_binary_operand() {
+            test_codegen_mainfunc_failure("return / 2;");
+        }
+
+        #[test]
+        fn parse_missing_second_binary_operand() {
+            test_codegen_mainfunc_failure("return 2 / ;");
+        }
+
+        #[test]
+        fn parse_relational_missing_first_operand() {
+            test_codegen_mainfunc_failure("return <= 2;");
+        }
+
+        #[test]
+        fn parse_relational_missing_second_operand() {
+            test_codegen_mainfunc_failure("return 1 < > 3;");
+        }
+
+        #[test]
+        fn parse_and_missing_second_operand() {
+            test_codegen_mainfunc_failure("return 2 && ~;");
+        }
+
+        #[test]
+        fn parse_or_missing_semicolon() {
+            test_codegen_mainfunc_failure("return 2 || 4");
+        }
+
+        #[test]
+        fn parse_unary_not_missing_semicolon() {
+            test_codegen_mainfunc_failure("return !10");
+        }
+
+        #[test]
+        fn parse_double_bitwise_or() {
+            test_codegen_mainfunc_failure("return 1 | | 2;");
+        }
+
+        #[test]
+        fn parse_unary_not_missing_operand() {
+            test_codegen_mainfunc_failure("return 10 <= !;");
+        }
+
+        #[test]
+        fn duplicate_variable() {
+            test_codegen_mainfunc_failure("int x = 5; int x = 4; return x;");
+        }
+
+        #[test]
+        fn duplicate_variable_after_use() {
+            test_codegen_mainfunc_failure("int x = 5; return x; int x = 4; return x;");
+        }
+
+        #[test]
+        fn unknown_variable() {
+            test_codegen_mainfunc_failure("return x;");
+        }
+
+        #[test]
+        fn unknown_variable_after_shortcircuit() {
+            test_codegen_mainfunc_failure("return 0 && x;");
+        }
+
+        #[test]
+        fn unknown_variable_in_binary_op() {
+            test_codegen_mainfunc_failure("return x < 5;");
+        }
+
+        #[test]
+        fn unknown_variable_in_unary_op() {
+            test_codegen_mainfunc_failure("return -x;");
+        }
+
+        #[test]
+        fn malformed_plusequals() {
+            test_codegen_mainfunc_failure("int a = 0; a + = 1; return a;");
+        }
+
+        #[test]
+        fn malformed_decrement() {
+            test_codegen_mainfunc_failure("int a = 5; a - -; return a;");
+        }
+
+        #[test]
+        fn malformed_increment() {
+            test_codegen_mainfunc_failure("int a = 5; a + +; return a;");
+        }
+
+        #[test]
+        fn malformed_less_equals() {
+            test_codegen_mainfunc_failure("return 1 < = 2;");
+        }
+
+        #[test]
+        fn malformed_not_equals() {
+            test_codegen_mainfunc_failure("return 1 ! = 2;");
+        }
+
+        #[test]
+        fn malformed_divide_equals() {
+            test_codegen_mainfunc_failure("int a = 10; a =/ 5; return a;");
+        }
+
+        #[test]
+        fn missing_semicolon() {
+            test_codegen_mainfunc_failure("int a = 5 a = a + 5; return a;");
+        }
+
+        #[test]
+        fn return_in_assignment() {
+            test_codegen_mainfunc_failure("int a = return 5;");
+        }
+
+        #[test]
+        fn declare_keyword_as_var() {
+            test_codegen_mainfunc_failure("int return = 6; return return + 1;");
+        }
+
+        #[test]
+        fn declare_after_use() {
+            test_codegen_mainfunc_failure("a = 5; int a; return a;");
+        }
+
+        #[test]
+        fn invalid_lvalue_binary_op() {
+            test_codegen_mainfunc_failure("int a = 5; a + 3 = 4; return a;");
+        }
+
+        #[test]
+        fn invalid_lvalue_unary_op() {
+            test_codegen_mainfunc_failure("int a = 5; !a = 4; return a;");
+        }
+
+        #[test]
+        fn declare_invalid_var_name_with_space() {
+            test_codegen_mainfunc_failure("int x y = 3; return y;");
+        }
+
+        #[test]
+        fn declare_invalid_var_name_starting_number() {
+            test_codegen_mainfunc_failure("int 10 = 3; return 10;");
+            test_codegen_mainfunc_failure("int 10a = 3; return 10a;");
+        }
+
+        #[test]
+        fn declare_invalid_type_name() {
+            test_codegen_mainfunc_failure("ints x = 3; return x;");
+        }
+
+        #[test]
+        fn invalid_mixed_precedence_assignment() {
+            test_codegen_mainfunc_failure("int a = 1; int b = 2; a = 3 * b = a; return a;");
+        }
+    }
+
     #[test]
-    fn test_codegen_unary_neg() {
+    fn unary_neg() {
         test_codegen_expression("-5", -5);
     }
 
     #[test]
-    fn test_codegen_unary_bitnot() {
+    fn unary_bitnot() {
         test_codegen_expression("~12", -13);
     }
 
     #[test]
-    fn test_codegen_unary_not() {
+    fn unary_not() {
         test_codegen_expression("!5", 0);
         test_codegen_expression("!0", 1);
     }
 
     #[test]
-    fn test_codegen_unary_neg_zero() {
+    fn unary_neg_zero() {
         test_codegen_expression("-0", 0);
     }
 
     #[test]
-    fn test_codegen_unary_bitnot_zero() {
+    fn unary_bitnot_zero() {
         test_codegen_expression("~0", -1);
     }
 
     #[test]
-    fn test_codegen_unary_neg_min_val() {
+    fn unary_neg_min_val() {
         test_codegen_expression("-2147483647", -2147483647);
     }
 
     #[test]
-    fn test_codegen_unary_bitnot_and_neg() {
+    fn unary_bitnot_and_neg() {
         test_codegen_expression("~-3", 2);
     }
 
     #[test]
-    fn test_codegen_unary_bitnot_and_neg_zero() {
+    fn unary_bitnot_and_neg_zero() {
         test_codegen_expression("-~0", 1);
     }
 
     #[test]
-    fn test_codegen_unary_bitnot_and_neg_min_val() {
+    fn unary_bitnot_and_neg_min_val() {
         test_codegen_expression("~-2147483647", 2147483646);
     }
 
     #[test]
-    fn test_codegen_unary_grouping_outside() {
+    fn unary_grouping_outside() {
         test_codegen_expression("(-2)", -2);
     }
 
     #[test]
-    fn test_codegen_unary_grouping_inside() {
+    fn unary_grouping_inside() {
         test_codegen_expression("~(2)", -3);
     }
 
     #[test]
-    fn test_codegen_unary_grouping_inside_and_outside() {
+    fn unary_grouping_inside_and_outside() {
         test_codegen_expression("-(-4)", 4);
     }
 
     #[test]
-    fn test_codegen_unary_grouping_several() {
+    fn unary_grouping_several() {
         test_codegen_expression("-((((((10))))))", -10);
     }
 
     #[test]
-    fn test_codegen_unary_not_and_neg() {
+    fn unary_not_and_neg() {
         test_codegen_expression("!-3", 0);
     }
 
     #[test]
-    fn test_codegen_unary_not_and_arithmetic() {
+    fn unary_not_and_arithmetic() {
         test_codegen_expression("!(4-4)", 1);
         test_codegen_expression("!(4 - 5)", 0);
     }
 
     #[test]
-    fn test_parse_fail_extra_paren() {
-        test_codegen_mainfunc_failure("return (3));");
-    }
-
-    #[test]
-    fn test_parse_fail_unclosed_paren() {
-        test_codegen_mainfunc_failure("return (3;");
-    }
-
-    #[test]
-    fn test_parse_fail_missing_immediate() {
-        test_codegen_mainfunc_failure("return ~;");
-    }
-
-    #[test]
-    fn test_parse_fail_missing_immediate_2() {
-        test_codegen_mainfunc_failure("return -~;");
-    }
-
-    #[test]
-    fn test_parse_fail_missing_semicolon() {
-        test_codegen_mainfunc_failure("return 5");
-    }
-
-    #[test]
-    fn test_parse_fail_missing_semicolon_binary_op() {
-        test_codegen_mainfunc_failure("return 5 + 6");
-    }
-
-    #[test]
-    fn test_parse_fail_parens_around_operator() {
-        test_codegen_mainfunc_failure("return (-)5;");
-    }
-
-    #[test]
-    fn test_parse_fail_operator_wrong_order() {
-        test_codegen_mainfunc_failure("return 5-;");
-    }
-
-    #[test]
-    fn test_parse_fail_double_operator() {
-        test_codegen_mainfunc_failure("return 1 * / 2;");
-    }
-
-    #[test]
-    fn test_parse_fail_unbalanced_paren() {
-        test_codegen_mainfunc_failure("return 1 + (2;");
-    }
-
-    #[test]
-    fn test_parse_fail_missing_opening_paren() {
-        test_codegen_mainfunc_failure("return 1 + 2);");
-    }
-
-    #[test]
-    fn test_parse_fail_unexpected_paren() {
-        test_codegen_mainfunc_failure("return 1 (- 2);");
-    }
-
-    #[test]
-    fn test_parse_fail_misplaced_semicolon_paren() {
-        test_codegen_mainfunc_failure("return 1 + (2;)");
-    }
-
-    #[test]
-    fn test_parse_fail_missing_first_binary_operand() {
-        test_codegen_mainfunc_failure("return / 2;");
-    }
-
-    #[test]
-    fn test_parse_fail_missing_second_binary_operand() {
-        test_codegen_mainfunc_failure("return 2 / ;");
-    }
-
-    #[test]
-    fn test_parse_fail_relational_missing_first_operand() {
-        test_codegen_mainfunc_failure("return <= 2;");
-    }
-
-    #[test]
-    fn test_parse_fail_relational_missing_second_operand() {
-        test_codegen_mainfunc_failure("return 1 < > 3;");
-    }
-
-    #[test]
-    fn test_parse_fail_and_missing_second_operand() {
-        test_codegen_mainfunc_failure("return 2 && ~;");
-    }
-
-    #[test]
-    fn test_parse_fail_or_missing_semicolon() {
-        test_codegen_mainfunc_failure("return 2 || 4");
-    }
-
-    #[test]
-    fn test_parse_fail_unary_not_missing_semicolon() {
-        test_codegen_mainfunc_failure("return !10");
-    }
-
-    #[test]
-    fn test_parse_fail_double_bitwise_or() {
-        test_codegen_mainfunc_failure("return 1 | | 2;");
-    }
-
-    #[test]
-    fn test_parse_fail_unary_not_missing_operand() {
-        test_codegen_mainfunc_failure("return 10 <= !;");
-    }
-
-    #[test]
-    fn test_codegen_expression_binary_operation() {
+    fn expression_binary_operation() {
         test_codegen_expression("5 + 6", 11);
     }
 
     #[test]
-    fn test_codegen_expression_negative_divide() {
+    fn expression_negative_divide() {
         test_codegen_expression("-110 / 10", -11);
     }
 
     #[test]
-    fn test_codegen_expression_negative_multiply() {
+    fn expression_negative_multiply() {
         test_codegen_expression("10 * -11", -110);
     }
 
     #[test]
-    fn test_codegen_expression_factors_and_terms() {
+    fn expression_factors_and_terms() {
         test_codegen_expression("(1 + 2 + 3 + 4) * (10 - 21)", -110);
     }
 
     #[test]
-    fn test_codegen_and_false() {
+    fn and_false() {
         test_codegen_expression("(10 && 0) + (0 && 4) + (0 && 0)", 0);
     }
 
     #[test]
-    fn test_codegen_and_true() {
+    fn and_true() {
         test_codegen_expression("1 && -1", 1);
     }
 
     #[test]
-    fn test_codegen_and_shortcircuit() {
+    fn and_shortcircuit() {
         test_codegen_expression("0 && (1 / 0)", 0);
     }
 
     #[test]
-    fn test_codegen_or_shortcircuit() {
+    fn or_shortcircuit() {
         test_codegen_expression("1 || (1 / 0)", 1);
     }
 
     #[test]
-    fn test_codegen_multi_shortcircuit() {
+    fn multi_shortcircuit() {
         test_codegen_expression("0 || 0 && (1 / 0)", 0);
     }
 
     #[test]
-    fn test_codegen_and_or_precedence() {
+    fn and_or_precedence() {
         test_codegen_expression("1 || 0 && 2", 1);
     }
 
     #[test]
-    fn test_codegen_and_or_precedence_2() {
+    fn and_or_precedence_2() {
         test_codegen_expression("(1 || 0) && 0", 0);
     }
 
     #[test]
-    fn test_codegen_relational_lt() {
+    fn relational_lt() {
         test_codegen_expression("1234 < 1234", 0);
         test_codegen_expression("1234 < 1235", 1);
     }
 
     #[test]
-    fn test_codegen_relational_gt() {
+    fn relational_gt() {
         test_codegen_expression("1234 > 1234", 0);
         test_codegen_expression("1234 > 1233", 1);
         test_codegen_expression("(1 > 2) + (1 > 1)", 0);
     }
 
     #[test]
-    fn test_codegen_relational_le() {
+    fn relational_le() {
         test_codegen_expression("1234 <= 1234", 1);
         test_codegen_expression("1234 <= 1233", 0);
         test_codegen_expression("1 <= -1", 0);
@@ -3273,205 +3392,205 @@ mod test {
     }
 
     #[test]
-    fn test_codegen_relational_ge() {
+    fn relational_ge() {
         test_codegen_expression("1234 >= 1234", 1);
         test_codegen_expression("1234 >= 1235", 0);
         test_codegen_expression("(1 >= 1) + (1 >= -4)", 2);
     }
 
     #[test]
-    fn test_codegen_equality_eq() {
+    fn equality_eq() {
         test_codegen_expression("1234 == 1234", 1);
         test_codegen_expression("1234 == 1235", 0);
     }
 
     #[test]
-    fn test_codegen_equality_ne() {
+    fn equality_ne() {
         test_codegen_expression("1234 != 1234", 0);
         test_codegen_expression("1234 != 1235", 1);
     }
 
     #[test]
-    fn test_codegen_logical_and() {
+    fn logical_and() {
         test_codegen_expression("0 && 1 && 2", 0);
         test_codegen_expression("5 && 6 && 7", 1);
         test_codegen_expression("5 && 6 && 0", 0);
     }
 
     #[test]
-    fn test_codegen_logical_or() {
+    fn logical_or() {
         test_codegen_expression("0 || 0 || 1", 1);
         test_codegen_expression("1 || 0 || 0", 1);
         test_codegen_expression("0 || 0 || 0", 0);
     }
 
     #[test]
-    fn test_codegen_equals_precedence() {
+    fn equals_precedence() {
         test_codegen_expression("0 == 0 != 0", 1);
     }
 
     #[test]
-    fn test_codegen_equals_relational_precedence() {
+    fn equals_relational_precedence() {
         test_codegen_expression("2 == 2 >= 0", 0);
     }
 
     #[test]
-    fn test_codegen_equals_or_precedence() {
+    fn equals_or_precedence() {
         test_codegen_expression("2 == 2 || 0", 1);
     }
 
     #[test]
-    fn test_codegen_relational_associativity() {
+    fn relational_associativity() {
         test_codegen_expression("5 >= 0 > 1 <= 0", 1);
     }
 
     #[test]
-    fn test_codegen_compare_arithmetic_results() {
+    fn compare_arithmetic_results() {
         test_codegen_expression("~2 * -2 == 1 + 5", 1);
     }
 
     #[test]
-    fn test_codegen_all_operator_precedence() {
+    fn all_operator_precedence() {
         test_codegen_expression("-1 * -2 + 3 >= 5 == 1 && (6 - 6) || 7", 1);
     }
 
     #[test]
-    fn test_codegen_all_operator_precedence_2() {
+    fn all_operator_precedence_2() {
         test_codegen_expression("(0 == 0 && 3 == 2 + 1 > 1) + 1", 1);
     }
 
     #[test]
-    fn test_codegen_arithmetic_operator_precedence() {
+    fn arithmetic_operator_precedence() {
         test_codegen_expression("1 * 2 + 3 * -4", -10);
     }
 
     #[test]
-    fn test_codegen_arithmetic_operator_associativity_minus() {
+    fn arithmetic_operator_associativity_minus() {
         test_codegen_expression("5 - 2 - 1", 2);
     }
 
     #[test]
-    fn test_codegen_arithmetic_operator_associativity_div() {
+    fn arithmetic_operator_associativity_div() {
         test_codegen_expression("12 / 3 / 2", 2);
     }
 
     #[test]
-    fn test_codegen_arithmetic_operator_associativity_grouping() {
+    fn arithmetic_operator_associativity_grouping() {
         test_codegen_expression("(3 / 2 * 4) + (5 - 4 + 3)", 8);
     }
 
     #[test]
-    fn test_codegen_arithmetic_operator_associativity_grouping_2() {
+    fn arithmetic_operator_associativity_grouping_2() {
         test_codegen_expression("5 * 4 / 2 - 3 % (2 + 1)", 10);
     }
 
     #[test]
-    fn test_codegen_sub_neg() {
+    fn sub_neg() {
         test_codegen_expression("2- -1", 3);
     }
 
     #[test]
-    fn test_codegen_unop_add() {
+    fn unop_add() {
         test_codegen_expression("~2 + 3", 0);
     }
 
     #[test]
-    fn test_codegen_unop_parens() {
+    fn unop_parens() {
         test_codegen_expression("~(1 + 2)", -4);
     }
 
     #[test]
-    fn test_codegen_modulus() {
+    fn modulus() {
         test_codegen_expression("10 % 3", 1);
     }
 
     #[test]
-    fn test_codegen_bitand_associativity() {
+    fn bitand_associativity() {
         test_codegen_expression("7 * 1 & 3 * 1", 3);
     }
 
     #[test]
-    fn test_codegen_or_xor_associativity() {
+    fn or_xor_associativity() {
         test_codegen_expression("7 ^ 3 | 3 ^ 1", 6);
     }
 
     #[test]
-    fn test_codegen_and_xor_associativity() {
+    fn and_xor_associativity() {
         test_codegen_expression("7 ^ 3 & 6 ^ 2", 7);
     }
 
     #[test]
-    fn test_codegen_shl_immediate() {
+    fn shl_immediate() {
         test_codegen_expression("5 << 2", 20);
     }
 
     #[test]
-    fn test_codegen_shl_tempvar() {
+    fn shl_tempvar() {
         test_codegen_expression("5 << (2 * 1)", 20);
     }
 
     #[test]
-    fn test_codegen_sar_immediate() {
+    fn sar_immediate() {
         test_codegen_expression("20 >> 2", 5);
     }
 
     #[test]
-    fn test_codegen_sar_tempvar() {
+    fn sar_tempvar() {
         test_codegen_expression("20 >> (2 * 1)", 5);
     }
 
     #[test]
-    fn test_codegen_shift_associativity() {
+    fn shift_associativity() {
         test_codegen_expression("33 << 4 >> 2", 132);
     }
 
     #[test]
-    fn test_codegen_shift_associativity_2() {
+    fn shift_associativity_2() {
         test_codegen_expression("33 >> 2 << 1", 16);
     }
 
     #[test]
-    fn test_codegen_shift_precedence() {
+    fn shift_precedence() {
         test_codegen_expression("40 << 4 + 12 >> 1", 0x00140000);
     }
 
     #[test]
-    fn test_codegen_sar_negative() {
+    fn sar_negative() {
         test_codegen_expression("-5 >> 1", -3);
     }
 
     #[test]
-    fn test_codegen_bitwise_precedence() {
+    fn bitwise_precedence() {
         test_codegen_expression("80 >> 2 | 1 ^ 5 & 7 << 1", 21);
     }
 
     #[test]
-    fn test_codegen_arithmetic_and_booleans() {
+    fn arithmetic_and_booleans() {
         test_codegen_expression("~(0 && 1) - -(4 || 3)", 0);
     }
 
     #[test]
-    fn test_codegen_bitand_equals_precedence() {
+    fn bitand_equals_precedence() {
         test_codegen_expression("4 & 7 == 4", 0);
     }
 
     #[test]
-    fn test_codegen_bitor_notequals_precedence() {
+    fn bitor_notequals_precedence() {
         test_codegen_expression("4 | 7 != 4", 5);
     }
 
     #[test]
-    fn test_codegen_shift_relational_precedence() {
+    fn shift_relational_precedence() {
         test_codegen_expression("20 >> 4 <= 3 << 1", 1);
     }
 
     #[test]
-    fn test_codegen_xor_relational_precedence() {
+    fn xor_relational_precedence() {
         test_codegen_expression("5 ^ 7 < 5", 5);
     }
 
     #[test]
-    fn test_codegen_var_use() {
+    fn var_use() {
         test_codegen_mainfunc(
             "int x = 5; int y = 6; int z; x = 1; z = 3; return x + y + z;",
             10,
@@ -3479,185 +3598,74 @@ mod test {
     }
 
     #[test]
-    fn test_codegen_assign_expr() {
+    fn assign_expr() {
         test_codegen_mainfunc("int x = 5; int y = x = 3 + 1; return x + y;", 8);
     }
 
     #[test]
-    fn test_codegen_declaration_after_expression() {
+    fn declaration_after_expression() {
         test_codegen_mainfunc("int x; x = 5; int y = -x; return y;", -5);
     }
 
     #[test]
-    fn test_codegen_mixed_precedence_assignment() {
+    fn mixed_precedence_assignment() {
         test_codegen_mainfunc("int x = 5; int y = 4; x = 3 * (y = x); return x + y;", 20);
     }
 
     #[test]
-    fn test_codegen_assign_after_not_short_circuit_or() {
+    fn assign_after_not_short_circuit_or() {
         test_codegen_mainfunc("int x = 0; 0 || (x = 1); return x;", 1);
     }
 
     #[test]
-    fn test_codegen_assign_after_short_circuit_and() {
+    fn assign_after_short_circuit_and() {
         test_codegen_mainfunc("int x = 0; 0 && (x = 1); return x;", 0);
     }
 
     #[test]
-    fn test_codegen_assign_after_short_circuit_or() {
+    fn assign_after_short_circuit_or() {
         test_codegen_mainfunc("int x = 0; 1 || (x = 1); return x;", 0);
     }
 
     #[test]
-    fn test_codegen_assign_low_precedence() {
+    fn assign_low_precedence() {
         test_codegen_mainfunc("int x; x = 0 || 5; return x;", 1);
     }
 
     #[test]
-    fn test_codegen_assign_var_in_initializer() {
+    fn assign_var_in_initializer() {
         test_codegen_mainfunc("int x = x + 5; return x;", 5);
     }
 
     #[test]
-    fn test_codegen_empty_main_body() {
+    fn empty_main_body() {
         test_codegen_mainfunc("", 0);
     }
 
     #[test]
-    fn test_codegen_null_statement() {
+    fn null_statement() {
         test_codegen_mainfunc(";", 0);
     }
 
     #[test]
-    fn test_codegen_null_then_return() {
+    fn null_then_return() {
         test_codegen_mainfunc("; return 1;", 1);
     }
 
     #[test]
-    fn test_codegen_unused_expression() {
+    fn unused_expression() {
         test_codegen_mainfunc("2 + 2; return 0;", 0);
     }
 
     #[test]
-    fn test_codegen_duplicate_variable() {
-        test_codegen_mainfunc_failure("int x = 5; int x = 4; return x;");
-    }
-
-    #[test]
-    fn test_codegen_duplicate_variable_after_use() {
-        test_codegen_mainfunc_failure("int x = 5; return x; int x = 4; return x;");
-    }
-
-    #[test]
-    fn test_codegen_unknown_variable() {
-        test_codegen_mainfunc_failure("return x;");
-    }
-
-    #[test]
-    fn test_codegen_unknown_variable_after_shortcircuit() {
-        test_codegen_mainfunc_failure("return 0 && x;");
-    }
-
-    #[test]
-    fn test_codegen_unknown_variable_in_binary_op() {
-        test_codegen_mainfunc_failure("return x < 5;");
-    }
-
-    #[test]
-    fn test_codegen_unknown_variable_in_unary_op() {
-        test_codegen_mainfunc_failure("return -x;");
-    }
-
-    #[test]
-    fn test_codegen_malformed_plusequals() {
-        test_codegen_mainfunc_failure("int a = 0; a + = 1; return a;");
-    }
-
-    #[test]
-    fn test_codegen_malformed_decrement() {
-        test_codegen_mainfunc_failure("int a = 5; a - -; return a;");
-    }
-
-    #[test]
-    fn test_codegen_malformed_increment() {
-        test_codegen_mainfunc_failure("int a = 5; a + +; return a;");
-    }
-
-    #[test]
-    fn test_codegen_malformed_less_equals() {
-        test_codegen_mainfunc_failure("return 1 < = 2;");
-    }
-
-    #[test]
-    fn test_codegen_malformed_not_equals() {
-        test_codegen_mainfunc_failure("return 1 ! = 2;");
-    }
-
-    #[test]
-    fn test_codegen_malformed_divide_equals() {
-        test_codegen_mainfunc_failure("int a = 10; a =/ 5; return a;");
-    }
-
-    #[test]
-    fn test_codegen_missing_semicolon() {
-        test_codegen_mainfunc_failure("int a = 5 a = a + 5; return a;");
-    }
-
-    #[test]
-    fn test_codegen_return_in_assignment() {
-        test_codegen_mainfunc_failure("int a = return 5;");
-    }
-
-    #[test]
-    fn test_codegen_declare_keyword_as_var() {
-        test_codegen_mainfunc_failure("int return = 6; return return + 1;");
-    }
-
-    #[test]
-    fn test_codegen_declare_after_use() {
-        test_codegen_mainfunc_failure("a = 5; int a; return a;");
-    }
-
-    #[test]
-    fn test_codegen_invalid_lvalue_binary_op() {
-        test_codegen_mainfunc_failure("int a = 5; a + 3 = 4; return a;");
-    }
-
-    #[test]
-    fn test_codegen_invalid_lvalue_unary_op() {
-        test_codegen_mainfunc_failure("int a = 5; !a = 4; return a;");
-    }
-
-    #[test]
-    fn test_codegen_declare_invalid_var_name_with_space() {
-        test_codegen_mainfunc_failure("int x y = 3; return y;");
-    }
-
-    #[test]
-    fn test_codegen_declare_invalid_var_name_starting_number() {
-        test_codegen_mainfunc_failure("int 10 = 3; return 10;");
-        test_codegen_mainfunc_failure("int 10a = 3; return 10a;");
-    }
-
-    #[test]
-    fn test_codegen_declare_invalid_type_name() {
-        test_codegen_mainfunc_failure("ints x = 3; return x;");
-    }
-
-    #[test]
-    fn test_codegen_invalid_mixed_precedence_assignment() {
-        test_codegen_mainfunc_failure("int a = 1; int b = 2; a = 3 * b = a; return a;");
-    }
-
-    #[test]
     #[ignore]
-    fn test_codegen_if_assign() {
+    fn if_assign() {
         test_codegen_mainfunc("int x = 5; if (x == 5) x = 4; return x;", 4);
     }
 
     #[test]
     #[ignore]
-    fn test_codegen_if_else_assign() {
+    fn if_else_assign() {
         test_codegen_mainfunc(
             "int x = 5; if (x == 5) x = 4; else x == 6; if (x == 6) x = 7; else x = 8; return x;",
             8,
@@ -3666,14 +3674,14 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_codegen_ternary() {
+    fn ternary() {
         test_codegen_mainfunc("return 1 == 1 ? 2 : 3;", 2);
         test_codegen_mainfunc("return 1 == 0 ? 2 : 3;", 3);
     }
 
     #[test]
     #[ignore]
-    fn test_block_var_declarations() {
+    fn block_var_declarations() {
         test_codegen_mainfunc("int x = 1; { x = 3; } return x;", 3);
         test_codegen_mainfunc("int x = 1; { int x = 3; } return x;", 1);
         test_codegen_mainfunc("int x = 1; { int y; } int z = 7; return z;", 7);
@@ -3682,13 +3690,13 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_while_loop() {
+    fn while_loop() {
         test_codegen_mainfunc("int x = 1; while (x < 10) x = x + 1; return x;", 10);
     }
 
     #[test]
     #[ignore]
-    fn test_while_loop_with_break() {
+    fn while_loop_with_break() {
         test_codegen_mainfunc(
             "int x = 1; while (x < 10) { x = x + 1; break; } return x;",
             2,
@@ -3697,7 +3705,7 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_while_loop_with_continue() {
+    fn while_loop_with_continue() {
         test_codegen_mainfunc(
             "int x = 1; while (x < 10) { x = x + 1; continue; x = 50; } return x;",
             10,
@@ -3706,19 +3714,19 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_do_while_loop() {
+    fn do_while_loop() {
         test_codegen_mainfunc("do { return 1; } while (0); return 2;", 1);
     }
 
     #[test]
     #[ignore]
-    fn test_do_while_loop_with_break() {
+    fn do_while_loop_with_break() {
         test_codegen_mainfunc("do { break; return 1; } while (0); return 2;", 2);
     }
 
     #[test]
     #[ignore]
-    fn test_do_while_loop_with_continue() {
+    fn do_while_loop_with_continue() {
         test_codegen_mainfunc(
             "int x = 20; do { continue; } while ((x = 50) < 10); return x;",
             50,
@@ -3727,7 +3735,7 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_for_loop() {
+    fn for_loop() {
         test_codegen_mainfunc(
             "int y = 100; for (int i = 0; i < 10; i = i + 1) y = i; return y;",
             9,
@@ -3744,7 +3752,7 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_for_loop_with_break() {
+    fn for_loop_with_break() {
         test_codegen_mainfunc(
             "int i = 150; for (i = 2; i < 10; i = i + 1) { break; i = 20; } return i;",
             2,
@@ -3757,7 +3765,7 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_for_loop_with_continue() {
+    fn for_loop_with_continue() {
         test_codegen_mainfunc(
             "int i = 150; for (i = 2; i < 10; i = i + 1) { continue; i = 20; } return i;",
             10,
@@ -3766,8 +3774,8 @@ mod test {
 
     #[test]
     #[ignore]
-    fn test_wrong_func_arg_count() {
-        test_validate_error_count(
+    fn wrong_func_arg_count() {
+        validate_error_count(
             r"int blah(int x, int y)
 {
     return 5;
@@ -3793,7 +3801,7 @@ int main() {
 
     #[test]
     #[ignore]
-    fn test_recursive_function() {
+    fn recursive_function() {
         codegen_run_and_check_exit_code(
             r"
 int sigma(int x) {
@@ -3814,7 +3822,7 @@ int main() {
 
     #[test]
     #[ignore]
-    fn test_nested_function_arg_counts() {
+    fn nested_function_arg_counts() {
         codegen_run_and_check_exit_code(
             r"
 int func0()
@@ -3868,7 +3876,7 @@ int main() {
 
     #[test]
     #[ignore]
-    fn test_nested_block_variable_allocation() {
+    fn nested_block_variable_allocation() {
         codegen_run_and_check_exit_code(
             r"
 int func()
@@ -3899,7 +3907,7 @@ int main() {
 
     #[test]
     #[ignore]
-    fn test_parameter_redefinition() {
+    fn parameter_redefinition() {
         codegen_run_and_expect_compile_failure(
             r"int blah(int x)
 {
