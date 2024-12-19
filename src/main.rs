@@ -269,6 +269,10 @@ enum AstUnaryOperator {
     Negation,
     BitwiseNot,
     Not,
+    PrefixIncrement,
+    PrefixDecrement,
+    PostfixIncrement,
+    PostfixDecrement,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -691,11 +695,39 @@ impl FmtNode for AstStatement {
 }
 
 impl AstUnaryOperator {
+    fn is_postfix(&self) -> bool {
+        match self {
+            AstUnaryOperator::Negation | AstUnaryOperator::BitwiseNot | AstUnaryOperator::Not => {
+                panic!("shouldn't be called except for prefix/postfix")
+            }
+            AstUnaryOperator::PrefixIncrement | AstUnaryOperator::PrefixDecrement => false,
+            AstUnaryOperator::PostfixIncrement | AstUnaryOperator::PostfixDecrement => true,
+        }
+    }
+
+    fn get_base_binary_op_from_affix_op(&self) -> AstBinaryOperator {
+        match self {
+            AstUnaryOperator::Negation | AstUnaryOperator::BitwiseNot | AstUnaryOperator::Not => {
+                panic!("shouldn't be called except for prefix/postfix")
+            }
+            AstUnaryOperator::PrefixIncrement | AstUnaryOperator::PostfixIncrement => {
+                AstBinaryOperator::Add
+            }
+            AstUnaryOperator::PrefixDecrement | AstUnaryOperator::PostfixDecrement => {
+                AstBinaryOperator::Subtract
+            }
+        }
+    }
+
     fn to_tac(&self) -> TacUnaryOperator {
         match self {
             AstUnaryOperator::Negation => TacUnaryOperator::Negation,
             AstUnaryOperator::BitwiseNot => TacUnaryOperator::BitwiseNot,
             AstUnaryOperator::Not => TacUnaryOperator::Not,
+            AstUnaryOperator::PrefixIncrement
+            | AstUnaryOperator::PrefixDecrement
+            | AstUnaryOperator::PostfixIncrement
+            | AstUnaryOperator::PostfixDecrement => panic!("prefix/postfix handled elsewhere"),
         }
     }
 }
@@ -706,6 +738,10 @@ impl FmtNode for AstUnaryOperator {
             AstUnaryOperator::Negation => "-",
             AstUnaryOperator::BitwiseNot => "~",
             AstUnaryOperator::Not => "!",
+            AstUnaryOperator::PrefixIncrement => "++ (pre)",
+            AstUnaryOperator::PrefixDecrement => "-- (pre)",
+            AstUnaryOperator::PostfixIncrement => "++ (post)",
+            AstUnaryOperator::PostfixDecrement => "-- (post)",
         })
     }
 }
@@ -717,6 +753,8 @@ impl std::str::FromStr for AstUnaryOperator {
             "-" => Ok(AstUnaryOperator::Negation),
             "~" => Ok(AstUnaryOperator::BitwiseNot),
             "!" => Ok(AstUnaryOperator::Not),
+            "++" => Ok(AstUnaryOperator::PrefixIncrement),
+            "--" => Ok(AstUnaryOperator::PrefixDecrement),
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -913,7 +951,22 @@ impl AstExpression {
     ) -> Result<(), String> {
         match self {
             AstExpression::Constant(num) => {}
-            AstExpression::UnaryOperator(_ast_unary_op, ast_exp_inner) => {
+            AstExpression::UnaryOperator(ast_unary_op, ast_exp_inner) => {
+                match ast_unary_op {
+                    AstUnaryOperator::PrefixIncrement
+                    | AstUnaryOperator::PrefixDecrement
+                    | AstUnaryOperator::PostfixIncrement
+                    | AstUnaryOperator::PostfixDecrement => {
+                        let AstExpression::Var(_) = **ast_exp_inner else {
+                            return Err(format!(
+                                "{} is not an lvalue",
+                                display_with(|f| { ast_exp_inner.fmt_node(f, 0) })
+                            ));
+                        };
+                    }
+                    _ => (),
+                }
+
                 ast_exp_inner.validate_and_resolve(function_tracking)?;
             }
             AstExpression::BinaryOperator(ast_exp_left, _binary_op, ast_exp_right) => {
@@ -946,6 +999,42 @@ impl AstExpression {
     ) -> Result<TacVal, String> {
         Ok(match self {
             AstExpression::Constant(num) => TacVal::Constant(*num),
+            AstExpression::UnaryOperator(
+                ast_unary_op @ (AstUnaryOperator::PrefixIncrement
+                | AstUnaryOperator::PrefixDecrement
+                | AstUnaryOperator::PostfixIncrement
+                | AstUnaryOperator::PostfixDecrement),
+                ast_exp_inner,
+            ) => {
+                let tac_exp_val = ast_exp_inner.to_tac(global_tracking, instructions)?;
+
+                let TacVal::Var(ref tac_exp_var) = tac_exp_val else {
+                    panic!("lhs in an assignment wasn't an lvalue: {:?}", ast_exp_inner);
+                };
+
+                // Postfix operator needs to resolve to the original value, not the later value, so copy its original value first.
+                let final_val = if ast_unary_op.is_postfix() {
+                    let tempvar = global_tracking.allocate_temporary();
+                    instructions.push(TacInstruction::CopyVal(
+                        tac_exp_val.clone(),
+                        tempvar.clone(),
+                    ));
+                    TacVal::Var(tempvar)
+                } else {
+                    tac_exp_val.clone()
+                };
+
+                // Prefix increment or decrement is a compound assignment with a constant value of 1 and storing in the
+                // variable.
+                instructions.push(TacInstruction::BinaryOp(
+                    tac_exp_val.clone(),
+                    ast_unary_op.get_base_binary_op_from_affix_op().to_tac(),
+                    TacVal::Constant(1),
+                    tac_exp_var.clone(),
+                ));
+
+                final_val
+            }
             AstExpression::UnaryOperator(ast_unary_op, ast_exp_inner) => {
                 let tac_exp_inner_var = ast_exp_inner.to_tac(global_tracking, instructions)?;
                 let tempvar = global_tracking.allocate_temporary();
@@ -1075,8 +1164,10 @@ impl FmtNode for AstExpression {
         match self {
             AstExpression::Constant(val) => write!(f, "{}", val)?,
             AstExpression::UnaryOperator(operator, expr) => {
+                write!(f, "(")?;
                 operator.fmt_node(f, 0)?;
                 expr.fmt_node(f, 0)?;
+                write!(f, ")")?;
             }
             AstExpression::BinaryOperator(left, operator, right) => {
                 write!(f, "(")?;
@@ -2669,7 +2760,7 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
 fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
     let mut tokens = original_tokens.clone();
 
-    let ret = if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
+    let mut ret = if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
         Ok(AstExpression::Constant(integer_literal))
     } else if let Ok(_) = tokens.consume_expected_next_token("(") {
         let inner = parse_expression(&mut tokens)?;
@@ -2684,7 +2775,42 @@ fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpre
         Err(String::from("unknown factor"))
     };
 
+    // Immediately after parsing a factor, attempt to parse a postfix operator, because it's higher precedence than
+    // anything else.
+    if let Ok(factor) = ret {
+        if let Some(suffix_operator) = parse_postfix_operator(&mut tokens) {
+            ret = Ok(AstExpression::UnaryOperator(
+                suffix_operator,
+                Box::new(factor),
+            ));
+        } else {
+            ret = Ok(factor);
+        }
+    }
+
     if ret.is_ok() {
+        *original_tokens = tokens;
+    }
+
+    ret
+}
+
+fn parse_postfix_operator<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+) -> Option<AstUnaryOperator> {
+    let mut tokens = original_tokens.clone();
+
+    let ret = if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
+        match operator {
+            AstUnaryOperator::PrefixIncrement => Some(AstUnaryOperator::PostfixIncrement),
+            AstUnaryOperator::PrefixDecrement => Some(AstUnaryOperator::PostfixDecrement),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if ret.is_some() {
         *original_tokens = tokens;
     }
 
@@ -3400,6 +3526,51 @@ mod test {
         fn invalid_compound_lvalue() {
             test_codegen_mainfunc_failure("int a = 10; (a += 1) -= 2;");
         }
+
+        #[test]
+        fn decrement_binary_op() {
+            test_codegen_mainfunc_failure("int a = 0; return a -- 1;");
+        }
+
+        #[test]
+        fn increment_binary_op() {
+            test_codegen_mainfunc_failure("int a = 0; return a ++ 1;");
+        }
+
+        #[test]
+        fn increment_declaration() {
+            test_codegen_mainfunc_failure("int a++; return 0;");
+        }
+
+        #[test]
+        fn double_postfix() {
+            test_codegen_mainfunc_failure("int a = 10; return a++--;");
+        }
+
+        #[test]
+        fn postfix_incr_non_lvalue() {
+            test_codegen_mainfunc_failure("int a = 0; (a = 4)++;");
+        }
+
+        #[test]
+        fn prefix_incr_non_lvalue() {
+            test_codegen_mainfunc_failure("int a = 1; ++(a+1); return 0;");
+        }
+
+        #[test]
+        fn prefix_decr_constant() {
+            test_codegen_mainfunc_failure("return --3;");
+        }
+
+        #[test]
+        fn postfix_undeclared_var() {
+            test_codegen_mainfunc_failure("a--; return 0;");
+        }
+
+        #[test]
+        fn prefix_undeclared_var() {
+            test_codegen_mainfunc_failure("++a; return 0;");
+        }
     }
 
     #[test]
@@ -3988,6 +4159,41 @@ mod test {
     int e = 18;
     e <<= c || d; // e = 36
     return (a == 1 && b == 13 && c == 15 && d == 8 && e == 36);
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn increment_decrement_expressions() {
+        test_codegen_mainfunc(
+            "int a = 0; int b = 0; a++; ++a; b--; --b; return (a == 2 && b == -2);",
+            1,
+        );
+    }
+
+    #[test]
+    fn incr_decr_in_binary_expressions() {
+        test_codegen_mainfunc(
+            r"
+    int a = 2;
+    int b = 3 + a++;
+    int c = 4 + ++b;
+    return (a == 3 && b == 6 && c == 10);
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn incr_decr_parentheses() {
+        test_codegen_mainfunc(
+            r"
+    int a = 1;
+    int b = 2;
+    int c = -++(a);
+    int d = !(b)--;
+    return (a == 2 && b == 1 && c == -2 && d == 0);
     ",
             1,
         );
