@@ -263,6 +263,7 @@ enum AstExpression {
     BinaryOperator(Box<AstExpression>, AstBinaryOperator, Box<AstExpression>),
     Var(AstIdentifier),
     Assignment(Box<AstExpression>, AstBinaryOperator, Box<AstExpression>),
+    Conditional(Box<AstExpression>, Box<AstExpression>, Box<AstExpression>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -307,6 +308,7 @@ enum AstBinaryOperator {
     BitwiseXorAssign,
     ShiftLeftAssign,
     ShiftRightAssign,
+    Conditional,
 }
 
 #[derive(Debug)]
@@ -835,24 +837,25 @@ impl AstBinaryOperator {
             AstBinaryOperator::BitwiseXorAssign => 0,
             AstBinaryOperator::ShiftLeftAssign => 0,
             AstBinaryOperator::ShiftRightAssign => 0,
-            AstBinaryOperator::Or => 1,
-            AstBinaryOperator::And => 2,
-            AstBinaryOperator::BitwiseOr => 3,
-            AstBinaryOperator::BitwiseXor => 4,
-            AstBinaryOperator::BitwiseAnd => 5,
-            AstBinaryOperator::Equal => 6,
-            AstBinaryOperator::NotEqual => 6,
-            AstBinaryOperator::LessThan => 7,
-            AstBinaryOperator::LessOrEqual => 7,
-            AstBinaryOperator::GreaterThan => 7,
-            AstBinaryOperator::GreaterOrEqual => 7,
-            AstBinaryOperator::ShiftLeft => 8,
-            AstBinaryOperator::ShiftRight => 8,
-            AstBinaryOperator::Add => 9,
-            AstBinaryOperator::Subtract => 9,
-            AstBinaryOperator::Multiply => 10,
-            AstBinaryOperator::Divide => 10,
-            AstBinaryOperator::Modulus => 10,
+            AstBinaryOperator::Conditional => 1,
+            AstBinaryOperator::Or => 2,
+            AstBinaryOperator::And => 3,
+            AstBinaryOperator::BitwiseOr => 4,
+            AstBinaryOperator::BitwiseXor => 5,
+            AstBinaryOperator::BitwiseAnd => 6,
+            AstBinaryOperator::Equal => 7,
+            AstBinaryOperator::NotEqual => 7,
+            AstBinaryOperator::LessThan => 8,
+            AstBinaryOperator::LessOrEqual => 8,
+            AstBinaryOperator::GreaterThan => 8,
+            AstBinaryOperator::GreaterOrEqual => 8,
+            AstBinaryOperator::ShiftLeft => 9,
+            AstBinaryOperator::ShiftRight => 9,
+            AstBinaryOperator::Add => 10,
+            AstBinaryOperator::Subtract => 10,
+            AstBinaryOperator::Multiply => 11,
+            AstBinaryOperator::Divide => 11,
+            AstBinaryOperator::Modulus => 11,
         }
     }
 
@@ -880,7 +883,8 @@ impl AstBinaryOperator {
             | AstBinaryOperator::BitwiseOrAssign
             | AstBinaryOperator::BitwiseXorAssign
             | AstBinaryOperator::ShiftLeftAssign
-            | AstBinaryOperator::ShiftRightAssign => {
+            | AstBinaryOperator::ShiftRightAssign
+            | AstBinaryOperator::Conditional => {
                 panic!("should have been handled elsewhere")
             }
             AstBinaryOperator::Equal => TacBinaryOperator::Equal,
@@ -922,7 +926,8 @@ impl AstBinaryOperator {
             | AstBinaryOperator::Subtract
             | AstBinaryOperator::Multiply
             | AstBinaryOperator::Divide
-            | AstBinaryOperator::Modulus => {
+            | AstBinaryOperator::Modulus
+            | AstBinaryOperator::Conditional => {
                 panic!("shouldn't be called for non-compound-assignments")
             }
         }
@@ -961,6 +966,7 @@ impl FmtNode for AstBinaryOperator {
             AstBinaryOperator::BitwiseXorAssign => "^=",
             AstBinaryOperator::ShiftLeftAssign => "<<=",
             AstBinaryOperator::ShiftRightAssign => ">>=",
+            AstBinaryOperator::Conditional => panic!("shouldn't be called for conditional"),
         })
     }
 }
@@ -998,6 +1004,7 @@ impl std::str::FromStr for AstBinaryOperator {
             "^=" => Ok(AstBinaryOperator::BitwiseXorAssign),
             "<<=" => Ok(AstBinaryOperator::ShiftLeftAssign),
             ">>=" => Ok(AstBinaryOperator::ShiftRightAssign),
+            "?" => Ok(AstBinaryOperator::Conditional), /* other half is parsed directly, elsewhere */
             _ => Err(format!("unknown operator {}", s)),
         }
     }
@@ -1044,6 +1051,11 @@ impl AstExpression {
                 };
 
                 ast_exp_left.validate_and_resolve(function_tracking)?;
+                ast_exp_right.validate_and_resolve(function_tracking)?;
+            }
+            AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
+                ast_exp_left.validate_and_resolve(function_tracking)?;
+                ast_exp_middle.validate_and_resolve(function_tracking)?;
                 ast_exp_right.validate_and_resolve(function_tracking)?;
             }
         }
@@ -1214,6 +1226,46 @@ impl AstExpression {
 
                 tac_exp_left_val
             }
+            AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
+                let result_var = global_tracking.allocate_temporary();
+
+                let right_begin_label = global_tracking.allocate_label("cond_else_begin");
+                let end_label = global_tracking.allocate_label("cond_end");
+
+                let tac_exp_left_val = ast_exp_left.to_tac(global_tracking, instructions)?;
+
+                // If the condition is false, jump over the middle--the "then" part--to the beginning of the right--the
+                // "else" part.
+                instructions.push(TacInstruction::JumpIfZero(
+                    tac_exp_left_val,
+                    right_begin_label.clone(),
+                ));
+
+                let tac_exp_middle_val = ast_exp_middle.to_tac(global_tracking, instructions)?;
+
+                // After the then-clause is done, store the result in the overall expression's result temporary variable
+                // and jump to the end.
+                instructions.push(TacInstruction::CopyVal(
+                    tac_exp_middle_val,
+                    result_var.clone(),
+                ));
+
+                instructions.push(TacInstruction::Jump(end_label.clone()));
+
+                // And then emit the label for the start of the else part.
+                instructions.push(TacInstruction::Label(right_begin_label));
+
+                // And then the else part itself.
+                let tac_exp_right_val = ast_exp_right.to_tac(global_tracking, instructions)?;
+                instructions.push(TacInstruction::CopyVal(
+                    tac_exp_right_val,
+                    result_var.clone(),
+                ));
+
+                instructions.push(TacInstruction::Label(end_label));
+
+                TacVal::Var(result_var)
+            }
         })
     }
 }
@@ -1246,6 +1298,15 @@ impl FmtNode for AstExpression {
                 write!(f, " ")?;
                 operator.fmt_node(f, 0)?;
                 write!(f, " ")?;
+                right.fmt_node(f, 0)?;
+                write!(f, ")")?;
+            }
+            AstExpression::Conditional(left, middle, right) => {
+                write!(f, "(")?;
+                left.fmt_node(f, 0)?;
+                write!(f, " ? ")?;
+                middle.fmt_node(f, 0)?;
+                write!(f, " : ")?;
                 right.fmt_node(f, 0)?;
                 write!(f, ")")?;
             }
@@ -2796,6 +2857,24 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
                                 Box::new(right),
                             );
                         }
+                        AstBinaryOperator::Conditional => {
+                            // The middle expression is restarted with 0 precedence because it's cleanly delineated by
+                            // the : that follows.
+                            let middle = parse_expression_with_precedence(&mut tokens, 0)?;
+                            tokens.consume_expected_next_token(":")?;
+
+                            // Conditional operator is right-associative, so parse with current precedence.
+                            let right = parse_expression_with_precedence(
+                                &mut tokens,
+                                operator.precedence(),
+                            )?;
+
+                            left = AstExpression::Conditional(
+                                Box::new(left),
+                                Box::new(middle),
+                                Box::new(right),
+                            );
+                        }
                         _ => {
                             // If the right hand side is itself going to encounter a binary expression, it can only be a
                             // strictly higher precedence, or else it shouldn't be part of the right-hand-side expression.
@@ -3673,6 +3752,43 @@ mod test {
         fn undeclared_var_in_if() {
             test_codegen_mainfunc_failure("if (1) return c; int c = 0;");
         }
+
+        #[test]
+        fn incomplete_ternary() {
+            test_codegen_mainfunc_failure("return 1 ? 2;");
+        }
+
+        #[test]
+        fn ternary_extra_left() {
+            test_codegen_mainfunc_failure("return 1 ? 2 ? 3 : 4;");
+        }
+
+        #[test]
+        fn ternary_extra_right() {
+            test_codegen_mainfunc_failure("return 1 ? 2 : 3 : 4;");
+        }
+
+        #[test]
+        fn ternary_wrong_delimiter() {
+            test_codegen_mainfunc_failure("int x = 10; return x ? 1 = 2;");
+        }
+
+        #[test]
+        fn ternary_undeclared_var() {
+            test_codegen_mainfunc_failure("return a > 0 ? 1 : 2; int a = 5;");
+        }
+
+        #[test]
+        fn ternary_invalid_assign() {
+            test_codegen_mainfunc_failure(
+                r"
+            int a = 2;
+            int b = 1;
+            a > b ? a = 1 : a = 0;
+            return a;
+            ",
+            );
+        }
     }
 
     #[test]
@@ -4480,10 +4596,74 @@ mod test {
     }
 
     #[test]
-    #[ignore]
-    fn ternary() {
-        test_codegen_mainfunc("return 1 == 1 ? 2 : 3;", 2);
-        test_codegen_mainfunc("return 1 == 0 ? 2 : 3;", 3);
+    fn assign_ternary() {
+        test_codegen_mainfunc("int a = 0; a = 1 ? 2 : 3; return a;", 2);
+    }
+
+    #[test]
+    fn ternary_binary_op_in_middle() {
+        test_codegen_mainfunc("int a = 1 ? 3 % 2 : 4; return a;", 1);
+    }
+
+    #[test]
+    fn ternary_logical_or_precedence() {
+        test_codegen_mainfunc("int a = 10; return a || 0 ? 20 : 0;", 20);
+    }
+
+    #[test]
+    fn ternary_logical_or_precedence_right() {
+        test_codegen_mainfunc("return 0 ? 1 : 0 || 2;", 1);
+    }
+
+    #[test]
+    fn ternary_in_assignment() {
+        test_codegen_mainfunc(
+            r"
+    int x = 0;
+    int y = 0;
+    y = (x = 5) ? x : 2;
+    return (x == 5 && y == 5);
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn nested_ternary() {
+        test_codegen_mainfunc(
+            r"
+    int a = 1;
+    int b = 2;
+    int flag = 0;
+    return a > b ? 5 : flag ? 6 : 7;
+    ",
+            7,
+        );
+    }
+
+    #[test]
+    fn nested_ternary_literals() {
+        test_codegen_mainfunc(
+            r"
+    int a = 1 ? 2 ? 3 : 4 : 5;
+    int b = 0 ? 2 ? 3 : 4 : 5;
+    return a * b;
+    ",
+            15,
+        );
+    }
+
+    #[test]
+    fn ternary_assignment_rhs() {
+        test_codegen_mainfunc(
+            r"
+    int flag = 1;
+    int a = 0;
+    flag ? a = 1 : (a = 0);
+    return a;
+    ",
+            1,
+        );
     }
 
     #[test]
