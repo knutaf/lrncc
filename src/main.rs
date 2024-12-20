@@ -252,6 +252,7 @@ struct AstDeclaration {
 enum AstStatement {
     Return(AstExpression),
     Expr(AstExpression),
+    If(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
     Null,
 }
 
@@ -649,6 +650,14 @@ impl AstStatement {
             AstStatement::Return(expr) | AstStatement::Expr(expr) => {
                 expr.validate_and_resolve(function_tracking)?;
             }
+            AstStatement::If(condition_expr, then_statement, else_statement_opt) => {
+                condition_expr.validate_and_resolve(function_tracking)?;
+                then_statement.validate_and_resolve(function_tracking)?;
+
+                if let Some(else_statement) = else_statement_opt {
+                    else_statement.validate_and_resolve(function_tracking)?;
+                }
+            }
             AstStatement::Null => {}
         }
 
@@ -668,6 +677,39 @@ impl AstStatement {
             AstStatement::Expr(ast_exp) => {
                 let _tac_val = ast_exp.to_tac(global_tracking, instructions)?;
             }
+            AstStatement::If(condition_expr, then_statement, else_statement_opt) => {
+                let end_label = global_tracking.allocate_label("if_end");
+
+                let else_begin_label_opt = if else_statement_opt.is_some() {
+                    Some(global_tracking.allocate_label("else_begin"))
+                } else {
+                    None
+                };
+
+                let tac_condition_val = condition_expr.to_tac(global_tracking, instructions)?;
+
+                // If the condition is false, jump either to the beginning of the else, if present, or just the end of
+                // the if statement.
+                instructions.push(TacInstruction::JumpIfZero(
+                    tac_condition_val,
+                    else_begin_label_opt.as_ref().unwrap_or(&end_label).clone(),
+                ));
+
+                then_statement.to_tac(global_tracking, instructions)?;
+
+                if let Some(else_statement) = else_statement_opt {
+                    // After the then-clause is done, if there's an else-clause present, jump over it to the end.
+                    instructions.push(TacInstruction::Jump(end_label.clone()));
+
+                    // And then emit the label for the start of the else clause.
+                    instructions.push(TacInstruction::Label(else_begin_label_opt.unwrap()));
+
+                    // And then the else clause itself.
+                    else_statement.to_tac(global_tracking, instructions)?;
+                }
+
+                instructions.push(TacInstruction::Label(end_label));
+            }
             AstStatement::Null => {}
         }
 
@@ -686,6 +728,23 @@ impl FmtNode for AstStatement {
             }
             AstStatement::Expr(expr) => {
                 expr.fmt_node(f, indent_levels + 1)?;
+            }
+            AstStatement::If(condition_expr, then_statement, else_statement_opt) => {
+                write!(f, "if (")?;
+                condition_expr.fmt_node(f, indent_levels)?;
+                writeln!(f, ") {{")?;
+                then_statement.fmt_node(f, indent_levels + 1)?;
+                writeln!(f)?;
+                Self::write_indent(f, indent_levels)?;
+                write!(f, "}}")?;
+
+                if let Some(else_statement) = else_statement_opt {
+                    writeln!(f, " else {{")?;
+                    else_statement.fmt_node(f, indent_levels + 1)?;
+                    writeln!(f)?;
+                    Self::write_indent(f, indent_levels)?;
+                    write!(f, "}}")?;
+                }
             }
             AstStatement::Null => {}
         }
@@ -2644,6 +2703,19 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
         st
     } else if tokens.consume_expected_next_token(";").is_ok() {
         AstStatement::Null
+    } else if tokens.consume_expected_next_token("if").is_ok() {
+        tokens.consume_expected_next_token("(")?;
+        let condition_expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+        let then_statement = parse_statement(&mut tokens)?;
+
+        let else_statement_opt = if tokens.consume_expected_next_token("else").is_ok() {
+            Some(Box::new(parse_statement(&mut tokens)?))
+        } else {
+            None
+        };
+
+        AstStatement::If(condition_expr, Box::new(then_statement), else_statement_opt)
     } else {
         let st = AstStatement::Expr(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
@@ -3571,6 +3643,36 @@ mod test {
         fn prefix_undeclared_var() {
             test_codegen_mainfunc_failure("++a; return 0;");
         }
+
+        #[test]
+        fn declaration_as_statement() {
+            test_codegen_mainfunc_failure("if (5) int i = 0;");
+        }
+
+        #[test]
+        fn empty_if_body() {
+            test_codegen_mainfunc_failure("if (0) else return 0;");
+        }
+
+        #[test]
+        fn if_as_assignment() {
+            test_codegen_mainfunc_failure("int flag = 0; int a = if (flag) 2; else 3; return a;");
+        }
+
+        #[test]
+        fn if_no_parentheses() {
+            test_codegen_mainfunc_failure("if 0 return 1;");
+        }
+
+        #[test]
+        fn extra_else() {
+            test_codegen_mainfunc_failure("if (1) return 1; else return 2; else return 3;");
+        }
+
+        #[test]
+        fn undeclared_var_in_if() {
+            test_codegen_mainfunc_failure("if (1) return c; int c = 0;");
+        }
     }
 
     #[test]
@@ -4200,17 +4302,180 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn if_assign() {
         test_codegen_mainfunc("int x = 5; if (x == 5) x = 4; return x;", 4);
     }
 
     #[test]
-    #[ignore]
     fn if_else_assign() {
         test_codegen_mainfunc(
             "int x = 5; if (x == 5) x = 4; else x == 6; if (x == 6) x = 7; else x = 8; return x;",
             8,
+        );
+    }
+
+    #[test]
+    fn if_binary_op_in_condition_true() {
+        test_codegen_mainfunc("if (1 + 2 == 3) return 5;", 5);
+    }
+
+    #[test]
+    fn if_binary_op_in_condition_false() {
+        test_codegen_mainfunc("if (1 + 2 == 4) return 5;", 0);
+    }
+
+    #[test]
+    fn if_else_if() {
+        test_codegen_mainfunc(
+            r"
+    int a = 1;
+    int b = 0;
+    if (a)
+        b = 1;
+    else if (b)
+        b = 2;
+    return b;
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn if_else_if_nested_execute_else() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    int b = 1;
+    if (a)
+        b = 1;
+    else if (~b)
+        b = 2;
+    return b;
+    ",
+            2,
+        );
+    }
+
+    #[test]
+    fn if_nested_twice() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    if ( (a = 1) )
+        if (a == 1)
+            a = 3;
+        else
+            a = 4;
+    return a;
+    ",
+            3,
+        );
+    }
+
+    #[test]
+    fn if_nested_twice_execute_else() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    if (!a)
+        if (3 / 4)
+            a = 3;
+        else
+            a = 8 / 2;
+    return a;
+    ",
+            4,
+        );
+    }
+
+    #[test]
+    fn nested_else_execute_outer_else() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    if (0)
+        if (0)
+            a = 3;
+        else
+            a = 4;
+    else
+        a = 1;
+    return a;
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn if_null_body() {
+        test_codegen_mainfunc(
+            r"
+    int x = 0;
+    if (0)
+        ;
+    else
+        x = 1;
+    return x;
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn multiple_if_else() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    int b = 0;
+
+    if (a)
+        a = 2;
+    else
+        a = 3;
+
+    if (b)
+        b = 4;
+    else
+        b = 5;
+
+    return a + b;
+    ",
+            8,
+        );
+    }
+
+    #[test]
+    fn if_compound_assignment_in_condition() {
+        test_codegen_mainfunc("int a = 0; if (a += 1) return a; return 10;", 1);
+    }
+
+    #[test]
+    fn if_postfix_in_condition() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    if (a--)
+        return 0;
+    else if (a--)
+        return 1;
+    return 0;
+    ",
+            1,
+        );
+    }
+
+    #[test]
+    fn if_prefix_in_condition() {
+        test_codegen_mainfunc(
+            r"
+    int a = -1;
+    if (++a)
+        return 0;
+    else if (++a)
+        return 1;
+    return 0;
+    ",
+            1,
         );
     }
 
