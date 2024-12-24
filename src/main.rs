@@ -495,7 +495,11 @@ impl<'i> AstProgram<'i> {
             let mut function_tracking = FunctionTracking::new();
             let global_tracking = self.global_tracking_opt.as_mut().unwrap();
 
-            func.validate_and_resolve(global_tracking, &mut function_tracking, &mut errors);
+            func.validate_and_resolve_variables(
+                global_tracking,
+                &mut function_tracking,
+                &mut errors,
+            );
 
             func.for_each_statement(|ast_statement| {
                 for label in ast_statement.labels.iter_mut() {
@@ -552,14 +556,16 @@ impl<'i> FmtNode for AstProgram<'i> {
 }
 
 impl<'i> AstFunction<'i> {
-    fn validate_and_resolve(
+    fn validate_and_resolve_variables(
         &mut self,
         global_tracking: &mut GlobalTracking,
         function_tracking: &mut FunctionTracking,
         errors: &mut Vec<String>,
     ) {
         for block_item in self.body.iter_mut() {
-            if let Err(err) = block_item.validate_and_resolve(global_tracking, function_tracking) {
+            if let Err(err) =
+                block_item.validate_and_resolve_variables(global_tracking, function_tracking)
+            {
                 errors.push(err);
             }
         }
@@ -634,7 +640,7 @@ impl AstIdentifier {
 }
 
 impl AstBlockItem {
-    fn validate_and_resolve(
+    fn validate_and_resolve_variables(
         &mut self,
         global_tracking: &mut GlobalTracking,
         function_tracking: &mut FunctionTracking,
