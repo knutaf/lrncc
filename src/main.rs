@@ -174,9 +174,9 @@ impl<'i, 't> Tokens<'i, 't> {
         fn is_token_identifier(token: &str) -> bool {
             lazy_static! {
                 static ref IDENT_REGEX: Regex =
-                    Regex::new(r"^[a-zA-Z]\w*$").expect("failed to compile regex");
+                    Regex::new(r"^[a-zA-Z_]\w*$").expect("failed to compile regex");
                 static ref KEYWORDS_REGEX: Regex =
-                    Regex::new(r"^int|void|return$").expect("failed to compile regex");
+                    Regex::new(r"^(?:int|void|return|if|goto)$").expect("failed to compile regex");
             }
 
             IDENT_REGEX.is_match(token) && !KEYWORDS_REGEX.is_match(token)
@@ -247,12 +247,22 @@ struct AstDeclaration {
     initializer_opt: Option<AstExpression>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AstLabel(String);
+
+#[derive(Debug, Clone)]
+struct AstStatement {
+    labels: Vec<AstLabel>,
+    typ: AstStatementType,
+}
+
 // TODO: use a string slice instead of a string
 #[derive(Clone, Debug)]
-enum AstStatement {
+enum AstStatementType {
     Return(AstExpression),
     Expr(AstExpression),
     If(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
+    Goto(AstLabel),
     Null,
 }
 
@@ -456,6 +466,7 @@ struct GlobalTracking {
 #[derive(Debug)]
 struct FunctionTracking {
     variables: HashMap<AstIdentifier, AstIdentifier>,
+    labels: HashMap<AstLabel, AstLabel>,
 }
 
 #[derive(Debug)]
@@ -481,7 +492,40 @@ impl<'i> AstProgram<'i> {
 
         let mut errors = vec![];
         for func in self.functions.iter_mut() {
-            func.validate_and_resolve(self.global_tracking_opt.as_mut().unwrap(), &mut errors);
+            let mut function_tracking = FunctionTracking::new();
+            let global_tracking = self.global_tracking_opt.as_mut().unwrap();
+
+            func.validate_and_resolve(global_tracking, &mut function_tracking, &mut errors);
+
+            func.for_each_statement(|ast_statement| {
+                for label in ast_statement.labels.iter_mut() {
+                    match function_tracking.add_goto_label(global_tracking, label) {
+                        Ok(new_label) => {
+                            *label = new_label;
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+
+                Ok(())
+            });
+
+            func.for_each_statement(|ast_statement| {
+                if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
+                    match function_tracking.resolve_label(label) {
+                        Ok(new_label) => {
+                            *label = new_label;
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+
+                Ok(())
+            });
         }
 
         if errors.is_empty() {
@@ -511,15 +555,42 @@ impl<'i> AstFunction<'i> {
     fn validate_and_resolve(
         &mut self,
         global_tracking: &mut GlobalTracking,
+        function_tracking: &mut FunctionTracking,
         errors: &mut Vec<String>,
     ) {
-        let mut tracking = FunctionTracking::new();
-
         for block_item in self.body.iter_mut() {
-            if let Err(err) = block_item.validate_and_resolve(global_tracking, &mut tracking) {
+            if let Err(err) = block_item.validate_and_resolve(global_tracking, function_tracking) {
                 errors.push(err);
             }
         }
+    }
+
+    fn for_each_statement<F>(&mut self, mut func: F) -> Result<(), String>
+    where
+        F: FnMut(&mut AstStatement) -> Result<(), String>,
+    {
+        for block_item in self.body.iter_mut() {
+            if let AstBlockItem::Statement(ref mut statement) = block_item {
+                (func)(statement)?;
+
+                match &mut statement.typ {
+                    AstStatementType::If(
+                        _expr,
+                        ref mut then_statement,
+                        ref mut else_statement_opt,
+                    ) => {
+                        (func)(then_statement)?;
+
+                        if let Some(else_statement) = else_statement_opt {
+                            (func)(else_statement)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn to_tac(&self, global_tracking: &mut GlobalTracking) -> Result<TacFunction, String> {
@@ -569,11 +640,15 @@ impl AstBlockItem {
         function_tracking: &mut FunctionTracking,
     ) -> Result<(), String> {
         match self {
-            AstBlockItem::Statement(statement) => statement.validate_and_resolve(function_tracking),
+            AstBlockItem::Statement(statement) => {
+                statement.validate_and_resolve_variables(function_tracking)?;
+            }
             AstBlockItem::Declaration(declaration) => {
-                declaration.validate_and_resolve(global_tracking, function_tracking)
+                declaration.validate_and_resolve_variables(global_tracking, function_tracking)?;
             }
         }
+
+        Ok(())
     }
 
     fn to_tac(
@@ -600,7 +675,7 @@ impl FmtNode for AstBlockItem {
 }
 
 impl AstDeclaration {
-    fn validate_and_resolve(
+    fn validate_and_resolve_variables(
         &mut self,
         global_tracking: &mut GlobalTracking,
         function_tracking: &mut FunctionTracking,
@@ -608,7 +683,7 @@ impl AstDeclaration {
         self.identifier = function_tracking.add_variable(global_tracking, &self.identifier)?;
 
         if let Some(initializer) = &mut self.initializer_opt {
-            initializer.validate_and_resolve(function_tracking)?;
+            initializer.validate_and_resolve_variables(function_tracking)?;
         }
 
         Ok(())
@@ -643,24 +718,35 @@ impl FmtNode for AstDeclaration {
     }
 }
 
+impl AstLabel {
+    fn to_tac(&self) -> TacLabel {
+        TacLabel(self.0.clone())
+    }
+}
+
 impl AstStatement {
-    fn validate_and_resolve(
+    fn new(typ: AstStatementType, labels: Vec<AstLabel>) -> Self {
+        Self { typ, labels }
+    }
+
+    fn validate_and_resolve_variables(
         &mut self,
         function_tracking: &mut FunctionTracking,
     ) -> Result<(), String> {
-        match self {
-            AstStatement::Return(expr) | AstStatement::Expr(expr) => {
-                expr.validate_and_resolve(function_tracking)?;
+        match &mut self.typ {
+            AstStatementType::Return(expr) | AstStatementType::Expr(expr) => {
+                expr.validate_and_resolve_variables(function_tracking)?;
             }
-            AstStatement::If(condition_expr, then_statement, else_statement_opt) => {
-                condition_expr.validate_and_resolve(function_tracking)?;
-                then_statement.validate_and_resolve(function_tracking)?;
+            AstStatementType::If(condition_expr, then_statement, else_statement_opt) => {
+                condition_expr.validate_and_resolve_variables(function_tracking)?;
+                then_statement.validate_and_resolve_variables(function_tracking)?;
 
                 if let Some(else_statement) = else_statement_opt {
-                    else_statement.validate_and_resolve(function_tracking)?;
+                    else_statement.validate_and_resolve_variables(function_tracking)?;
                 }
             }
-            AstStatement::Null => {}
+            AstStatementType::Goto(_label) => {}
+            AstStatementType::Null => {}
         }
 
         Ok(())
@@ -671,19 +757,24 @@ impl AstStatement {
         global_tracking: &mut GlobalTracking,
         instructions: &mut Vec<TacInstruction>,
     ) -> Result<(), String> {
-        match self {
-            AstStatement::Return(ast_exp) => {
+        // A statement can have one or more labels. Emit all of the labels applied to this statement first.
+        for label in self.labels.iter() {
+            instructions.push(TacInstruction::Label(label.to_tac()));
+        }
+
+        match &self.typ {
+            AstStatementType::Return(ast_exp) => {
                 let tac_val = ast_exp.to_tac(global_tracking, instructions)?;
                 instructions.push(TacInstruction::Return(tac_val));
             }
-            AstStatement::Expr(ast_exp) => {
+            AstStatementType::Expr(ast_exp) => {
                 let _tac_val = ast_exp.to_tac(global_tracking, instructions)?;
             }
-            AstStatement::If(condition_expr, then_statement, else_statement_opt) => {
-                let end_label = global_tracking.allocate_label("if_end");
+            AstStatementType::If(condition_expr, then_statement, else_statement_opt) => {
+                let end_label = TacLabel(global_tracking.allocate_label("if_end"));
 
                 let else_begin_label_opt = if else_statement_opt.is_some() {
-                    Some(global_tracking.allocate_label("else_begin"))
+                    Some(TacLabel(global_tracking.allocate_label("else_begin")))
                 } else {
                     None
                 };
@@ -712,7 +803,10 @@ impl AstStatement {
 
                 instructions.push(TacInstruction::Label(end_label));
             }
-            AstStatement::Null => {}
+            AstStatementType::Goto(label) => {
+                instructions.push(TacInstruction::Jump(label.to_tac()));
+            }
+            AstStatementType::Null => {}
         }
 
         Ok(())
@@ -723,15 +817,20 @@ impl FmtNode for AstStatement {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
         Self::write_indent(f, indent_levels)?;
 
-        match self {
-            AstStatement::Return(expr) => {
+        for label in self.labels.iter() {
+            writeln!(f, "{}:", label.0)?;
+            Self::write_indent(f, indent_levels)?;
+        }
+
+        match &self.typ {
+            AstStatementType::Return(expr) => {
                 write!(f, "return ")?;
                 expr.fmt_node(f, indent_levels + 1)?;
             }
-            AstStatement::Expr(expr) => {
+            AstStatementType::Expr(expr) => {
                 expr.fmt_node(f, indent_levels + 1)?;
             }
-            AstStatement::If(condition_expr, then_statement, else_statement_opt) => {
+            AstStatementType::If(condition_expr, then_statement, else_statement_opt) => {
                 write!(f, "if (")?;
                 condition_expr.fmt_node(f, indent_levels)?;
                 writeln!(f, ") {{")?;
@@ -748,7 +847,10 @@ impl FmtNode for AstStatement {
                     write!(f, "}}")?;
                 }
             }
-            AstStatement::Null => {}
+            AstStatementType::Goto(label) => {
+                write!(f, "goto {}", label.0)?;
+            }
+            AstStatementType::Null => {}
         }
 
         Ok(())
@@ -1011,7 +1113,7 @@ impl std::str::FromStr for AstBinaryOperator {
 }
 
 impl AstExpression {
-    fn validate_and_resolve(
+    fn validate_and_resolve_variables(
         &mut self,
         function_tracking: &mut FunctionTracking,
     ) -> Result<(), String> {
@@ -1033,14 +1135,14 @@ impl AstExpression {
                     _ => (),
                 }
 
-                ast_exp_inner.validate_and_resolve(function_tracking)?;
+                ast_exp_inner.validate_and_resolve_variables(function_tracking)?;
             }
             AstExpression::BinaryOperator(ast_exp_left, _binary_op, ast_exp_right) => {
-                ast_exp_left.validate_and_resolve(function_tracking)?;
-                ast_exp_right.validate_and_resolve(function_tracking)?;
+                ast_exp_left.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_right.validate_and_resolve_variables(function_tracking)?;
             }
             AstExpression::Var(ref mut ast_ident) => {
-                function_tracking.resolve_variable(ast_ident)?;
+                *ast_ident = function_tracking.resolve_variable(ast_ident)?.clone();
             }
             AstExpression::Assignment(ast_exp_left, _operator, ast_exp_right) => {
                 let AstExpression::Var(_) = **ast_exp_left else {
@@ -1050,13 +1152,13 @@ impl AstExpression {
                     ));
                 };
 
-                ast_exp_left.validate_and_resolve(function_tracking)?;
-                ast_exp_right.validate_and_resolve(function_tracking)?;
+                ast_exp_left.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_right.validate_and_resolve_variables(function_tracking)?;
             }
             AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
-                ast_exp_left.validate_and_resolve(function_tracking)?;
-                ast_exp_middle.validate_and_resolve(function_tracking)?;
-                ast_exp_right.validate_and_resolve(function_tracking)?;
+                ast_exp_left.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_middle.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_right.validate_and_resolve_variables(function_tracking)?;
             }
         }
 
@@ -1130,14 +1232,17 @@ impl AstExpression {
 
                 let tempvar = global_tracking.allocate_temporary();
 
-                let shortcircuit_label = global_tracking.allocate_label(if is_and {
+                let shortcircuit_label = TacLabel(global_tracking.allocate_label(if is_and {
                     "and_shortcircuit"
                 } else {
                     "or_shortcircuit"
-                });
+                }));
 
-                let end_label =
-                    global_tracking.allocate_label(if is_and { "and_end" } else { "or_end" });
+                let end_label = TacLabel(global_tracking.allocate_label(if is_and {
+                    "and_end"
+                } else {
+                    "or_end"
+                }));
 
                 // First emit code to calculate the left hand side.
                 let tac_exp_left_var = ast_exp_left.to_tac(global_tracking, instructions)?;
@@ -1229,8 +1334,8 @@ impl AstExpression {
             AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
                 let result_var = global_tracking.allocate_temporary();
 
-                let right_begin_label = global_tracking.allocate_label("cond_else_begin");
-                let end_label = global_tracking.allocate_label("cond_end");
+                let right_begin_label = TacLabel(global_tracking.allocate_label("cond_else_begin"));
+                let end_label = TacLabel(global_tracking.allocate_label("cond_end"));
 
                 let tac_exp_left_val = ast_exp_left.to_tac(global_tracking, instructions)?;
 
@@ -2524,9 +2629,9 @@ impl GlobalTracking {
         ))
     }
 
-    fn allocate_label(&mut self, prefix: &str) -> TacLabel {
+    fn allocate_label(&mut self, prefix: &str) -> String {
         self.next_label_id += 1;
-        TacLabel(format!("{}_{:03}", prefix, self.next_label_id - 1))
+        format!("{}_{:03}", prefix, self.next_label_id - 1)
     }
 }
 
@@ -2534,6 +2639,7 @@ impl FunctionTracking {
     fn new() -> Self {
         Self {
             variables: HashMap::new(),
+            labels: HashMap::new(),
         }
     }
 
@@ -2554,13 +2660,38 @@ impl FunctionTracking {
         Ok(temp_var)
     }
 
-    fn resolve_variable(&self, identifier: &mut AstIdentifier) -> Result<(), String> {
-        // If the variable was found in this scope, transform it into its mangled version.
+    fn resolve_variable(&self, identifier: &AstIdentifier) -> Result<&AstIdentifier, String> {
+        // If the variable was found in this scope, return its mangled version.
         if let Some(temp_ident) = self.variables.get(identifier) {
-            *identifier = temp_ident.clone();
-            Ok(())
+            Ok(temp_ident)
         } else {
             Err(format!("variable '{}' not found", &identifier.0))
+        }
+    }
+
+    fn add_goto_label(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        label: &AstLabel,
+    ) -> Result<AstLabel, String> {
+        if self.labels.contains_key(&label) {
+            return Err(format!("duplicate label declaration \"{}\"", &label.0));
+        }
+
+        let temp_label =
+            AstLabel(global_tracking.allocate_label(&format!("0userlabel_{}", &label.0)));
+        let old_value = self.labels.insert(label.clone(), temp_label.clone());
+        assert!(old_value.is_none());
+
+        Ok(temp_label)
+    }
+
+    fn resolve_label(&self, label: &AstLabel) -> Result<AstLabel, String> {
+        // If the label was found in this scope, return its mangled version.
+        if let Some(temp_label) = self.labels.get(label) {
+            Ok(temp_label.clone())
+        } else {
+            Err(format!("label '{}' not found", &label.0))
         }
     }
 }
@@ -2640,7 +2771,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
             Regex::new(r"^\?").expect("failed to compile regex"),
             Regex::new(r"^:").expect("failed to compile regex"),
             Regex::new(r"^,").expect("failed to compile regex"),
-            Regex::new(r"^[a-zA-Z]\w*\b").expect("failed to compile regex"),
+            Regex::new(r"^[a-zA-Z_]\w*\b").expect("failed to compile regex"),
             Regex::new(r"^[0-9]+\b").expect("failed to compile regex"),
         ];
     }
@@ -2758,12 +2889,14 @@ fn parse_block_item<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstB
 fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
     let mut tokens = original_tokens.clone();
 
-    let statement = if tokens.consume_expected_next_token("return").is_ok() {
-        let st = AstStatement::Return(parse_expression(&mut tokens)?);
+    let labels = parse_statement_labels(&mut tokens)?;
+
+    let statement_type = if tokens.consume_expected_next_token("return").is_ok() {
+        let st = AstStatementType::Return(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
         st
     } else if tokens.consume_expected_next_token(";").is_ok() {
-        AstStatement::Null
+        AstStatementType::Null
     } else if tokens.consume_expected_next_token("if").is_ok() {
         tokens.consume_expected_next_token("(")?;
         let condition_expr = parse_expression(&mut tokens)?;
@@ -2776,15 +2909,47 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
             None
         };
 
-        AstStatement::If(condition_expr, Box::new(then_statement), else_statement_opt)
+        AstStatementType::If(condition_expr, Box::new(then_statement), else_statement_opt)
+    } else if tokens.consume_expected_next_token("goto").is_ok() {
+        let label_name = tokens.consume_identifier()?;
+        tokens.consume_expected_next_token(";")?;
+        AstStatementType::Goto(AstLabel(String::from(label_name)))
     } else {
-        let st = AstStatement::Expr(parse_expression(&mut tokens)?);
+        let st = AstStatementType::Expr(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
         st
     };
 
     *original_tokens = tokens;
-    Ok(statement)
+    Ok(AstStatement::new(statement_type, labels))
+}
+
+fn parse_statement_labels<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+) -> Result<Vec<AstLabel>, String> {
+    fn parse_label<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstLabel, String> {
+        let mut tokens = original_tokens.clone();
+
+        // Label is a name followed by :
+        let label_name = tokens.consume_identifier()?;
+        tokens.consume_expected_next_token(":")?;
+
+        *original_tokens = tokens;
+        Ok(AstLabel(String::from(label_name)))
+    }
+
+    let mut tokens = original_tokens.clone();
+
+    let mut labels = vec![];
+
+    loop {
+        if let Ok(label) = parse_label(&mut tokens) {
+            labels.push(label);
+        } else {
+            *original_tokens = tokens;
+            return Ok(labels);
+        }
+    }
 }
 
 fn parse_declaration<'i, 't>(
@@ -3789,6 +3954,14 @@ mod test {
             ",
             );
         }
+
+        #[test]
+        fn keywords_as_var_identifier() {
+            test_codegen_mainfunc_failure("int if = 0; return if;");
+            test_codegen_mainfunc_failure("int int = 0; return int;");
+            test_codegen_mainfunc_failure("int void = 0; return void;");
+            test_codegen_mainfunc_failure("int return = 0; return return;");
+        }
     }
 
     #[test]
@@ -4145,7 +4318,7 @@ mod test {
     #[test]
     fn var_use() {
         test_codegen_mainfunc(
-            "int x = 5; int y = 6; int z; x = 1; z = 3; return x + y + z;",
+            "int _x = 5; int y = 6; int z; _x = 1; z = 3; return _x + y + z;",
             10,
         );
     }
@@ -4664,6 +4837,275 @@ mod test {
     ",
             1,
         );
+    }
+
+    mod goto {
+        use super::*;
+
+        #[test]
+        fn skip_declaration() {
+            test_codegen_mainfunc(
+                r"
+    int x = 1;
+    goto post_declaration;
+    // we skip over initializer, so it's not executed
+    int i = (x = 0);
+
+    post_declaration:
+    // even though we didn't initialize i, it's in scope, so we can use it
+    i = 5;
+    return (x == 1 && i == 5);
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn same_as_var_name() {
+            test_codegen_mainfunc(
+                r"
+    // it's valid to use the same identifier as a variable and label
+    int ident = 5;
+    goto ident;
+    return 0;
+ident:
+    return ident;
+            ",
+                5,
+            );
+        }
+
+        #[test]
+        fn same_as_func_name() {
+            test_codegen_mainfunc(
+                r"
+    // it's legal to use main as both a function name and label
+    goto main;
+    return 5;
+main:
+    return 0;
+            ",
+                0,
+            );
+        }
+
+        #[test]
+        fn nested_label() {
+            test_codegen_mainfunc(
+                r"
+    goto labelB;
+
+    labelA:
+        labelB:
+            return 5;
+    return 0;
+            ",
+                5,
+            );
+        }
+
+        #[test]
+        fn label_all_statements() {
+            test_codegen_mainfunc(
+                r"
+    int a = 1;
+label_if:
+    if (a)
+        goto label_expression;
+    else
+        goto label_empty;
+
+label_goto:
+    goto label_return;
+
+    if (0)
+    label_expression:
+        a = 0;
+
+    goto label_if;
+
+label_return:
+    return a;
+
+label_empty:;
+    a = 100;
+    goto label_goto;
+            ",
+                100,
+            );
+        }
+
+        #[test]
+        fn label_name() {
+            test_codegen_mainfunc(
+                r"
+    goto _foo_1_;  // a label may include numbers and underscores
+    return 0;
+_foo_1_:
+    return 1;
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn unused_label() {
+            test_codegen_mainfunc(
+                r"
+unused:
+    return 0;
+            ",
+                0,
+            );
+        }
+
+        #[test]
+        fn whitespace_after_label() {
+            test_codegen_mainfunc(
+                r"
+    goto label2;
+    return 0;
+    // okay to have space or newline between label and colon
+    label1 :
+    return 1;
+    label2
+    :
+    goto label1;
+            ",
+                1,
+            );
+        }
+
+        mod fail {
+            use super::*;
+
+            #[test]
+            fn label_name() {
+                test_codegen_mainfunc_failure(r"0invalid_label: return 0;");
+            }
+
+            #[test]
+            fn label_keyword_name() {
+                test_codegen_mainfunc_failure(r"return: return 0;");
+            }
+
+            #[test]
+            fn whitespace_after_label() {
+                test_codegen_mainfunc_failure(
+                    r"
+    goto;
+lbl:
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn label_declaration() {
+                test_codegen_mainfunc_failure(
+                    r"
+// NOTE: this is a syntax error in C17 but valid in C23
+label:
+    int a = 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn label_without_statement() {
+                test_codegen_mainfunc_failure(
+                    r"
+    // NOTE: this is invalid in C17, but valid in C23
+    foo:
+                ",
+                );
+            }
+
+            #[test]
+            fn parenthesized_label() {
+                test_codegen_mainfunc_failure(
+                    r"
+    goto(a);
+a:
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn duplicate_label() {
+                test_codegen_mainfunc_failure(
+                    r"
+    int x = 0;
+label:
+    x = 1;
+label:
+    return 2;
+                ",
+                );
+            }
+
+            #[test]
+            fn unknown_label() {
+                test_codegen_mainfunc_failure(
+                    r"
+    goto label;
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn variable_as_label() {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a;
+    goto a;
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn undeclared_var_in_labeled_statement() {
+                test_codegen_mainfunc_failure(
+                    r"
+lbl:
+    return a;
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn label_as_variable() {
+                test_codegen_mainfunc_failure(
+                    r"
+    int x = 0;
+    a:
+    x = a;
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn label_in_expression() {
+                test_codegen_mainfunc_failure(r"1 && label: 2;");
+            }
+
+            #[test]
+            fn label_outside_function() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+label:
+int main(void) {
+    return 0;
+}
+                ",
+                );
+            }
+        }
     }
 
     #[test]
