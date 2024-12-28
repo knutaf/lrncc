@@ -30,6 +30,12 @@ fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
 }
 
+fn push_error(result: Result<(), String>, errors: &mut Vec<String>) {
+    if let Err(error) = result {
+        errors.push(error);
+    }
+}
+
 fn fmt_list<'t, T>(
     f: &mut fmt::Formatter,
     list: impl Iterator<Item = &'t T>,
@@ -225,17 +231,20 @@ struct AstProgram<'i> {
     global_tracking_opt: Option<GlobalTracking>,
 }
 
+#[derive(Debug, Clone)]
+struct AstBlock(Vec<AstBlockItem>);
+
 #[derive(Debug)]
 struct AstFunction<'i> {
     name: &'i str,
     parameters: Vec<String>,
-    body: Vec<AstBlockItem>,
+    body: AstBlock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AstIdentifier(String);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum AstBlockItem {
     Statement(AstStatement),
     Declaration(AstDeclaration),
@@ -263,6 +272,7 @@ enum AstStatementType {
     Expr(AstExpression),
     If(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
     Goto(AstLabel),
+    Compound(Box<AstBlock>),
     Null,
 }
 
@@ -465,8 +475,13 @@ struct GlobalTracking {
 
 #[derive(Debug)]
 struct FunctionTracking {
-    variables: HashMap<AstIdentifier, AstIdentifier>,
     labels: HashMap<AstLabel, AstLabel>,
+}
+
+#[derive(Debug)]
+struct BlockTracking<'p> {
+    parent_opt: Option<&'p BlockTracking<'p>>,
+    variables: HashMap<AstIdentifier, AstIdentifier>,
 }
 
 #[derive(Debug)]
@@ -495,41 +510,43 @@ impl<'i> AstProgram<'i> {
             let mut function_tracking = FunctionTracking::new();
             let global_tracking = self.global_tracking_opt.as_mut().unwrap();
 
-            func.validate_and_resolve_variables(
-                global_tracking,
-                &mut function_tracking,
+            func.validate_and_resolve_variables(global_tracking, &mut errors);
+
+            push_error(
+                func.for_each_statement(|ast_statement| {
+                    for label in ast_statement.labels.iter_mut() {
+                        match function_tracking.add_goto_label(global_tracking, label) {
+                            Ok(new_label) => {
+                                *label = new_label;
+                            }
+                            Err(err) => {
+                                errors.push(err);
+                            }
+                        }
+                    }
+
+                    Ok(())
+                }),
                 &mut errors,
             );
 
-            func.for_each_statement(|ast_statement| {
-                for label in ast_statement.labels.iter_mut() {
-                    match function_tracking.add_goto_label(global_tracking, label) {
-                        Ok(new_label) => {
-                            *label = new_label;
-                        }
-                        Err(err) => {
-                            errors.push(err);
-                        }
-                    }
-                }
-
-                Ok(())
-            });
-
-            func.for_each_statement(|ast_statement| {
-                if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
-                    match function_tracking.resolve_label(label) {
-                        Ok(new_label) => {
-                            *label = new_label;
-                        }
-                        Err(err) => {
-                            errors.push(err);
+            push_error(
+                func.for_each_statement(|ast_statement| {
+                    if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
+                        match function_tracking.resolve_label(label) {
+                            Ok(new_label) => {
+                                *label = new_label;
+                            }
+                            Err(err) => {
+                                errors.push(err);
+                            }
                         }
                     }
-                }
 
-                Ok(())
-            });
+                    Ok(())
+                }),
+                &mut errors,
+            );
         }
 
         if errors.is_empty() {
@@ -555,55 +572,65 @@ impl<'i> FmtNode for AstProgram<'i> {
     }
 }
 
-impl<'i> AstFunction<'i> {
+impl AstBlock {
     fn validate_and_resolve_variables(
         &mut self,
         global_tracking: &mut GlobalTracking,
-        function_tracking: &mut FunctionTracking,
+        block_tracking: &mut BlockTracking,
         errors: &mut Vec<String>,
     ) {
-        for block_item in self.body.iter_mut() {
-            if let Err(err) =
-                block_item.validate_and_resolve_variables(global_tracking, function_tracking)
-            {
-                errors.push(err);
-            }
+        for block_item in self.0.iter_mut() {
+            block_item.validate_and_resolve_variables(global_tracking, block_tracking, errors);
         }
     }
 
-    fn for_each_statement<F>(&mut self, mut func: F) -> Result<(), String>
+    fn for_each_statement<F>(&mut self, func: &mut F) -> Result<(), String>
     where
         F: FnMut(&mut AstStatement) -> Result<(), String>,
     {
-        for block_item in self.body.iter_mut() {
+        for block_item in self.0.iter_mut() {
             if let AstBlockItem::Statement(ref mut statement) = block_item {
-                (func)(statement)?;
-
-                match &mut statement.typ {
-                    AstStatementType::If(
-                        _expr,
-                        ref mut then_statement,
-                        ref mut else_statement_opt,
-                    ) => {
-                        (func)(then_statement)?;
-
-                        if let Some(else_statement) = else_statement_opt {
-                            (func)(else_statement)?;
-                        }
-                    }
-                    _ => {}
-                }
+                statement.for_each_statement(func)?;
             }
         }
 
         Ok(())
     }
 
+    fn to_tac(
+        &self,
+        global_tracking: &mut GlobalTracking,
+        instructions: &mut Vec<TacInstruction>,
+    ) -> Result<(), String> {
+        for block_item in self.0.iter() {
+            block_item.to_tac(global_tracking, instructions)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'i> AstFunction<'i> {
+    fn validate_and_resolve_variables(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        errors: &mut Vec<String>,
+    ) {
+        let mut block_tracking = BlockTracking::new(None);
+        self.body
+            .validate_and_resolve_variables(global_tracking, &mut block_tracking, errors);
+    }
+
+    fn for_each_statement<F>(&mut self, mut func: F) -> Result<(), String>
+    where
+        F: FnMut(&mut AstStatement) -> Result<(), String>,
+    {
+        self.body.for_each_statement(&mut func)
+    }
+
     fn to_tac(&self, global_tracking: &mut GlobalTracking) -> Result<TacFunction, String> {
         let mut body_instructions = vec![];
-        for block_item in self.body.iter() {
-            block_item.to_tac(global_tracking, &mut body_instructions)?;
-        }
+        self.body.to_tac(global_tracking, &mut body_instructions)?;
 
         // In C, functions lacking a return value either automatically return 0 (in the case of main), have undefined
         // behavior (if the function's return value is actually used), or the return value doesn't matter (if the return
@@ -624,7 +651,7 @@ impl<'i> FmtNode for AstFunction<'i> {
         write!(f, "FUNC {}(", self.name)?;
         fmt_list(f, self.parameters.iter(), ", ")?;
         writeln!(f, "):")?;
-        for block_item in self.body.iter() {
+        for block_item in self.body.0.iter() {
             block_item.fmt_node(f, indent_levels + 1)?;
             writeln!(f)?;
         }
@@ -643,18 +670,17 @@ impl AstBlockItem {
     fn validate_and_resolve_variables(
         &mut self,
         global_tracking: &mut GlobalTracking,
-        function_tracking: &mut FunctionTracking,
-    ) -> Result<(), String> {
+        block_tracking: &mut BlockTracking,
+        errors: &mut Vec<String>,
+    ) {
         match self {
             AstBlockItem::Statement(statement) => {
-                statement.validate_and_resolve_variables(function_tracking)?;
+                statement.validate_and_resolve_variables(global_tracking, block_tracking, errors);
             }
             AstBlockItem::Declaration(declaration) => {
-                declaration.validate_and_resolve_variables(global_tracking, function_tracking)?;
+                declaration.validate_and_resolve_variables(global_tracking, block_tracking, errors);
             }
         }
-
-        Ok(())
     }
 
     fn to_tac(
@@ -684,15 +710,25 @@ impl AstDeclaration {
     fn validate_and_resolve_variables(
         &mut self,
         global_tracking: &mut GlobalTracking,
-        function_tracking: &mut FunctionTracking,
-    ) -> Result<(), String> {
-        self.identifier = function_tracking.add_variable(global_tracking, &self.identifier)?;
-
-        if let Some(initializer) = &mut self.initializer_opt {
-            initializer.validate_and_resolve_variables(function_tracking)?;
+        block_tracking: &mut BlockTracking,
+        errors: &mut Vec<String>,
+    ) {
+        match block_tracking.add_variable(global_tracking, &self.identifier) {
+            Ok(identifier) => {
+                self.identifier = identifier;
+            }
+            Err(error) => {
+                errors.push(error);
+                return;
+            }
         }
 
-        Ok(())
+        if let Some(initializer) = &mut self.initializer_opt {
+            push_error(
+                initializer.validate_and_resolve_variables(block_tracking),
+                errors,
+            );
+        }
     }
 
     fn to_tac(
@@ -737,21 +773,65 @@ impl AstStatement {
 
     fn validate_and_resolve_variables(
         &mut self,
-        function_tracking: &mut FunctionTracking,
-    ) -> Result<(), String> {
+        global_tracking: &mut GlobalTracking,
+        block_tracking: &mut BlockTracking,
+        errors: &mut Vec<String>,
+    ) {
         match &mut self.typ {
             AstStatementType::Return(expr) | AstStatementType::Expr(expr) => {
-                expr.validate_and_resolve_variables(function_tracking)?;
+                push_error(expr.validate_and_resolve_variables(block_tracking), errors);
             }
             AstStatementType::If(condition_expr, then_statement, else_statement_opt) => {
-                condition_expr.validate_and_resolve_variables(function_tracking)?;
-                then_statement.validate_and_resolve_variables(function_tracking)?;
+                push_error(
+                    condition_expr.validate_and_resolve_variables(block_tracking),
+                    errors,
+                );
+                then_statement.validate_and_resolve_variables(
+                    global_tracking,
+                    block_tracking,
+                    errors,
+                );
 
                 if let Some(else_statement) = else_statement_opt {
-                    else_statement.validate_and_resolve_variables(function_tracking)?;
+                    else_statement.validate_and_resolve_variables(
+                        global_tracking,
+                        block_tracking,
+                        errors,
+                    );
                 }
             }
             AstStatementType::Goto(_label) => {}
+            AstStatementType::Compound(block) => {
+                // Create a new scope contained within this one, so that variables can be declared within that shadow
+                // the outside ones.
+                let mut inner_block = BlockTracking::new(Some(&block_tracking));
+
+                block.validate_and_resolve_variables(global_tracking, &mut inner_block, errors);
+            }
+            AstStatementType::Null => {}
+        }
+    }
+
+    fn for_each_statement<F>(&mut self, func: &mut F) -> Result<(), String>
+    where
+        F: FnMut(&mut AstStatement) -> Result<(), String>,
+    {
+        (func)(self)?;
+
+        match &mut self.typ {
+            AstStatementType::Return(_expr) => {}
+            AstStatementType::If(_expr, ref mut then_statement, ref mut else_statement_opt) => {
+                then_statement.for_each_statement(func)?;
+
+                if let Some(else_statement) = else_statement_opt {
+                    else_statement.for_each_statement(func)?;
+                }
+            }
+            AstStatementType::Expr(_expr) => {}
+            AstStatementType::Goto(_label) => {}
+            AstStatementType::Compound(block) => {
+                block.for_each_statement(func)?;
+            }
             AstStatementType::Null => {}
         }
 
@@ -812,6 +892,9 @@ impl AstStatement {
             AstStatementType::Goto(label) => {
                 instructions.push(TacInstruction::Jump(label.to_tac()));
             }
+            AstStatementType::Compound(block) => {
+                block.to_tac(global_tracking, instructions)?;
+            }
             AstStatementType::Null => {}
         }
 
@@ -839,11 +922,10 @@ impl FmtNode for AstStatement {
             AstStatementType::If(condition_expr, then_statement, else_statement_opt) => {
                 write!(f, "if (")?;
                 condition_expr.fmt_node(f, indent_levels)?;
-                writeln!(f, ") {{")?;
+                writeln!(f, ")")?;
                 then_statement.fmt_node(f, indent_levels + 1)?;
                 writeln!(f)?;
                 Self::write_indent(f, indent_levels)?;
-                write!(f, "}}")?;
 
                 if let Some(else_statement) = else_statement_opt {
                     writeln!(f, " else {{")?;
@@ -855,6 +937,17 @@ impl FmtNode for AstStatement {
             }
             AstStatementType::Goto(label) => {
                 write!(f, "goto {}", label.0)?;
+            }
+            AstStatementType::Compound(block) => {
+                writeln!(f, "{{")?;
+
+                for block_item in block.0.iter() {
+                    block_item.fmt_node(f, indent_levels + 1)?;
+                    writeln!(f)?;
+                }
+
+                Self::write_indent(f, indent_levels)?;
+                write!(f, "}}")?;
             }
             AstStatementType::Null => {}
         }
@@ -1121,7 +1214,7 @@ impl std::str::FromStr for AstBinaryOperator {
 impl AstExpression {
     fn validate_and_resolve_variables(
         &mut self,
-        function_tracking: &mut FunctionTracking,
+        block_tracking: &mut BlockTracking,
     ) -> Result<(), String> {
         match self {
             AstExpression::Constant(num) => {}
@@ -1141,14 +1234,14 @@ impl AstExpression {
                     _ => (),
                 }
 
-                ast_exp_inner.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_inner.validate_and_resolve_variables(block_tracking)?;
             }
             AstExpression::BinaryOperator(ast_exp_left, _binary_op, ast_exp_right) => {
-                ast_exp_left.validate_and_resolve_variables(function_tracking)?;
-                ast_exp_right.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_left.validate_and_resolve_variables(block_tracking)?;
+                ast_exp_right.validate_and_resolve_variables(block_tracking)?;
             }
             AstExpression::Var(ref mut ast_ident) => {
-                *ast_ident = function_tracking.resolve_variable(ast_ident)?.clone();
+                *ast_ident = block_tracking.resolve_variable(ast_ident)?.clone();
             }
             AstExpression::Assignment(ast_exp_left, _operator, ast_exp_right) => {
                 let AstExpression::Var(_) = **ast_exp_left else {
@@ -1158,13 +1251,13 @@ impl AstExpression {
                     ));
                 };
 
-                ast_exp_left.validate_and_resolve_variables(function_tracking)?;
-                ast_exp_right.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_left.validate_and_resolve_variables(block_tracking)?;
+                ast_exp_right.validate_and_resolve_variables(block_tracking)?;
             }
             AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
-                ast_exp_left.validate_and_resolve_variables(function_tracking)?;
-                ast_exp_middle.validate_and_resolve_variables(function_tracking)?;
-                ast_exp_right.validate_and_resolve_variables(function_tracking)?;
+                ast_exp_left.validate_and_resolve_variables(block_tracking)?;
+                ast_exp_middle.validate_and_resolve_variables(block_tracking)?;
+                ast_exp_right.validate_and_resolve_variables(block_tracking)?;
             }
         }
 
@@ -2644,34 +2737,7 @@ impl GlobalTracking {
 impl FunctionTracking {
     fn new() -> Self {
         Self {
-            variables: HashMap::new(),
             labels: HashMap::new(),
-        }
-    }
-
-    /// Adds a variable to the map and returns a unique, mangled identifier to refer to the variable with.
-    fn add_variable(
-        &mut self,
-        global_tracking: &mut GlobalTracking,
-        identifier: &AstIdentifier,
-    ) -> Result<AstIdentifier, String> {
-        if self.variables.contains_key(&identifier) {
-            return Err(format!("duplicate variable declaration {}", &identifier.0));
-        }
-
-        let temp_var = global_tracking.create_temporary_ast_ident(&identifier);
-        let old_value = self.variables.insert(identifier.clone(), temp_var.clone());
-        assert!(old_value.is_none());
-
-        Ok(temp_var)
-    }
-
-    fn resolve_variable(&self, identifier: &AstIdentifier) -> Result<&AstIdentifier, String> {
-        // If the variable was found in this scope, return its mangled version.
-        if let Some(temp_ident) = self.variables.get(identifier) {
-            Ok(temp_ident)
-        } else {
-            Err(format!("variable '{}' not found", &identifier.0))
         }
     }
 
@@ -2698,6 +2764,44 @@ impl FunctionTracking {
             Ok(temp_label.clone())
         } else {
             Err(format!("label '{}' not found", &label.0))
+        }
+    }
+}
+
+impl<'p> BlockTracking<'p> {
+    fn new(parent_opt: Option<&'p BlockTracking>) -> Self {
+        Self {
+            parent_opt,
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Adds a variable to the map and returns a unique, mangled identifier to refer to the variable with.
+    fn add_variable(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        identifier: &AstIdentifier,
+    ) -> Result<AstIdentifier, String> {
+        if self.variables.contains_key(&identifier) {
+            return Err(format!("duplicate variable declaration {}", &identifier.0));
+        }
+
+        let temp_var = global_tracking.create_temporary_ast_ident(&identifier);
+        let old_value = self.variables.insert(identifier.clone(), temp_var.clone());
+        assert!(old_value.is_none());
+
+        Ok(temp_var)
+    }
+
+    fn resolve_variable(&self, identifier: &AstIdentifier) -> Result<&AstIdentifier, String> {
+        // If the variable was found in this scope, return its mangled version.
+        if let Some(temp_ident) = self.variables.get(identifier) {
+            Ok(temp_ident)
+        } else if let Some(parent) = self.parent_opt {
+            // If this block is contained within another block, search that one for a variable instead.
+            parent.resolve_variable(identifier)
+        } else {
+            Err(format!("variable '{}' not found", &identifier.0))
         }
     }
 }
@@ -2795,17 +2899,7 @@ fn parse_function<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstFun
 
     tokens.consume_expected_next_token(")")?;
 
-    tokens.consume_expected_next_token("{")?;
-
-    let mut body = vec![];
-
-    loop {
-        if let Ok(operator) = tokens.consume_expected_next_token("}") {
-            break;
-        }
-
-        body.push(parse_block_item(&mut tokens)?);
-    }
+    let body = parse_block(&mut tokens)?;
 
     *original_tokens = tokens;
     Ok(AstFunction {
@@ -2830,6 +2924,25 @@ fn parse_function_parameter<'i, 't>(
     let var_name = tokens.consume_identifier()?;
     *original_tokens = tokens;
     Ok(var_name)
+}
+
+fn parse_block<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlock, String> {
+    let mut tokens = original_tokens.clone();
+
+    tokens.consume_expected_next_token("{")?;
+
+    let mut body = vec![];
+
+    loop {
+        if let Ok(operator) = tokens.consume_expected_next_token("}") {
+            break;
+        }
+
+        body.push(parse_block_item(&mut tokens)?);
+    }
+
+    *original_tokens = tokens;
+    Ok(AstBlock(body))
 }
 
 fn parse_block_item<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
@@ -2878,6 +2991,8 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
         let label_name = tokens.consume_identifier()?;
         tokens.consume_expected_next_token(";")?;
         AstStatementType::Goto(AstLabel(String::from(label_name)))
+    } else if let Ok(block) = parse_block(&mut tokens) {
+        AstStatementType::Compound(Box::new(block))
     } else {
         let st = AstStatementType::Expr(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
@@ -3926,6 +4041,55 @@ mod test {
             test_codegen_mainfunc_failure("int void = 0; return void;");
             test_codegen_mainfunc_failure("int return = 0; return return;");
         }
+
+        #[test]
+        fn extra_closing_brace() {
+            test_codegen_mainfunc_failure("if(0){ return 1; }} return 2;");
+        }
+
+        #[test]
+        fn missing_closing_brace() {
+            test_codegen_mainfunc_failure("if(0){ return 1; return 2;");
+        }
+
+        #[test]
+        fn missing_semicolon_in_block() {
+            test_codegen_mainfunc_failure("int a = 4; { a = 5; return a }");
+        }
+
+        #[test]
+        fn block_in_ternary() {
+            test_codegen_mainfunc_failure("int a; return 1 ? { a = 2 } : a = 4;");
+        }
+
+        #[test]
+        fn duplicate_var_declaration() {
+            test_codegen_mainfunc_failure("{ int a; int a; }");
+        }
+
+        #[test]
+        fn use_var_after_scope() {
+            test_codegen_mainfunc_failure("{ int a = 2; } return a;");
+        }
+
+        #[test]
+        fn use_var_before_declare() {
+            test_codegen_mainfunc_failure("int a; { b = 10; } int b; return b;");
+        }
+
+        #[test]
+        fn duplicate_var_declaration_after_block() {
+            test_codegen_mainfunc_failure(
+                r"
+    int a = 3;
+    {
+        a = 5;
+    }
+    int a = 2;
+    return a;
+            ",
+            );
+        }
     }
 
     #[test]
@@ -4940,6 +5104,86 @@ unused:
             );
         }
 
+        #[test]
+        fn goto_after_declaration() {
+            test_codegen_mainfunc(
+                r"
+    int a = 0;
+    {
+        if (a != 0)
+            return_a:
+                return a;
+        int a = 4;
+        goto return_a;
+    }
+            ",
+                0,
+            );
+        }
+
+        #[test]
+        fn goto_inner_scope() {
+            test_codegen_mainfunc(
+                r"
+    int x = 5;
+    goto inner;
+    {
+        int x = 0;
+        inner:
+        x = 1;
+        return x;
+    }
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn goto_outer_scope() {
+            test_codegen_mainfunc(
+                r"
+    int a = 10;
+    int b = 0;
+    if (a) {
+        int a = 1;
+        b = a;
+        goto end;
+    }
+    a = 9;
+end:
+    return (a == 10 && b == 1);
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn jump_between_sibling_scopes() {
+            test_codegen_mainfunc(
+                r"
+    int sum = 0;
+    if (1) {
+        int a = 5;
+        goto other_if;
+        sum = 0;  // not executed
+    first_if:
+        // when we jump back into block at this label, a is uninitialized, so we need to initialize it again
+        a = 5;
+        sum = sum + a;  // sum = 11
+    }
+    if (0) {
+    other_if:;
+        int a = 6;
+        sum = sum + a;  // sum = 6
+        goto first_if;
+        sum = 0;
+    }
+    return sum;
+            ",
+                11,
+            );
+        }
+
         mod fail {
             use super::*;
 
@@ -5069,16 +5313,250 @@ int main(void) {
                 ",
                 );
             }
+
+            #[test]
+            fn different_label_same_scope() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    // different labels do not define different scopes
+label1:;
+    int a = 10;
+label2:;
+    int a = 11;
+    return 1;
+                ",
+                );
+            }
+
+            #[test]
+            fn duplicate_labels_different_scopes() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    int x = 0;
+    if (x) {
+        x = 5;
+        goto l;
+        return 0;
+        l:
+            return x;
+    } else {
+        goto l;
+        return 0;
+        l:
+            return x;
+    }
+                ",
+                );
+            }
+
+            #[test]
+            fn goto_use_before_declare() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    int x = 0;
+    if (x != 0) {
+        return_y:
+        return y; // not declared
+    }
+    int y = 4;
+    goto return_y;
+                ",
+                );
+            }
         }
     }
 
     #[test]
-    #[ignore]
-    fn block_var_declarations() {
-        test_codegen_mainfunc("int x = 1; { x = 3; } return x;", 3);
-        test_codegen_mainfunc("int x = 1; { int x = 3; } return x;", 1);
-        test_codegen_mainfunc("int x = 1; { int y; } int z = 7; return z;", 7);
-        test_codegen_mainfunc_failure("int x = 1; { int x = 3; } int x = 5; return x;");
+    fn var_assign_to_self() {
+        test_codegen_mainfunc(
+            r"
+    int a = 3;
+    {
+        int a = a = 4;
+        return a;
+    }
+        ",
+            4,
+        );
+    }
+
+    #[test]
+    fn var_assign_to_self_inner_block() {
+        test_codegen_mainfunc(
+            r"
+    int a = 3;
+    {
+        int a = a = 4;
+    }
+    return a;
+        ",
+            3,
+        );
+    }
+
+    #[test]
+    fn var_assign_to_self_from_other_var_declaration_in_inner_block() {
+        test_codegen_mainfunc(
+            r"
+    int a;
+    {
+        int b = a = 1;
+    }
+    return a;
+        ",
+            1,
+        );
+    }
+
+    #[test]
+    fn empty_blocks() {
+        test_codegen_mainfunc(
+            r"
+    int ten = 10;
+    {}
+    int twenty = 10 * 2;
+    {{}}
+    return ten + twenty;
+        ",
+            30,
+        );
+    }
+
+    #[test]
+    fn var_hidden_then_visible() {
+        test_codegen_mainfunc(
+            r"
+    int a = 2;
+    int b;
+    {
+        a = -4;
+        int a = 7;
+        b = a + 1;
+    }
+    return b == 8 && a == -4;
+        ",
+            1,
+        );
+    }
+
+    #[test]
+    fn var_shadowed() {
+        test_codegen_mainfunc(
+            r"
+    int a = 2;
+    {
+        int a = 1;
+        return a;
+    }
+        ",
+            1,
+        );
+    }
+
+    #[test]
+    fn var_inner_uninitialized() {
+        test_codegen_mainfunc(
+            r"
+    int x = 4;
+    {
+        int x;
+    }
+    return x;
+        ",
+            4,
+        );
+    }
+
+    #[test]
+    fn var_same_name_different_blocks() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    {
+        int b = 4;
+        a = b;
+    }
+    {
+        int b = 2;
+        a = a - b;
+    }
+    return a;
+        ",
+            2,
+        );
+    }
+
+    #[test]
+    fn nested_if_compound_statements() {
+        test_codegen_mainfunc(
+            r"
+    int a = 0;
+    if (a) {
+        int b = 2;
+        return b;
+    } else {
+        int c = 3;
+        if (a < c) {
+            return !a;
+        } else {
+            return 5;
+        }
+    }
+    return a;
+        ",
+            1,
+        );
+    }
+
+    #[test]
+    fn nested_var_declarations() {
+        test_codegen_mainfunc(
+            r"
+    int a; // a0
+    int result;
+    int a1 = 1; // a10
+    {
+        int a = 2; //a1
+        int a1 = 2; // a11
+        {
+            int a; // a2
+            {
+                int a; // a3
+                {
+                    int a; // a4
+                    {
+                        int a; // a5
+                        {
+                            int a; // a6
+                            {
+                                int a; // a7
+                                {
+                                    int a; // a8
+                                    {
+                                        int a; // a9
+                                        {
+                                            int a = 20; // a10
+                                            result = a;
+                                            {
+                                                int a; // a11
+                                                a = 5;
+                                                result = result + a;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result = result + a1;
+    }
+    return result + a1;
+        ",
+            28,
+        );
     }
 
     #[test]
