@@ -8,7 +8,9 @@ use {
     rand::distributions::Alphanumeric,
     rand::{thread_rng, Rng},
     regex::Regex,
-    std::{collections::HashMap, fmt, fmt::Display, ops::Deref, path::*, process::*},
+    std::{
+        cell::RefCell, collections::HashMap, fmt, fmt::Display, ops::Deref, path::*, process::*,
+    },
 };
 
 const VARIABLE_SIZE: u32 = 8;
@@ -182,7 +184,8 @@ impl<'i, 't> Tokens<'i, 't> {
                 static ref IDENT_REGEX: Regex =
                     Regex::new(r"^[a-zA-Z_]\w*$").expect("failed to compile regex");
                 static ref KEYWORDS_REGEX: Regex =
-                    Regex::new(r"^(?:int|void|return|if|goto)$").expect("failed to compile regex");
+                    Regex::new(r"^(?:int|void|return|if|goto|for|break|continue)$")
+                        .expect("failed to compile regex");
             }
 
             IDENT_REGEX.is_match(token) && !KEYWORDS_REGEX.is_match(token)
@@ -273,7 +276,23 @@ enum AstStatementType {
     If(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
     Goto(AstLabel),
     Compound(Box<AstBlock>),
+    For(
+        AstForInit,
+        Option<AstExpression>,
+        Option<AstExpression>,
+        Box<AstStatement>,
+        Option<AstLabel>,
+        Option<AstLabel>,
+    ),
+    Break(Option<AstLabel>),
+    Continue(Option<AstLabel>),
     Null,
+}
+
+#[derive(Clone, Debug)]
+enum AstForInit {
+    Declaration(AstDeclaration),
+    Expression(Option<AstExpression>),
 }
 
 #[derive(Clone, Debug)]
@@ -485,6 +504,13 @@ struct BlockTracking<'p> {
 }
 
 #[derive(Debug)]
+struct BreakTracking {
+    parent_opt: Option<Box<BreakTracking>>,
+    break_label: AstLabel,
+    continue_label_opt: Option<AstLabel>,
+}
+
+#[derive(Debug)]
 struct FuncStackFrame {
     names: HashMap<String, i32>,
     max_base_offset: u32,
@@ -547,6 +573,113 @@ impl<'i> AstProgram<'i> {
                 }),
                 &mut errors,
             );
+
+            // Loop labeling: each loop has two labels associated with it: one that a break statement should jump to
+            // (after the end of the loop) and one that a continue statement should jump to (after the end of the body).
+            // Because of nesting, the current tracking data needs to store a reference to the containing tracking data,
+            // so when the loop is over, we can revert back to the parent.
+            //
+            // Because we are referencing break_tracking_opt in two closures, the borrow checker doesn't know that we
+            // are only referencing it one at a time, so store in a RefCell, to allow for borrowing it in both closures
+            // when needed.
+            let mut break_tracking_opt = RefCell::new(None);
+            push_error(
+                func.for_each_statement_and_after(
+                    |ast_statement| {
+                        match ast_statement.typ {
+                            AstStatementType::For(
+                                ref _ast_for_init,
+                                ref _ast_expr_condition_opt,
+                                ref _ast_expr_final_opt,
+                                ref _ast_statement_body,
+                                ref mut ast_body_end_label_opt,
+                                ref mut ast_loop_end_label_opt,
+                            ) => {
+                                assert!(ast_body_end_label_opt.is_none());
+                                assert!(ast_loop_end_label_opt.is_none());
+
+                                // Create new labels for this loop's body end and loop end, to be used in break and continue
+                                // statements.
+                                *ast_body_end_label_opt =
+                                    Some(AstLabel(global_tracking.allocate_label("for_body_end")));
+                                *ast_loop_end_label_opt =
+                                    Some(AstLabel(global_tracking.allocate_label("for_loop_end")));
+
+                                // Store the pre-existing tracking info into the new tracking info, so we can revert to it
+                                // after this loop is done.
+                                let parent_opt = break_tracking_opt.borrow_mut().take();
+                                *break_tracking_opt.borrow_mut() =
+                                    Some(Box::new(BreakTracking::new(
+                                        parent_opt,
+                                        ast_loop_end_label_opt.as_ref().unwrap().clone(),
+                                        ast_body_end_label_opt.clone(),
+                                    )));
+                            }
+                            AstStatementType::Break(ref mut label_opt) => {
+                                assert!(label_opt.is_none());
+
+                                let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
+                                    errors.push(format!(
+                                        "break statement with no containing loop or switch"
+                                    ));
+                                    return Ok(());
+                                };
+
+                                // Write in the correct label to use for breaking in this scope.
+                                *label_opt = Some(break_tracking.break_label.clone());
+                            }
+                            AstStatementType::Continue(ref mut label_opt) => {
+                                assert!(label_opt.is_none());
+
+                                // This could happen if the continue statement is found outside of a loop.
+                                let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
+                                    errors.push(format!(
+                                        "continue statement with no containing loop"
+                                    ));
+                                    return Ok(());
+                                };
+
+                                // This could happen if the continue statement is found outside of a loop or anything else
+                                // that uses BreakTracking, such as a switch statement.
+                                let Some(ref continue_label) = break_tracking.continue_label_opt
+                                else {
+                                    errors.push(format!(
+                                        "continue statement with no containing loop"
+                                    ));
+                                    return Ok(());
+                                };
+
+                                // Write in the correct label to use for continuing in this scope.
+                                *label_opt = Some(continue_label.clone());
+                            }
+                            _ => {}
+                        }
+
+                        Ok(())
+                    },
+                    |ast_statement| {
+                        if let AstStatementType::For(
+                            _ast_for_init,
+                            _ast_expr_condition_opt,
+                            _ast_expr_final_opt,
+                            _ast_statement_body,
+                            _ast_body_end_label_opt,
+                            _ast_loop_end_label_opt,
+                        ) = &ast_statement.typ
+                        {
+                            assert!(break_tracking_opt.borrow().is_some());
+
+                            // This for loop is done, so revert the break tracking to its containing one.
+                            let parent_opt =
+                                break_tracking_opt.borrow_mut().take().unwrap().parent_opt;
+                            *break_tracking_opt.borrow_mut() = parent_opt;
+                        }
+
+                        Ok(())
+                    },
+                ),
+                &mut errors,
+            );
         }
 
         if errors.is_empty() {
@@ -584,13 +717,18 @@ impl AstBlock {
         }
     }
 
-    fn for_each_statement<F>(&mut self, func: &mut F) -> Result<(), String>
+    fn for_each_statement_and_after<F1, F2>(
+        &mut self,
+        func: &mut F1,
+        func_after: &mut F2,
+    ) -> Result<(), String>
     where
-        F: FnMut(&mut AstStatement) -> Result<(), String>,
+        F1: FnMut(&mut AstStatement) -> Result<(), String>,
+        F2: FnMut(&mut AstStatement) -> Result<(), String>,
     {
         for block_item in self.0.iter_mut() {
             if let AstBlockItem::Statement(ref mut statement) = block_item {
-                statement.for_each_statement(func)?;
+                statement.for_each_statement_and_after(func, func_after)?;
             }
         }
 
@@ -621,11 +759,29 @@ impl<'i> AstFunction<'i> {
             .validate_and_resolve_variables(global_tracking, &mut block_tracking, errors);
     }
 
+    fn for_each_statement_and_after<F1, F2>(
+        &mut self,
+        mut func: F1,
+        mut func_after: F2,
+    ) -> Result<(), String>
+    where
+        F1: FnMut(&mut AstStatement) -> Result<(), String>,
+        F2: FnMut(&mut AstStatement) -> Result<(), String>,
+    {
+        self.body
+            .for_each_statement_and_after(&mut func, &mut func_after)
+    }
+
     fn for_each_statement<F>(&mut self, mut func: F) -> Result<(), String>
     where
         F: FnMut(&mut AstStatement) -> Result<(), String>,
     {
-        self.body.for_each_statement(&mut func)
+        fn null_func(_statement: &mut AstStatement) -> Result<(), String> {
+            Ok(())
+        }
+
+        self.body
+            .for_each_statement_and_after(&mut func, &mut null_func)
     }
 
     fn to_tac(&self, global_tracking: &mut GlobalTracking) -> Result<TacFunction, String> {
@@ -808,34 +964,89 @@ impl AstStatement {
 
                 block.validate_and_resolve_variables(global_tracking, &mut inner_block, errors);
             }
+            AstStatementType::For(
+                ast_for_init,
+                ast_expr_condition_opt,
+                ast_expr_final_opt,
+                ast_statement_body,
+                _ast_body_end_label_opt,
+                _ast_loop_end_label_opt,
+            ) => {
+                // The for loop initializer introduces a new scope for its declarations, if any.
+                let mut inner_block = BlockTracking::new(Some(&block_tracking));
+                ast_for_init.validate_and_resolve_variables(
+                    global_tracking,
+                    &mut inner_block,
+                    errors,
+                );
+
+                if let Some(expr) = ast_expr_condition_opt {
+                    push_error(
+                        expr.validate_and_resolve_variables(&mut inner_block),
+                        errors,
+                    );
+                }
+
+                if let Some(expr) = ast_expr_final_opt {
+                    push_error(
+                        expr.validate_and_resolve_variables(&mut inner_block),
+                        errors,
+                    );
+                }
+
+                ast_statement_body.validate_and_resolve_variables(
+                    global_tracking,
+                    &mut inner_block,
+                    errors,
+                );
+            }
+            AstStatementType::Break(_label) => {}
+            AstStatementType::Continue(_label) => {}
             AstStatementType::Null => {}
         }
     }
 
-    fn for_each_statement<F>(&mut self, func: &mut F) -> Result<(), String>
+    fn for_each_statement_and_after<F1, F2>(
+        &mut self,
+        func: &mut F1,
+        func_after: &mut F2,
+    ) -> Result<(), String>
     where
-        F: FnMut(&mut AstStatement) -> Result<(), String>,
+        F1: FnMut(&mut AstStatement) -> Result<(), String>,
+        F2: FnMut(&mut AstStatement) -> Result<(), String>,
     {
         (func)(self)?;
 
         match &mut self.typ {
             AstStatementType::Return(_expr) => {}
             AstStatementType::If(_expr, ref mut then_statement, ref mut else_statement_opt) => {
-                then_statement.for_each_statement(func)?;
+                then_statement.for_each_statement_and_after(func, func_after)?;
 
                 if let Some(else_statement) = else_statement_opt {
-                    else_statement.for_each_statement(func)?;
+                    else_statement.for_each_statement_and_after(func, func_after)?;
                 }
             }
             AstStatementType::Expr(_expr) => {}
             AstStatementType::Goto(_label) => {}
             AstStatementType::Compound(block) => {
-                block.for_each_statement(func)?;
+                block.for_each_statement_and_after(func, func_after)?;
             }
+            AstStatementType::For(
+                _ast_for_init,
+                _ast_expr_condition_opt,
+                _ast_expr_final_opt,
+                ast_statement_body,
+                _ast_body_end_label_opt,
+                _ast_loop_end_label_opt,
+            ) => {
+                ast_statement_body.for_each_statement_and_after(func, func_after)?;
+            }
+            AstStatementType::Break(_label) => {}
+            AstStatementType::Continue(_label) => {}
             AstStatementType::Null => {}
         }
 
-        Ok(())
+        (func_after)(self)
     }
 
     fn to_tac(
@@ -895,6 +1106,57 @@ impl AstStatement {
             AstStatementType::Compound(block) => {
                 block.to_tac(global_tracking, instructions)?;
             }
+            AstStatementType::For(
+                ast_for_init,
+                ast_expr_condition_opt,
+                ast_expr_final_opt,
+                ast_statement_body,
+                ast_body_end_label_opt,
+                ast_loop_end_label_opt,
+            ) => {
+                // The for loop initializer runs one time, first.
+                ast_for_init.to_tac(global_tracking, instructions)?;
+
+                // The for loop condition is evaluated next, and it's the top of the repeated portion, so we need a
+                // label to jump to for the beginning of each iteration.
+                let condition_label = TacLabel(global_tracking.allocate_label("for_condition"));
+                instructions.push(TacInstruction::Label(condition_label.clone()));
+
+                // The for loop condition is actually optional. If it's not present, it'll just fall through to the loop
+                // body. If it is present, it's evaluated, and if the condition fails, it jumps to the end of the loop.
+                if let Some(ast_condition) = ast_expr_condition_opt {
+                    let tac_condition_val = ast_condition.to_tac(global_tracking, instructions)?;
+
+                    instructions.push(TacInstruction::JumpIfZero(
+                        tac_condition_val,
+                        ast_loop_end_label_opt.as_ref().unwrap().to_tac(),
+                    ));
+                }
+
+                ast_statement_body.to_tac(global_tracking, instructions)?;
+
+                // After the loop body we need a label that is used for continue statements.
+                instructions.push(TacInstruction::Label(
+                    ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+
+                // If the final expression is present, it is evaluated after the end of the loop body.
+                if let Some(ast_final_expr) = ast_expr_final_opt {
+                    let _ = ast_final_expr.to_tac(global_tracking, instructions)?;
+                }
+
+                // It's a loop, so of course we have to jump back to the top after the end of the final expressoin.
+                instructions.push(TacInstruction::Jump(condition_label));
+
+                // The loop end label is used for two purposes: jump to it if the loop condition fails; and jump to it
+                // from break statements.
+                instructions.push(TacInstruction::Label(
+                    ast_loop_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+            }
+            AstStatementType::Break(label_opt) | AstStatementType::Continue(label_opt) => {
+                instructions.push(TacInstruction::Jump(label_opt.as_ref().unwrap().to_tac()));
+            }
             AstStatementType::Null => {}
         }
 
@@ -949,10 +1211,111 @@ impl FmtNode for AstStatement {
                 Self::write_indent(f, indent_levels)?;
                 write!(f, "}}")?;
             }
+            AstStatementType::For(
+                ast_for_init,
+                ast_expr_condition_opt,
+                ast_expr_final_opt,
+                ast_statement_body,
+                ast_body_end_label_opt,
+                ast_loop_end_label_opt,
+            ) => {
+                write!(f, "for (")?;
+                ast_for_init.fmt_node(f, 0)?;
+                write!(f, "; ")?;
+
+                if let Some(condition_expr) = ast_expr_condition_opt {
+                    condition_expr.fmt_node(f, 0)?;
+                }
+
+                // Print out the end label for the body if it's been populated yet. It occurs just before the condition.
+                // Helps with seeing where continue statements will jump to.
+                if let Some(ast_body_end_label) = ast_body_end_label_opt {
+                    write!(f, "; {}: ", ast_body_end_label.0)?;
+                } else {
+                    write!(f, ";")?;
+                }
+
+                if let Some(final_expr) = ast_expr_final_opt {
+                    final_expr.fmt_node(f, 0)?;
+                }
+
+                writeln!(f, ")")?;
+                ast_statement_body.fmt_node(f, indent_levels + 1)?;
+                writeln!(f)?;
+                Self::write_indent(f, indent_levels)?;
+
+                // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
+                // will jump to.
+                if let Some(ast_loop_end_label) = ast_loop_end_label_opt {
+                    writeln!(f, "{}:", ast_loop_end_label.0)?;
+                    Self::write_indent(f, indent_levels)?;
+                }
+            }
+            AstStatementType::Break(None) => {
+                write!(f, "break")?;
+            }
+            AstStatementType::Continue(None) => {
+                write!(f, "continue")?;
+            }
+            AstStatementType::Break(Some(ref label)) => {
+                write!(f, "break to {}", label.0)?;
+            }
+            AstStatementType::Continue(Some(ref label)) => {
+                write!(f, "continue to {}", label.0)?;
+            }
             AstStatementType::Null => {}
         }
 
         Ok(())
+    }
+}
+
+impl AstForInit {
+    fn validate_and_resolve_variables(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        block_tracking: &mut BlockTracking,
+        errors: &mut Vec<String>,
+    ) {
+        match self {
+            AstForInit::Declaration(decl) => {
+                decl.validate_and_resolve_variables(global_tracking, block_tracking, errors);
+            }
+            AstForInit::Expression(Some(expr)) => {
+                push_error(expr.validate_and_resolve_variables(block_tracking), errors);
+            }
+            AstForInit::Expression(None) => {}
+        }
+    }
+
+    fn to_tac(
+        &self,
+        global_tracking: &mut GlobalTracking,
+        instructions: &mut Vec<TacInstruction>,
+    ) -> Result<(), String> {
+        match self {
+            AstForInit::Declaration(decl) => decl.to_tac(global_tracking, instructions),
+            AstForInit::Expression(Some(expr)) => {
+                expr.to_tac(global_tracking, instructions)?;
+                Ok(())
+            }
+            AstForInit::Expression(None) => Ok(()),
+        }
+    }
+}
+
+impl FmtNode for AstForInit {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        match self {
+            AstForInit::Declaration(decl) => decl.fmt_node(f, indent_levels),
+            AstForInit::Expression(expr_opt) => {
+                if let Some(expr) = expr_opt {
+                    expr.fmt_node(f, indent_levels)
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -2806,6 +3169,20 @@ impl<'p> BlockTracking<'p> {
     }
 }
 
+impl BreakTracking {
+    fn new(
+        parent_opt: Option<Box<BreakTracking>>,
+        break_label: AstLabel,
+        continue_label_opt: Option<AstLabel>,
+    ) -> Self {
+        Self {
+            parent_opt,
+            break_label,
+            continue_label_opt,
+        }
+    }
+}
+
 impl FuncStackFrame {
     fn new() -> Self {
         Self {
@@ -2991,8 +3368,18 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
         let label_name = tokens.consume_identifier()?;
         tokens.consume_expected_next_token(";")?;
         AstStatementType::Goto(AstLabel(String::from(label_name)))
+    } else if let Ok(for_statement) = parse_for_statement(&mut tokens) {
+        for_statement
     } else if let Ok(block) = parse_block(&mut tokens) {
         AstStatementType::Compound(Box::new(block))
+    } else if tokens.consume_expected_next_token("break").is_ok() {
+        let st = AstStatementType::Break(None);
+        tokens.consume_expected_next_token(";")?;
+        st
+    } else if tokens.consume_expected_next_token("continue").is_ok() {
+        let st = AstStatementType::Continue(None);
+        tokens.consume_expected_next_token(";")?;
+        st
     } else {
         let st = AstStatementType::Expr(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
@@ -3001,6 +3388,39 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
 
     *original_tokens = tokens;
     Ok(AstStatement::new(statement_type, labels))
+}
+
+fn parse_for_statement<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+) -> Result<AstStatementType, String> {
+    let mut tokens = original_tokens.clone();
+
+    tokens.consume_expected_next_token("for")?;
+    tokens.consume_expected_next_token("(")?;
+
+    let initializer = if let Ok(decl) = parse_declaration(&mut tokens) {
+        AstForInit::Declaration(decl)
+    } else if let Ok(expr_opt) = parse_optional_expression(&mut tokens, ";") {
+        AstForInit::Expression(expr_opt)
+    } else {
+        return Err(format!("failed to parse for loop initializer"));
+    };
+
+    let condition_opt = parse_optional_expression(&mut tokens, ";")?;
+
+    let final_expr_opt = parse_optional_expression(&mut tokens, ")")?;
+
+    let body = parse_statement(&mut tokens)?;
+
+    *original_tokens = tokens;
+    Ok(AstStatementType::For(
+        initializer,
+        condition_opt,
+        final_expr_opt,
+        Box::new(body),
+        None,
+        None,
+    ))
 }
 
 fn parse_statement_labels<'i, 't>(
@@ -3150,6 +3570,35 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
     }
 
     parse_expression_with_precedence(original_tokens, 0)
+}
+
+fn parse_optional_expression<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+    terminator: &str,
+) -> Result<Option<AstExpression>, String> {
+    let mut tokens = original_tokens.clone();
+
+    // Try to parse an expression and then the desired terminator.
+    let ret = if let Ok(expr) = parse_expression(&mut tokens) {
+        tokens.consume_expected_next_token(terminator)?;
+        Ok(Some(expr))
+    } else if tokens.consume_expected_next_token(terminator).is_ok() {
+        // Well, the expression wasn't found. See if just the terminator is, in which case the optional expression is
+        // valid, just with no expression found.
+        Ok(None)
+    } else {
+        // If the terminator isn't found, then it's not valid.
+        return Err(format!(
+            "failed to parse optional expression starting at {:?}",
+            tokens
+        ));
+    };
+
+    if ret.is_ok() {
+        *original_tokens = tokens;
+    }
+
+    ret
 }
 
 fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
@@ -4090,6 +4539,24 @@ mod test {
             ",
             );
         }
+
+        #[test]
+        fn break_outside_loop() {
+            codegen_run_and_expect_compile_failure(r"if (1) break;");
+        }
+
+        #[test]
+        fn continue_outside_loop() {
+            codegen_run_and_expect_compile_failure(
+                r"
+    {
+        int a;
+        continue;
+    }
+    return 0;
+            ",
+            );
+        }
     }
 
     #[test]
@@ -4504,6 +4971,11 @@ mod test {
     #[test]
     fn null_then_return() {
         test_codegen_mainfunc("; return 1;", 1);
+    }
+
+    #[test]
+    fn empty_expression() {
+        test_codegen_mainfunc("return 0;;;", 0);
     }
 
     #[test]
@@ -5363,6 +5835,17 @@ label2:;
                 ",
                 );
             }
+
+            #[test]
+            fn labeled_break_outside_loop() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    // make sure our usual analysis of break/continue labels also traverses labeled statements
+    label: break;
+    return 0;
+                ",
+                );
+            }
         }
     }
 
@@ -5559,6 +6042,313 @@ label2:;
         );
     }
 
+    mod for_loops {
+        use super::*;
+
+        #[test]
+        fn empty_header() {
+            test_codegen_mainfunc(
+                r"
+    int a = 0;
+    for (; ; ) {
+        a = a + 1;
+        if (a > 3)
+            break;
+    }
+
+    return a;
+            ",
+                4,
+            );
+        }
+
+        #[test]
+        fn break_statement() {
+            test_codegen_mainfunc(
+                r"
+    int a = 10;
+    int b = 20;
+    for (b = -20; b < 0; b = b + 1) {
+        a = a - 1;
+        if (a <= 0)
+            break;
+    }
+
+    return a == 0 && b == -11;
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn continue_statement() {
+            test_codegen_mainfunc(
+                r"
+    int sum = 0;
+    int counter;
+    for (int i = 0; i <= 10; i = i + 1) {
+        counter = i;
+        if (i % 2 == 0)
+            continue;
+        sum = sum + 1;
+    }
+
+    return sum == 5 && counter == 10;
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn declaration() {
+            test_codegen_mainfunc(
+                r"
+    int a = 0;
+
+    for (int i = -100; i <= 0; i = i + 1)
+        a = a + 1;
+    return a;
+            ",
+                101,
+            );
+        }
+
+        #[test]
+        fn shadow_declaration() {
+            test_codegen_mainfunc(
+                r"
+    int shadow = 1;
+    int acc = 0;
+    for (int shadow = 0; shadow < 10; shadow = shadow + 1) {
+        acc = acc + shadow;
+    }
+    return acc == 45 && shadow == 1;
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn nested_shadowed_declarations() {
+            test_codegen_mainfunc(
+                r"
+    int i = 0;
+    int j = 0;
+    int k = 1;
+    for (int i = 100; i > 0; i = i - 1) {
+        int i = 1;
+        int j = i + k;
+        k = j;
+    }
+
+    return k == 101 && i == 0 && j == 0;
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn no_post_expression() {
+            test_codegen_mainfunc(
+                r"
+    int a = -2147483647;
+    for (; a % 5 != 0;) {
+        a = a + 1;
+    }
+    return a % 5 == 0;
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn continue_with_no_post_expression() {
+            test_codegen_mainfunc(
+                r"
+    int sum = 0;
+    for (int i = 0; i < 10;) {
+        i = i + 1;
+        if (i % 2)
+            continue;
+        sum = sum + i;
+    }
+    return sum;
+            ",
+                30,
+            );
+        }
+
+        #[test]
+        fn no_condition() {
+            test_codegen_mainfunc(
+                r"
+    for (int i = 400; ; i = i - 100)
+        if (i == 100)
+            return 0;
+            ",
+                0,
+            );
+        }
+
+        #[test]
+        fn nested_break() {
+            test_codegen_mainfunc(
+                r"
+    int ans = 0;
+    for (int i = 0; i < 10; i = i + 1)
+        for (int j = 0; j < 10; j = j + 1)
+            if ((i / 2)*2 == i)
+                break;
+            else
+                ans = ans + i;
+    return ans;
+            ",
+                250,
+            );
+        }
+
+        #[test]
+        fn compound_assignent_in_post_expression() {
+            test_codegen_mainfunc(
+                r"
+    int i = 1;
+    for (i *= -1; i >= -100; i -=3)
+        ;
+    return (i == -103);
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn jump_past_initializer() {
+            test_codegen_mainfunc(
+                r"
+    int i = 0;
+    goto target;
+    for (i = 5; i < 10; i = i + 1)
+    target:
+        if (i == 0)
+            return 1;
+    return 0;
+            ",
+                1,
+            );
+        }
+
+        #[test]
+        fn jump_within_body() {
+            test_codegen_mainfunc(
+                r"
+    int sum = 0;
+    for (int i = 0;; i = 0) {
+    lbl:
+        sum = sum + 1;
+        i = i + 1;
+        if (i > 10)
+            break;
+        goto lbl;
+    }
+    return sum;
+            ",
+                11,
+            );
+        }
+
+        mod fail {
+            use super::*;
+
+            #[test]
+            fn extra_header_clause() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (int i = 0; i < 10; i = i + 1; )
+        ;
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn missing_header_clause() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (int i = 0;)
+        ;
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn extra_parens() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (int i = 2; ))
+        int a = 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn invalid_declaration_compound_assignment() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (int i += 1; i < 10; i += 1) {
+        return 0;
+    }
+                ",
+                );
+            }
+
+            #[test]
+            fn declaration_in_condition() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (; int i = 0; i = i + 1)
+        ;
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn label_in_header() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (int i = 0; label: i < 10; i = i + 1) {
+        ;
+    }
+    return 0;
+                ",
+                );
+            }
+
+            #[test]
+            fn undeclared_variable() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (i = 0; i < 1; i = i + 1)
+    {
+        return 0;
+    }
+                ",
+                );
+            }
+
+            #[test]
+            fn reference_body_variable_in_condition() {
+                codegen_run_and_expect_compile_failure(
+                    r"
+    for (;; i++) {
+        int i = 0;
+    }
+                ",
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn while_loop() {
@@ -5601,45 +6391,6 @@ label2:;
         test_codegen_mainfunc(
             "int x = 20; do { continue; } while ((x = 50) < 10); return x;",
             50,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn for_loop() {
-        test_codegen_mainfunc(
-            "int y = 100; for (int i = 0; i < 10; i = i + 1) y = i; return y;",
-            9,
-        );
-        test_codegen_mainfunc(
-            "int y = 100; int i = 150; for (int i = 0; i < 10; i = i + 1) { y = i; } return y + i;",
-            159,
-        );
-        test_codegen_mainfunc(
-            "int i = 150; for (i = 0; i < 10; i = i + 1) { } return i;",
-            10,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn for_loop_with_break() {
-        test_codegen_mainfunc(
-            "int i = 150; for (i = 2; i < 10; i = i + 1) { break; i = 20; } return i;",
-            2,
-        );
-        test_codegen_mainfunc(
-            "int i = 150; for (i = 2; i < 10; i = i + 1) { if (i == 3) { break; } } return i;",
-            3,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn for_loop_with_continue() {
-        test_codegen_mainfunc(
-            "int i = 150; for (i = 2; i < 10; i = i + 1) { continue; i = 20; } return i;",
-            10,
         );
     }
 
