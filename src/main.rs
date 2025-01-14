@@ -276,6 +276,18 @@ enum AstStatementType {
     If(AstExpression, Box<AstStatement>, Option<Box<AstStatement>>),
     Goto(AstLabel),
     Compound(Box<AstBlock>),
+    While(
+        AstExpression,
+        Box<AstStatement>,
+        Option<AstLabel>,
+        Option<AstLabel>,
+    ),
+    DoWhile(
+        AstExpression,
+        Box<AstStatement>,
+        Option<AstLabel>,
+        Option<AstLabel>,
+    ),
     For(
         AstForInit,
         Option<AstExpression>,
@@ -588,10 +600,22 @@ impl<'i> AstProgram<'i> {
                     |ast_statement| {
                         match ast_statement.typ {
                             AstStatementType::For(
-                                ref _ast_for_init,
-                                ref _ast_expr_condition_opt,
-                                ref _ast_expr_final_opt,
-                                ref _ast_statement_body,
+                                _,
+                                _,
+                                _,
+                                _,
+                                ref mut ast_body_end_label_opt,
+                                ref mut ast_loop_end_label_opt,
+                            )
+                            | AstStatementType::While(
+                                _,
+                                _,
+                                ref mut ast_body_end_label_opt,
+                                ref mut ast_loop_end_label_opt,
+                            )
+                            | AstStatementType::DoWhile(
+                                _,
+                                _,
                                 ref mut ast_body_end_label_opt,
                                 ref mut ast_loop_end_label_opt,
                             ) => {
@@ -601,9 +625,9 @@ impl<'i> AstProgram<'i> {
                                 // Create new labels for this loop's body end and loop end, to be used in break and continue
                                 // statements.
                                 *ast_body_end_label_opt =
-                                    Some(AstLabel(global_tracking.allocate_label("for_body_end")));
+                                    Some(AstLabel(global_tracking.allocate_label("loop_body_end")));
                                 *ast_loop_end_label_opt =
-                                    Some(AstLabel(global_tracking.allocate_label("for_loop_end")));
+                                    Some(AstLabel(global_tracking.allocate_label("loop_end")));
 
                                 // Store the pre-existing tracking info into the new tracking info, so we can revert to it
                                 // after this loop is done.
@@ -942,6 +966,7 @@ impl AstStatement {
                     condition_expr.validate_and_resolve_variables(block_tracking),
                     errors,
                 );
+
                 then_statement.validate_and_resolve_variables(
                     global_tracking,
                     block_tracking,
@@ -955,6 +980,29 @@ impl AstStatement {
                         errors,
                     );
                 }
+            }
+            AstStatementType::While(
+                condition_expr,
+                body_statement,
+                _ast_body_end_label_opt,
+                _ast_loop_end_label_opt,
+            )
+            | AstStatementType::DoWhile(
+                condition_expr,
+                body_statement,
+                _ast_body_end_label_opt,
+                _ast_loop_end_label_opt,
+            ) => {
+                push_error(
+                    condition_expr.validate_and_resolve_variables(block_tracking),
+                    errors,
+                );
+
+                body_statement.validate_and_resolve_variables(
+                    global_tracking,
+                    block_tracking,
+                    errors,
+                );
             }
             AstStatementType::Goto(_label) => {}
             AstStatementType::Compound(block) => {
@@ -1025,6 +1073,20 @@ impl AstStatement {
                 if let Some(else_statement) = else_statement_opt {
                     else_statement.for_each_statement_and_after(func, func_after)?;
                 }
+            }
+            AstStatementType::While(
+                condition_expr,
+                body_statement,
+                _ast_body_end_label_opt,
+                _ast_loop_end_label_opt,
+            )
+            | AstStatementType::DoWhile(
+                condition_expr,
+                body_statement,
+                _ast_body_end_label_opt,
+                _ast_loop_end_label_opt,
+            ) => {
+                body_statement.for_each_statement_and_after(func, func_after)?;
             }
             AstStatementType::Expr(_expr) => {}
             AstStatementType::Goto(_label) => {}
@@ -1099,6 +1161,73 @@ impl AstStatement {
                 }
 
                 instructions.push(TacInstruction::Label(end_label));
+            }
+            AstStatementType::While(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                ast_loop_end_label_opt,
+            ) => {
+                // The body end label can actually go just before the condition, since it's only used as a target for
+                // continue statements.
+                instructions.push(TacInstruction::Label(
+                    ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+
+                let tac_condition_val = condition_expr.to_tac(global_tracking, instructions)?;
+
+                instructions.push(TacInstruction::JumpIfZero(
+                    tac_condition_val,
+                    ast_loop_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+
+                body_statement.to_tac(global_tracking, instructions)?;
+
+                // It's a loop, so of course we have to jump back to the top after the end of the body. The body end
+                // label is actually at the top of the loop for this type of loop.
+                instructions.push(TacInstruction::Jump(
+                    ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+
+                // The loop end label is used for two purposes: jump to it if the loop condition fails; and jump to it
+                // from break statements.
+                instructions.push(TacInstruction::Label(
+                    ast_loop_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+            }
+            AstStatementType::DoWhile(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                ast_loop_end_label_opt,
+            ) => {
+                // We need a label at the beginning of the body to jump back to after the condition evaluates to true.
+                let body_begin_label =
+                    TacLabel(global_tracking.allocate_label("do_while_body_begin"));
+                instructions.push(TacInstruction::Label(body_begin_label.clone()));
+
+                // In a do-while loop, the body executes before the condition is evaluated.
+                body_statement.to_tac(global_tracking, instructions)?;
+
+                // The body end label goes just before the condition. It's only used as a target for continue
+                // statements.
+                instructions.push(TacInstruction::Label(
+                    ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+
+                let tac_condition_val = condition_expr.to_tac(global_tracking, instructions)?;
+
+                // If the condition is true, jump back to do the body again. If it's false, it'll fall through to exit
+                // the loop.
+                instructions.push(TacInstruction::JumpIfNotZero(
+                    tac_condition_val,
+                    body_begin_label,
+                ));
+
+                // For this kind of loop, the end label is only used for break statements.
+                instructions.push(TacInstruction::Label(
+                    ast_loop_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
             }
             AstStatementType::Goto(label) => {
                 instructions.push(TacInstruction::Jump(label.to_tac()));
@@ -1195,6 +1324,63 @@ impl FmtNode for AstStatement {
                     writeln!(f)?;
                     Self::write_indent(f, indent_levels)?;
                     write!(f, "}}")?;
+                }
+            }
+            AstStatementType::While(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                ast_loop_end_label_opt,
+            ) => {
+                write!(f, "while (")?;
+
+                if let Some(ast_body_end_label) = ast_body_end_label_opt {
+                    write!(f, "{}: ", ast_body_end_label.0)?;
+                }
+
+                condition_expr.fmt_node(f, indent_levels)?;
+                writeln!(f, ")")?;
+                body_statement.fmt_node(f, indent_levels + 1)?;
+
+                writeln!(f)?;
+                Self::write_indent(f, indent_levels)?;
+
+                // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
+                // will jump to.
+                if let Some(ast_loop_end_label) = ast_loop_end_label_opt {
+                    writeln!(f, "{}:", ast_loop_end_label.0)?;
+                    Self::write_indent(f, indent_levels)?;
+                }
+            }
+            AstStatementType::DoWhile(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                ast_loop_end_label_opt,
+            ) => {
+                writeln!(f, "do")?;
+
+                body_statement.fmt_node(f, indent_levels + 1)?;
+
+                writeln!(f)?;
+                Self::write_indent(f, indent_levels)?;
+
+                if let Some(ast_body_end_label) = ast_body_end_label_opt {
+                    write!(f, "{}: ", ast_body_end_label.0)?;
+                }
+
+                write!(f, "while ")?;
+                condition_expr.fmt_node(f, indent_levels)?;
+                write!(f, ")")?;
+
+                // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
+                // will jump to.
+                if let Some(ast_loop_end_label) = ast_loop_end_label_opt {
+                    writeln!(f)?;
+                    Self::write_indent(f, indent_levels)?;
+
+                    writeln!(f, "{}:", ast_loop_end_label.0)?;
+                    Self::write_indent(f, indent_levels)?;
                 }
             }
             AstStatementType::Goto(label) => {
@@ -3370,6 +3556,21 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
         AstStatementType::Goto(AstLabel(String::from(label_name)))
     } else if let Ok(for_statement) = parse_for_statement(&mut tokens) {
         for_statement
+    } else if tokens.consume_expected_next_token("while").is_ok() {
+        tokens.consume_expected_next_token("(")?;
+        let condition_expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+        let body_statement = parse_statement(&mut tokens)?;
+
+        AstStatementType::While(condition_expr, Box::new(body_statement), None, None)
+    } else if tokens.consume_expected_next_token("do").is_ok() {
+        let body_statement = parse_statement(&mut tokens)?;
+        tokens.consume_expected_next_token("while")?;
+        tokens.consume_expected_next_token("(")?;
+        let condition_expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+        tokens.consume_expected_next_token(";")?;
+        AstStatementType::DoWhile(condition_expr, Box::new(body_statement), None, None)
     } else if let Ok(block) = parse_block(&mut tokens) {
         AstStatementType::Compound(Box::new(block))
     } else if tokens.consume_expected_next_token("break").is_ok() {
@@ -6042,216 +6243,626 @@ label2:;
         );
     }
 
-    mod for_loops {
+    mod loops {
         use super::*;
 
-        #[test]
-        fn empty_header() {
-            test_codegen_mainfunc(
-                r"
-    int a = 0;
-    for (; ; ) {
-        a = a + 1;
-        if (a > 3)
-            break;
-    }
+        mod for_loop {
+            use super::*;
 
-    return a;
-            ",
-                4,
-            );
-        }
-
-        #[test]
-        fn break_statement() {
-            test_codegen_mainfunc(
-                r"
-    int a = 10;
-    int b = 20;
-    for (b = -20; b < 0; b = b + 1) {
-        a = a - 1;
-        if (a <= 0)
-            break;
-    }
-
-    return a == 0 && b == -11;
-            ",
-                1,
-            );
-        }
-
-        #[test]
-        fn continue_statement() {
-            test_codegen_mainfunc(
-                r"
-    int sum = 0;
-    int counter;
-    for (int i = 0; i <= 10; i = i + 1) {
-        counter = i;
-        if (i % 2 == 0)
-            continue;
-        sum = sum + 1;
-    }
-
-    return sum == 5 && counter == 10;
-            ",
-                1,
-            );
-        }
-
-        #[test]
-        fn declaration() {
-            test_codegen_mainfunc(
-                r"
-    int a = 0;
-
-    for (int i = -100; i <= 0; i = i + 1)
-        a = a + 1;
-    return a;
-            ",
-                101,
-            );
-        }
-
-        #[test]
-        fn shadow_declaration() {
-            test_codegen_mainfunc(
-                r"
-    int shadow = 1;
-    int acc = 0;
-    for (int shadow = 0; shadow < 10; shadow = shadow + 1) {
-        acc = acc + shadow;
-    }
-    return acc == 45 && shadow == 1;
-            ",
-                1,
-            );
-        }
-
-        #[test]
-        fn nested_shadowed_declarations() {
-            test_codegen_mainfunc(
-                r"
-    int i = 0;
-    int j = 0;
-    int k = 1;
-    for (int i = 100; i > 0; i = i - 1) {
-        int i = 1;
-        int j = i + k;
-        k = j;
-    }
-
-    return k == 101 && i == 0 && j == 0;
-            ",
-                1,
-            );
-        }
-
-        #[test]
-        fn no_post_expression() {
-            test_codegen_mainfunc(
-                r"
-    int a = -2147483647;
-    for (; a % 5 != 0;) {
-        a = a + 1;
-    }
-    return a % 5 == 0;
-            ",
-                1,
-            );
-        }
-
-        #[test]
-        fn continue_with_no_post_expression() {
-            test_codegen_mainfunc(
-                r"
-    int sum = 0;
-    for (int i = 0; i < 10;) {
-        i = i + 1;
-        if (i % 2)
-            continue;
-        sum = sum + i;
-    }
-    return sum;
-            ",
-                30,
-            );
-        }
-
-        #[test]
-        fn no_condition() {
-            test_codegen_mainfunc(
-                r"
-    for (int i = 400; ; i = i - 100)
-        if (i == 100)
-            return 0;
-            ",
-                0,
-            );
-        }
-
-        #[test]
-        fn nested_break() {
-            test_codegen_mainfunc(
-                r"
-    int ans = 0;
-    for (int i = 0; i < 10; i = i + 1)
-        for (int j = 0; j < 10; j = j + 1)
-            if ((i / 2)*2 == i)
+            #[test]
+            fn empty_header() {
+                test_codegen_mainfunc(
+                    r"
+        int a = 0;
+        for (; ; ) {
+            a = a + 1;
+            if (a > 3)
                 break;
-            else
-                ans = ans + i;
-    return ans;
-            ",
-                250,
-            );
         }
 
-        #[test]
-        fn compound_assignent_in_post_expression() {
-            test_codegen_mainfunc(
-                r"
-    int i = 1;
-    for (i *= -1; i >= -100; i -=3)
-        ;
-    return (i == -103);
-            ",
-                1,
-            );
+        return a;
+                ",
+                    4,
+                );
+            }
+
+            #[test]
+            fn break_statement() {
+                test_codegen_mainfunc(
+                    r"
+        int a = 10;
+        int b = 20;
+        for (b = -20; b < 0; b = b + 1) {
+            a = a - 1;
+            if (a <= 0)
+                break;
         }
 
-        #[test]
-        fn jump_past_initializer() {
-            test_codegen_mainfunc(
-                r"
-    int i = 0;
-    goto target;
-    for (i = 5; i < 10; i = i + 1)
-    target:
-        if (i == 0)
-            return 1;
+        return a == 0 && b == -11;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn continue_statement() {
+                test_codegen_mainfunc(
+                    r"
+        int sum = 0;
+        int counter;
+        for (int i = 0; i <= 10; i = i + 1) {
+            counter = i;
+            if (i % 2 == 0)
+                continue;
+            sum = sum + 1;
+        }
+
+        return sum == 5 && counter == 10;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn declaration() {
+                test_codegen_mainfunc(
+                    r"
+        int a = 0;
+
+        for (int i = -100; i <= 0; i = i + 1)
+            a = a + 1;
+        return a;
+                ",
+                    101,
+                );
+            }
+
+            #[test]
+            fn shadow_declaration() {
+                test_codegen_mainfunc(
+                    r"
+        int shadow = 1;
+        int acc = 0;
+        for (int shadow = 0; shadow < 10; shadow = shadow + 1) {
+            acc = acc + shadow;
+        }
+        return acc == 45 && shadow == 1;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn nested_shadowed_declarations() {
+                test_codegen_mainfunc(
+                    r"
+        int i = 0;
+        int j = 0;
+        int k = 1;
+        for (int i = 100; i > 0; i = i - 1) {
+            int i = 1;
+            int j = i + k;
+            k = j;
+        }
+
+        return k == 101 && i == 0 && j == 0;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn no_post_expression() {
+                test_codegen_mainfunc(
+                    r"
+        int a = -2147483647;
+        for (; a % 5 != 0;) {
+            a = a + 1;
+        }
+        return a % 5 == 0;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn continue_with_no_post_expression() {
+                test_codegen_mainfunc(
+                    r"
+        int sum = 0;
+        for (int i = 0; i < 10;) {
+            i = i + 1;
+            if (i % 2)
+                continue;
+            sum = sum + i;
+        }
+        return sum;
+                ",
+                    30,
+                );
+            }
+
+            #[test]
+            fn no_condition() {
+                test_codegen_mainfunc(
+                    r"
+        for (int i = 400; ; i = i - 100)
+            if (i == 100)
+                return 0;
+                ",
+                    0,
+                );
+            }
+
+            #[test]
+            fn nested_break() {
+                test_codegen_mainfunc(
+                    r"
+        int ans = 0;
+        for (int i = 0; i < 10; i = i + 1)
+            for (int j = 0; j < 10; j = j + 1)
+                if ((i / 2)*2 == i)
+                    break;
+                else
+                    ans = ans + i;
+        return ans;
+                ",
+                    250,
+                );
+            }
+
+            #[test]
+            fn compound_assignent_in_post_expression() {
+                test_codegen_mainfunc(
+                    r"
+        int i = 1;
+        for (i *= -1; i >= -100; i -=3)
+            ;
+        return (i == -103);
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn jump_past_initializer() {
+                test_codegen_mainfunc(
+                    r"
+        int i = 0;
+        goto target;
+        for (i = 5; i < 10; i = i + 1)
+        target:
+            if (i == 0)
+                return 1;
+        return 0;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn jump_within_body() {
+                test_codegen_mainfunc(
+                    r"
+        int sum = 0;
+        for (int i = 0;; i = 0) {
+        lbl:
+            sum = sum + 1;
+            i = i + 1;
+            if (i > 10)
+                break;
+            goto lbl;
+        }
+        return sum;
+                ",
+                    11,
+                );
+            }
+
+            mod fail {
+                use super::*;
+
+                #[test]
+                fn extra_header_clause() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (int i = 0; i < 10; i = i + 1; )
+            ;
+        return 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn missing_header_clause() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (int i = 0;)
+            ;
+        return 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn extra_parens() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (int i = 2; ))
+            int a = 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn invalid_declaration_compound_assignment() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (int i += 1; i < 10; i += 1) {
+            return 0;
+        }
+                    ",
+                    );
+                }
+
+                #[test]
+                fn declaration_in_condition() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (; int i = 0; i = i + 1)
+            ;
+        return 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn label_in_header() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (int i = 0; label: i < 10; i = i + 1) {
+            ;
+        }
+        return 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn undeclared_variable() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (i = 0; i < 1; i = i + 1)
+        {
+            return 0;
+        }
+                    ",
+                    );
+                }
+
+                #[test]
+                fn reference_body_variable_in_condition() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+        for (;; i++) {
+            int i = 0;
+        }
+                    ",
+                    );
+                }
+            }
+        }
+
+        mod while_loop {
+            use super::*;
+
+            #[test]
+            fn break_immediate() {
+                test_codegen_mainfunc(
+                    r"
+        int a = 10;
+        while ((a = 1))
+            break;
+        return a;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn multi_break() {
+                test_codegen_mainfunc(
+                    r"
+        int i = 0;
+        while (1) {
+            i = i + 1;
+            if (i > 10)
+                break;
+        }
+        int j = 10;
+        while (1) {
+            j = j - 1;
+            if (j < 0)
+                break;
+        }
+        int result = j == -1 && i == 11;
+        return result;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn nested_continue() {
+                test_codegen_mainfunc(
+                    r"
+        int x = 5;
+        int acc = 0;
+        while (x >= 0) {
+            int i = x;
+            while (i <= 10) {
+                i = i + 1;
+                if (i % 2)
+                    continue;
+                acc = acc + 1;
+            }
+            x = x - 1;
+        }
+        return acc;
+                ",
+                    24,
+                );
+            }
+
+            #[test]
+            fn nested_loops() {
+                test_codegen_mainfunc(
+                    r"
+        int acc = 0;
+        int x = 100;
+        while (x) {
+            int y = 10;
+            x = x - y;
+            while (y) {
+                acc = acc + 1;
+                y = y - 1;
+            }
+        }
+        return acc == 100 && x == 0;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn labeled_body() {
+                test_codegen_mainfunc(
+                    r"
+    int result = 0;
+    goto label;
+    while (0)
+    label: { result = 1; }
+
+    return result;
+                ",
+                    1,
+                );
+            }
+
+            #[test]
+            fn condition_postfix() {
+                test_codegen_mainfunc(
+                    r"
+    int i = 100;
+    int count = 0;
+    while (i--) count++;
+    if (count != 100)
+        return 0;
+    i = 100;
+    count = 0;
+    while (--i) count++;
+    if (count != 99)
+        return 0;
+    return 1;
+                ",
+                    1,
+                );
+            }
+
+            mod fail {
+                use super::*;
+
+                #[test]
+                fn declaration_in_body() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+    while (1)
+        int i = 0;
     return 0;
-            ",
-                1,
-            );
+                    ",
+                    );
+                }
+
+                #[test]
+                fn declaration_in_condition() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+    while(int a) {
+        2;
+    }
+                    ",
+                    );
+                }
+
+                #[test]
+                fn missing_parentheses() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+    while 1 {
+        return 0;
+    }
+                    ",
+                    );
+                }
+            }
+        }
+
+        mod do_while_loop {
+            use super::*;
+
+            #[test]
+            fn simple() {
+                test_codegen_mainfunc(
+                    r"
+    int a = 1;
+    do {
+        a = a * 2;
+    } while(a < 11);
+
+    return a;
+                ",
+                    16,
+                );
+            }
+
+            #[test]
+            fn break_immediate() {
+                test_codegen_mainfunc(
+                    r"
+    int a = 10;
+    do
+        break;
+    while ((a = 1));
+    return a;
+                ",
+                    10,
+                );
+            }
+
+            #[test]
+            fn no_body() {
+                test_codegen_mainfunc(
+                    r"
+    int i = 2147483642;
+    do ; while ((i = i - 5) >= 256);
+
+    return i;
+                ",
+                    252,
+                );
+            }
+
+            #[test]
+            fn multi_continue_same_loop() {
+                test_codegen_mainfunc(
+                    r"
+    int x = 10;
+    int y = 0;
+    int z = 0;
+    do {
+        z = z + 1;
+        if (x <= 0)
+            continue;
+        x = x - 1;
+        if (y >= 10)
+            continue;
+        y = y + 1;
+    } while (z != 50);
+    return z == 50 && x == 0 && y == 10;
+                ",
+                    1,
+                );
+            }
+
+            mod fail {
+                use super::*;
+
+                #[test]
+                fn semicolon_after_body() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+    do {
+        int a;
+    }; while(1);
+    return 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn missing_final_semicolon() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+    do {
+        4;
+    } while(1)
+    return 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn empty_condition() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+    do
+        1;
+    while ();
+    return 0;
+                    ",
+                    );
+                }
+
+                #[test]
+                fn variable_in_body_not_in_scope_for_condition() {
+                    codegen_run_and_expect_compile_failure(
+                        r"
+    do {
+        int a = a + 1;
+    } while (a < 100);
+                    ",
+                    );
+                }
+            }
         }
 
         #[test]
-        fn jump_within_body() {
+        fn labeled_loops() {
             test_codegen_mainfunc(
                 r"
     int sum = 0;
-    for (int i = 0;; i = 0) {
-    lbl:
+    goto do_label;
+    return 0;
+
+do_label:
+    do {
+        sum = 1;
+        goto while_label;
+    } while (1);
+
+while_label:
+    while (1) {
         sum = sum + 1;
-        i = i + 1;
-        if (i > 10)
-            break;
-        goto lbl;
+        goto break_label;
+        return 0;
+    break_label:
+        break;
+    };
+    goto for_label;
+    return 0;
+
+for_label:
+    for (int i = 0; i < 10; i = i + 1) {
+        sum = sum + 1;
+        goto continue_label;
+        return 0;
+    continue_label:
+        continue;
+        return 0;
     }
     return sum;
             ",
-                11,
+                12,
             );
         }
 
@@ -6259,10 +6870,18 @@ label2:;
             use super::*;
 
             #[test]
-            fn extra_header_clause() {
+            fn label_is_not_block() {
                 codegen_run_and_expect_compile_failure(
                     r"
-    for (int i = 0; i < 10; i = i + 1; )
+    int a = 0;
+    int b = 0;
+    // a label does not start a new block, so you can't use it
+    // to delineate a multi-statement loop body
+    do
+    do_body:
+        a = a + 1;
+        b = b - 1;
+    while (a < 10)
         ;
     return 0;
                 ",
@@ -6270,128 +6889,21 @@ label2:;
             }
 
             #[test]
-            fn missing_header_clause() {
+            fn duplicate_label_in_body() {
                 codegen_run_and_expect_compile_failure(
                     r"
-    for (int i = 0;)
-        ;
+    do {
+        // make sure our label-validation analysis also traverses loop bodies
+    lbl:
+        return 1;
+    lbl:
+        return 2;
+    } while (1);
     return 0;
-                ",
-                );
-            }
-
-            #[test]
-            fn extra_parens() {
-                codegen_run_and_expect_compile_failure(
-                    r"
-    for (int i = 2; ))
-        int a = 0;
-                ",
-                );
-            }
-
-            #[test]
-            fn invalid_declaration_compound_assignment() {
-                codegen_run_and_expect_compile_failure(
-                    r"
-    for (int i += 1; i < 10; i += 1) {
-        return 0;
-    }
-                ",
-                );
-            }
-
-            #[test]
-            fn declaration_in_condition() {
-                codegen_run_and_expect_compile_failure(
-                    r"
-    for (; int i = 0; i = i + 1)
-        ;
-    return 0;
-                ",
-                );
-            }
-
-            #[test]
-            fn label_in_header() {
-                codegen_run_and_expect_compile_failure(
-                    r"
-    for (int i = 0; label: i < 10; i = i + 1) {
-        ;
-    }
-    return 0;
-                ",
-                );
-            }
-
-            #[test]
-            fn undeclared_variable() {
-                codegen_run_and_expect_compile_failure(
-                    r"
-    for (i = 0; i < 1; i = i + 1)
-    {
-        return 0;
-    }
-                ",
-                );
-            }
-
-            #[test]
-            fn reference_body_variable_in_condition() {
-                codegen_run_and_expect_compile_failure(
-                    r"
-    for (;; i++) {
-        int i = 0;
-    }
                 ",
                 );
             }
         }
-    }
-
-    #[test]
-    #[ignore]
-    fn while_loop() {
-        test_codegen_mainfunc("int x = 1; while (x < 10) x = x + 1; return x;", 10);
-    }
-
-    #[test]
-    #[ignore]
-    fn while_loop_with_break() {
-        test_codegen_mainfunc(
-            "int x = 1; while (x < 10) { x = x + 1; break; } return x;",
-            2,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn while_loop_with_continue() {
-        test_codegen_mainfunc(
-            "int x = 1; while (x < 10) { x = x + 1; continue; x = 50; } return x;",
-            10,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn do_while_loop() {
-        test_codegen_mainfunc("do { return 1; } while (0); return 2;", 1);
-    }
-
-    #[test]
-    #[ignore]
-    fn do_while_loop_with_break() {
-        test_codegen_mainfunc("do { break; return 1; } while (0); return 2;", 2);
-    }
-
-    #[test]
-    #[ignore]
-    fn do_while_loop_with_continue() {
-        test_codegen_mainfunc(
-            "int x = 20; do { continue; } while ((x = 50) < 10); return x;",
-            50,
-        );
     }
 
     #[test]
