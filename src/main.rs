@@ -1369,7 +1369,7 @@ impl FmtNode for AstStatement {
                     write!(f, "{}: ", ast_body_end_label.0)?;
                 }
 
-                write!(f, "while ")?;
+                write!(f, "while (")?;
                 condition_expr.fmt_node(f, indent_levels)?;
                 write!(f, ")")?;
 
@@ -4315,7 +4315,7 @@ mod test {
     }
 
     fn test_codegen_mainfunc_failure(body: &str) {
-        codegen_run_and_expect_compile_failure(&format!("int main() {{ {} }}", body))
+        codegen_run_and_expect_compile_failure(&format!("int main() {{\n{}\n}}", body))
     }
 
     mod fail {
@@ -4743,12 +4743,12 @@ mod test {
 
         #[test]
         fn break_outside_loop() {
-            codegen_run_and_expect_compile_failure(r"if (1) break;");
+            test_codegen_mainfunc_failure(r"if (1) break;");
         }
 
         #[test]
         fn continue_outside_loop() {
-            codegen_run_and_expect_compile_failure(
+            test_codegen_mainfunc_failure(
                 r"
     {
         int a;
@@ -5989,7 +5989,7 @@ int main(void) {
 
             #[test]
             fn different_label_same_scope() {
-                codegen_run_and_expect_compile_failure(
+                test_codegen_mainfunc_failure(
                     r"
     // different labels do not define different scopes
 label1:;
@@ -6003,7 +6003,7 @@ label2:;
 
             #[test]
             fn duplicate_labels_different_scopes() {
-                codegen_run_and_expect_compile_failure(
+                test_codegen_mainfunc_failure(
                     r"
     int x = 0;
     if (x) {
@@ -6024,7 +6024,7 @@ label2:;
 
             #[test]
             fn goto_use_before_declare() {
-                codegen_run_and_expect_compile_failure(
+                test_codegen_mainfunc_failure(
                     r"
     int x = 0;
     if (x != 0) {
@@ -6039,7 +6039,7 @@ label2:;
 
             #[test]
             fn labeled_break_outside_loop() {
-                codegen_run_and_expect_compile_failure(
+                test_codegen_mainfunc_failure(
                     r"
     // make sure our usual analysis of break/continue labels also traverses labeled statements
     label: break;
@@ -6464,7 +6464,7 @@ label2:;
 
                 #[test]
                 fn extra_header_clause() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 0; i < 10; i = i + 1; )
             ;
@@ -6475,7 +6475,7 @@ label2:;
 
                 #[test]
                 fn missing_header_clause() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 0;)
             ;
@@ -6486,7 +6486,7 @@ label2:;
 
                 #[test]
                 fn extra_parens() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 2; ))
             int a = 0;
@@ -6496,7 +6496,7 @@ label2:;
 
                 #[test]
                 fn invalid_declaration_compound_assignment() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i += 1; i < 10; i += 1) {
             return 0;
@@ -6507,7 +6507,7 @@ label2:;
 
                 #[test]
                 fn declaration_in_condition() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (; int i = 0; i = i + 1)
             ;
@@ -6518,7 +6518,7 @@ label2:;
 
                 #[test]
                 fn label_in_header() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 0; label: i < 10; i = i + 1) {
             ;
@@ -6530,7 +6530,7 @@ label2:;
 
                 #[test]
                 fn undeclared_variable() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (i = 0; i < 1; i = i + 1)
         {
@@ -6542,7 +6542,7 @@ label2:;
 
                 #[test]
                 fn reference_body_variable_in_condition() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
         for (;; i++) {
             int i = 0;
@@ -6674,7 +6674,7 @@ label2:;
 
                 #[test]
                 fn declaration_in_body() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
     while (1)
         int i = 0;
@@ -6685,7 +6685,7 @@ label2:;
 
                 #[test]
                 fn declaration_in_condition() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
     while(int a) {
         2;
@@ -6696,7 +6696,7 @@ label2:;
 
                 #[test]
                 fn missing_parentheses() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
     while 1 {
         return 0;
@@ -6779,7 +6779,7 @@ label2:;
 
                 #[test]
                 fn semicolon_after_body() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
     do {
         int a;
@@ -6791,7 +6791,7 @@ label2:;
 
                 #[test]
                 fn missing_final_semicolon() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
     do {
         4;
@@ -6803,7 +6803,7 @@ label2:;
 
                 #[test]
                 fn empty_condition() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
     do
         1;
@@ -6815,7 +6815,7 @@ label2:;
 
                 #[test]
                 fn variable_in_body_not_in_scope_for_condition() {
-                    codegen_run_and_expect_compile_failure(
+                    test_codegen_mainfunc_failure(
                         r"
     do {
         int a = a + 1;
@@ -6871,7 +6871,7 @@ for_label:
 
             #[test]
             fn label_is_not_block() {
-                codegen_run_and_expect_compile_failure(
+                test_codegen_mainfunc_failure(
                     r"
     int a = 0;
     int b = 0;
@@ -6890,7 +6890,7 @@ for_label:
 
             #[test]
             fn duplicate_label_in_body() {
-                codegen_run_and_expect_compile_failure(
+                test_codegen_mainfunc_failure(
                     r"
     do {
         // make sure our label-validation analysis also traverses loop bodies
@@ -7042,7 +7042,7 @@ int main() {
     #[test]
     #[ignore]
     fn parameter_redefinition() {
-        codegen_run_and_expect_compile_failure(
+        test_codegen_mainfunc_failure(
             r"int blah(int x)
 {
     int x;
@@ -7054,7 +7054,7 @@ int main() {
 }",
         );
 
-        codegen_run_and_expect_compile_failure(
+        test_codegen_mainfunc_failure(
             r"int blah(int x)
 {
     {
