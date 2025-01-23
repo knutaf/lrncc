@@ -11,6 +11,9 @@ use {
     std::{
         cell::RefCell, collections::HashMap, fmt, fmt::Display, ops::Deref, path::*, process::*,
     },
+    tracing::{debug, info, instrument},
+    tracing_subscriber,
+    tracing_subscriber::{prelude::*, util::SubscriberInitExt, EnvFilter, Registry},
 };
 
 const VARIABLE_SIZE: u32 = 8;
@@ -139,6 +142,23 @@ trait FmtNode {
     }
 }
 
+// This implements FmtNode for any reference to a type that implements FmtNode. It's mostly useful along with
+// DisplayFmtNode, below.
+impl<T: FmtNode + ?Sized> FmtNode for &T {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        (*self).fmt_node(f, indent_levels)
+    }
+}
+
+// Because Rust doesn't allow a blanket implementation of fmt::Display for FmtNode, we can instead make a bare wrapper
+// to do it for us.
+struct DisplayFmtNode<T>(T);
+impl<T: FmtNode> fmt::Display for DisplayFmtNode<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt_node(f, 0)
+    }
+}
+
 // A wrapper around a slice of tokens with convenience functions useful for parsing.
 #[derive(PartialEq, Clone, Debug)]
 struct Tokens<'i, 't>(&'t [&'i str]);
@@ -161,10 +181,13 @@ impl<'i, 't> Tokens<'i, 't> {
 
         if tokens[0] == expected_token {
             *self = remaining_tokens;
-            //println!("consumed expected next token {}", expected_token);
+            debug!(name: "consume_expected_token", target: "parse", token = expected_token, "consumed");
             Ok(self)
         } else {
-            //println!("expected next token \"{}\" but found \"{}\"", expected_token, tokens[0]);
+            debug!(
+                "expected next token \"{}\" but found \"{}\"",
+                expected_token, tokens[0]
+            );
             Err(format!(
                 "expected next token \"{}\" but found \"{}\"",
                 expected_token, tokens[0]
@@ -195,7 +218,7 @@ impl<'i, 't> Tokens<'i, 't> {
 
         if is_token_identifier(tokens[0]) {
             *self = remaining_tokens;
-            //println!("consumed identifier {}", tokens[0]);
+            debug!("consumed identifier {}", tokens[0]);
             Ok(tokens[0])
         } else {
             Err(format!("token \"{}\" is not a variable name", tokens[0]))
@@ -1369,7 +1392,7 @@ impl FmtNode for AstStatement {
                     write!(f, "{}: ", ast_body_end_label.0)?;
                 }
 
-                write!(f, "while ")?;
+                write!(f, "while (")?;
                 condition_expr.fmt_node(f, indent_levels)?;
                 write!(f, ")")?;
 
@@ -3410,7 +3433,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
     for r in SKIPPED_TOKEN_REGEXES.iter() {
         if let Some(mat) = r.find(input) {
             let range = mat.range();
-            //println!("match skipped {:?}: {}, {}", r, range.start, range.end);
+            debug!(target: "lex", "match skipped {:?}: {}, {}", r, range.start, range.end);
             return Ok(("", input.split_at(range.end).1));
         }
     }
@@ -3418,7 +3441,7 @@ fn lex_next_token<'i>(input: &'i str) -> Result<(&'i str, &'i str), String> {
     for r in TOKEN_REGEXES.iter() {
         if let Some(mat) = r.find(input) {
             let range = mat.range();
-            //println!("match {:?}: {}, {}", r, range.start, range.end);
+            debug!(target: "lex", "match {:?}: {}, {}", r, range.start, range.end);
             return Ok(input.split_at(range.end));
         }
     }
@@ -3433,8 +3456,8 @@ fn lex_all_tokens<'i>(input: &'i str) -> Result<Vec<&'i str>, Vec<String>> {
     while remaining_input.len() > 0 {
         match lex_next_token(&remaining_input) {
             Ok(split) => {
-                //println!("[{}], [{}]", split.0, split.1);
-                //println!("token: {}", split.0);
+                debug!(target: "lex", "[{}], [{}]", split.0, split.1);
+                info!(target: "lex", "token: {}", split.0);
                 if !split.0.is_empty() {
                     tokens.push(split.0);
                 }
@@ -3472,6 +3495,7 @@ fn parse_function<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstFun
     })
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_function_parameter<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
     is_first_parameter: bool,
@@ -3489,6 +3513,7 @@ fn parse_function_parameter<'i, 't>(
     Ok(var_name)
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_block<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlock, String> {
     let mut tokens = original_tokens.clone();
 
@@ -3508,6 +3533,7 @@ fn parse_block<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlock,
     Ok(AstBlock(body))
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_block_item<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
     let mut tokens = original_tokens.clone();
 
@@ -3526,6 +3552,7 @@ fn parse_block_item<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstB
     ret
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
     let mut tokens = original_tokens.clone();
 
@@ -3588,9 +3615,12 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
     };
 
     *original_tokens = tokens;
-    Ok(AstStatement::new(statement_type, labels))
+    let st = AstStatement::new(statement_type, labels);
+    debug!(target: "parse", st = %DisplayFmtNode(&st), "parsed statement");
+    Ok(st)
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_for_statement<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
 ) -> Result<AstStatementType, String> {
@@ -3624,6 +3654,7 @@ fn parse_for_statement<'i, 't>(
     ))
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_statement_labels<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
 ) -> Result<Vec<AstLabel>, String> {
@@ -3652,6 +3683,7 @@ fn parse_statement_labels<'i, 't>(
     }
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_declaration<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
 ) -> Result<AstDeclaration, String> {
@@ -3672,13 +3704,18 @@ fn parse_declaration<'i, 't>(
 
     *original_tokens = tokens;
 
-    Ok(AstDeclaration {
+    let decl = AstDeclaration {
         identifier: AstIdentifier(String::from(var_name)),
         initializer_opt,
-    })
+    };
+
+    debug!(target: "parse", decl = %DisplayFmtNode(&decl), "parsed declaration");
+
+    Ok(decl)
 }
 
 fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+    #[instrument(target = "parse", level = "debug")]
     fn parse_expression_with_precedence<'i, 't>(
         original_tokens: &mut Tokens<'i, 't>,
         min_precedence_allowed: u8,
@@ -3773,6 +3810,7 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
     parse_expression_with_precedence(original_tokens, 0)
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_optional_expression<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
     terminator: &str,
@@ -3802,6 +3840,7 @@ fn parse_optional_expression<'i, 't>(
     ret
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
     let mut tokens = original_tokens.clone();
 
@@ -3840,6 +3879,7 @@ fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpre
     ret
 }
 
+#[instrument(target = "parse", level = "debug")]
 fn parse_postfix_operator<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
 ) -> Option<AstUnaryOperator> {
@@ -3865,7 +3905,7 @@ fn parse_postfix_operator<'i, 't>(
 fn generate_program_code(mode: Mode, ast_program: &mut AstProgram) -> Result<String, String> {
     let tac_program = ast_program.to_tac()?;
 
-    println!(
+    info!(
         "tac:\n{}\n",
         display_with(|f| { tac_program.fmt_node(f, 0) })
     );
@@ -3874,12 +3914,12 @@ fn generate_program_code(mode: Mode, ast_program: &mut AstProgram) -> Result<Str
         Mode::All | Mode::CodegenOnly => {
             let mut asm_program = tac_program.to_asm()?;
 
-            println!("asm:\n{}", display_with(|f| asm_program.fmt_node(f, 0)));
+            info!("asm:\n{}", display_with(|f| asm_program.fmt_node(f, 0)));
 
             asm_program.finalize()?;
 
-            println!(
-                "\nasm after fixup:\n{}",
+            info!(
+                "asm after fixup:\n{}",
                 display_with(|f| asm_program.fmt_node(f, 0))
             );
 
@@ -3920,7 +3960,7 @@ fn assemble_and_link(
         "/link",
         "/pdb:output.pdb",
     ];
-    println!("ml64.exe {} {}", args[0], args[1]);
+    info!("ml64.exe {} {}", args[0], args[1]);
     command.args(&args);
     command.current_dir(&temp_dir);
 
@@ -3930,7 +3970,7 @@ fn assemble_and_link(
 
     let status = command.status().expect("failed to run ml64.exe");
 
-    println!("assembly status: {:?}", status);
+    info!("assembly status: {:?}", status);
     if status.success() {
         std::fs::rename(&exe_temp_output_path, &Path::new(output_exe_path));
 
@@ -3943,16 +3983,10 @@ fn assemble_and_link(
 }
 
 // TODO should return line numbers with errors
+#[instrument(target = "parse", level = "debug", skip_all)]
 fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, Vec<String>> {
     let token_strings = lex_all_tokens(&input)?;
     let mut tokens = Tokens(&token_strings);
-    /*
-    for token in tokens.iter() {
-        println!("{}", token);
-    }
-
-    println!();
-    */
 
     if let Mode::LexOnly = mode {
         return Ok(AstProgram::new(vec![]));
@@ -3968,7 +4002,7 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
         AstProgram::new(functions)
     };
 
-    println!("AST:\n{}\n", display_with(|f| ast.fmt_node(f, 0)));
+    info!("AST:\n{}", display_with(|f| ast.fmt_node(f, 0)));
 
     if tokens.0.len() != 0 {
         return Err(vec![format!(
@@ -3983,8 +4017,8 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
 
     ast.validate_and_resolve()?;
 
-    println!(
-        "AST after resolve:\n{}\n",
+    info!(
+        "AST after resolve:\n{}",
         display_with(|f| ast.fmt_node(f, 0))
     );
 
@@ -4006,7 +4040,7 @@ fn preprocess(
     command.args(&args);
     command.current_dir(&temp_dir);
 
-    println!("preprocess command: {:?}", command);
+    info!("preprocess command: {:?}", command);
 
     if should_suppress_output {
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -4014,7 +4048,7 @@ fn preprocess(
 
     let status = command.status().expect("failed to run cl.exe");
 
-    println!("preprocess status: {:?}", status);
+    info!("preprocess status: {:?}", status);
     if status.success() {
         Ok(std::fs::read_to_string(&preprocessed_output_path).map_err(format_io_err)?)
     } else {
@@ -4041,7 +4075,7 @@ fn compile_and_link(
                     let asm = generate_program_code(args.mode, ast)?;
 
                     if let Mode::All = args.mode {
-                        println!("\nassembly:\n{}", asm);
+                        info!("assembly:\n{}", asm);
 
                         let exit_code = assemble_and_link(
                             &asm,
@@ -4050,7 +4084,7 @@ fn compile_and_link(
                             temp_dir,
                         )
                         .expect("programs should always have an exit code");
-                        println!("assemble status: {}", exit_code);
+                        info!("assemble status: {}", exit_code);
 
                         if exit_code == 0 {
                             Ok(exit_code)
@@ -4086,7 +4120,7 @@ fn compile_and_link(
     std::fs::create_dir_all(&temp_dir);
     let ret = helper(args, input, should_suppress_output, temp_dir);
     if ret.is_ok() {
-        println!("cleaning up temp dir {}", temp_dir.to_string_lossy());
+        debug!("cleaning up temp dir {}", temp_dir.to_string_lossy());
         std::fs::remove_dir_all(&temp_dir);
     }
     ret
@@ -4131,10 +4165,19 @@ struct LcArgs {
 
     #[arg()]
     output_path: Option<String>,
+
+    #[arg(short = 'v')]
+    verbose: bool,
 }
 
 fn main() {
     let args = LcArgs::parse();
+
+    if args.verbose {
+        Registry::default()
+            .with(tracing_forest::ForestLayer::default().with_filter(EnvFilter::from_default_env()))
+            .init();
+    }
 
     if let Mode::All = args.mode {
         if args.output_path.is_none() {
@@ -4143,7 +4186,7 @@ fn main() {
         }
     }
 
-    println!("loading {}", args.input_path);
+    info!("Loading {}", args.input_path);
     let input = std::fs::read_to_string(&args.input_path).unwrap();
 
     let exit_code = match compile_and_link(&args, &input, false) {
@@ -4161,11 +4204,29 @@ fn main() {
 mod test {
     use super::*;
 
+    macro_rules! test {
+        ($name:ident $body:block) => {
+            #[test]
+            fn $name() {
+                let _ = Registry::default()
+                    .with(
+                        tracing_forest::ForestLayer::new(
+                            tracing_forest::printer::TestCapturePrinter::new(),
+                            tracing_forest::tag::NoTag,
+                        )
+                        .with_filter(EnvFilter::from_default_env()),
+                    )
+                    .try_init();
+
+                $body
+            }
+        };
+    }
+
     mod lex {
         use super::*;
 
-        #[test]
-        fn simple() {
+        test!(simple {
             let input = r"int main() {
         return 2;
     }";
@@ -4173,71 +4234,62 @@ mod test {
                 lex_all_tokens(&input),
                 Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
             );
-        }
+        });
 
-        #[test]
-        fn no_whitespace() {
+        test!(no_whitespace {
             let input = r"int main(){return 2;}";
             assert_eq!(
                 lex_all_tokens(&input),
                 Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
             );
-        }
+        });
 
-        #[test]
-        fn negative() {
+        test!(negative {
             assert_eq!(
                 lex_all_tokens("int main() { return -1; }"),
                 Ok(vec![
                     "int", "main", "(", ")", "{", "return", "-", "1", ";", "}"
                 ])
             );
-        }
+        });
 
-        #[test]
-        fn bitwise_not() {
+        test!(bitwise_not {
             assert_eq!(
                 lex_all_tokens("int main() { return ~1; }"),
                 Ok(vec![
                     "int", "main", "(", ")", "{", "return", "~", "1", ";", "}"
                 ])
             );
-        }
+        });
 
-        #[test]
-        fn logical_not() {
+        test!(logical_not {
             assert_eq!(
                 lex_all_tokens("int main() { return !1; }"),
                 Ok(vec![
                     "int", "main", "(", ")", "{", "return", "!", "1", ";", "}"
                 ])
             );
-        }
+        });
 
-        #[test]
-        fn no_at() {
+        test!(no_at {
             assert!(lex_all_tokens("int main() { return 0@1; }").is_err());
-        }
+        });
 
-        #[test]
-        fn no_backslash() {
+        test!(no_backslash {
             assert!(lex_all_tokens("\\").is_err());
-        }
+        });
 
-        #[test]
-        fn no_backtick() {
+        test!(no_backtick {
             assert!(lex_all_tokens("`").is_err());
-        }
+        });
 
-        #[test]
-        fn bad_identifier() {
+        test!(bad_identifier {
             assert!(lex_all_tokens("int main() { return 1foo; }").is_err());
-        }
+        });
 
-        #[test]
-        fn no_at_identifier() {
+        test!(no_at_identifier {
             assert!(lex_all_tokens("int main() { return @b; }").is_err());
-        }
+        });
     }
 
     fn codegen_run_and_check_exit_code_or_compile_failure(
@@ -4248,6 +4300,7 @@ mod test {
             input_path: String::new(),
             output_path: Some(format!("test_{}.exe", generate_random_string(8))),
             mode: Mode::All,
+            verbose: true,
         };
 
         let compile_result = compile_and_link(&args, input, true);
@@ -4315,365 +4368,294 @@ mod test {
     }
 
     fn test_codegen_mainfunc_failure(body: &str) {
-        codegen_run_and_expect_compile_failure(&format!("int main() {{ {} }}", body))
+        codegen_run_and_expect_compile_failure(&format!("int main() {{\n{}\n}}", body))
     }
 
     mod fail {
         use super::*;
 
-        #[test]
-        fn parse_extra_paren() {
+        test!(parse_extra_paren {
             test_codegen_mainfunc_failure("return (3));");
-        }
+        });
 
-        #[test]
-        fn parse_unclosed_paren() {
+        test!(parse_unclosed_paren {
             test_codegen_mainfunc_failure("return (3;");
-        }
+        });
 
-        #[test]
-        fn parse_missing_immediate() {
+        test!(parse_missing_immediate {
             test_codegen_mainfunc_failure("return ~;");
-        }
+        });
 
-        #[test]
-        fn parse_missing_immediate_2() {
+        test!(parse_missing_immediate_2 {
             test_codegen_mainfunc_failure("return -~;");
-        }
+        });
 
-        #[test]
-        fn parse_missing_semicolon() {
+        test!(parse_missing_semicolon {
             test_codegen_mainfunc_failure("return 5");
-        }
+        });
 
-        #[test]
-        fn parse_missing_semicolon_binary_op() {
+        test!(parse_missing_semicolon_binary_op {
             test_codegen_mainfunc_failure("return 5 + 6");
-        }
+        });
 
-        #[test]
-        fn parse_parens_around_operator() {
+        test!(parse_parens_around_operator {
             test_codegen_mainfunc_failure("return (-)5;");
-        }
+        });
 
-        #[test]
-        fn parse_operator_wrong_order() {
+        test!(parse_operator_wrong_order {
             test_codegen_mainfunc_failure("return 5-;");
-        }
+        });
 
-        #[test]
-        fn parse_double_operator() {
+        test!(parse_double_operator {
             test_codegen_mainfunc_failure("return 1 * / 2;");
-        }
+        });
 
-        #[test]
-        fn parse_unbalanced_paren() {
+        test!(parse_unbalanced_paren {
             test_codegen_mainfunc_failure("return 1 + (2;");
-        }
+        });
 
-        #[test]
-        fn parse_missing_opening_paren() {
+        test!(parse_missing_opening_paren {
             test_codegen_mainfunc_failure("return 1 + 2);");
-        }
+        });
 
-        #[test]
-        fn parse_unexpected_paren() {
+        test!(parse_unexpected_paren {
             test_codegen_mainfunc_failure("return 1 (- 2);");
-        }
+        });
 
-        #[test]
-        fn parse_misplaced_semicolon_paren() {
+        test!(parse_misplaced_semicolon_paren {
             test_codegen_mainfunc_failure("return 1 + (2;)");
-        }
+        });
 
-        #[test]
-        fn parse_missing_first_binary_operand() {
+        test!(parse_missing_first_binary_operand {
             test_codegen_mainfunc_failure("return / 2;");
-        }
+        });
 
-        #[test]
-        fn parse_missing_second_binary_operand() {
+        test!(parse_missing_second_binary_operand {
             test_codegen_mainfunc_failure("return 2 / ;");
-        }
+        });
 
-        #[test]
-        fn parse_relational_missing_first_operand() {
+        test!(parse_relational_missing_first_operand {
             test_codegen_mainfunc_failure("return <= 2;");
-        }
+        });
 
-        #[test]
-        fn parse_relational_missing_second_operand() {
+        test!(parse_relational_missing_second_operand {
             test_codegen_mainfunc_failure("return 1 < > 3;");
-        }
+        });
 
-        #[test]
-        fn parse_and_missing_second_operand() {
+        test!(parse_and_missing_second_operand {
             test_codegen_mainfunc_failure("return 2 && ~;");
-        }
+        });
 
-        #[test]
-        fn parse_or_missing_semicolon() {
+        test!(parse_or_missing_semicolon {
             test_codegen_mainfunc_failure("return 2 || 4");
-        }
+        });
 
-        #[test]
-        fn parse_unary_not_missing_semicolon() {
+        test!(parse_unary_not_missing_semicolon {
             test_codegen_mainfunc_failure("return !10");
-        }
+        });
 
-        #[test]
-        fn parse_double_bitwise_or() {
+        test!(parse_double_bitwise_or {
             test_codegen_mainfunc_failure("return 1 | | 2;");
-        }
+        });
 
-        #[test]
-        fn parse_unary_not_missing_operand() {
+        test!(parse_unary_not_missing_operand {
             test_codegen_mainfunc_failure("return 10 <= !;");
-        }
+        });
 
-        #[test]
-        fn duplicate_variable() {
+        test!(duplicate_variable {
             test_codegen_mainfunc_failure("int x = 5; int x = 4; return x;");
-        }
+        });
 
-        #[test]
-        fn duplicate_variable_after_use() {
+        test!(duplicate_variable_after_use {
             test_codegen_mainfunc_failure("int x = 5; return x; int x = 4; return x;");
-        }
+        });
 
-        #[test]
-        fn unknown_variable() {
+        test!(unknown_variable {
             test_codegen_mainfunc_failure("return x;");
-        }
+        });
 
-        #[test]
-        fn unknown_variable_after_shortcircuit() {
+        test!(unknown_variable_after_shortcircuit {
             test_codegen_mainfunc_failure("return 0 && x;");
-        }
+        });
 
-        #[test]
-        fn unknown_variable_in_binary_op() {
+        test!(unknown_variable_in_binary_op {
             test_codegen_mainfunc_failure("return x < 5;");
-        }
+        });
 
-        #[test]
-        fn unknown_variable_in_bitwise_op() {
+        test!(unknown_variable_in_bitwise_op {
             test_codegen_mainfunc_failure("return a >> 2;");
-        }
+        });
 
-        #[test]
-        fn unknown_variable_in_unary_op() {
+        test!(unknown_variable_in_unary_op {
             test_codegen_mainfunc_failure("return -x;");
-        }
+        });
 
-        #[test]
-        fn unknown_variable_lhs_compound_assignment() {
+        test!(unknown_variable_lhs_compound_assignment {
             test_codegen_mainfunc_failure("a += 1; return 0;");
-        }
+        });
 
-        #[test]
-        fn unknown_variable_rhs_compound_assignment() {
+        test!(unknown_variable_rhs_compound_assignment {
             test_codegen_mainfunc_failure("int b = 10; b *= a; return 0;");
-        }
+        });
 
-        #[test]
-        fn malformed_plusequals() {
+        test!(malformed_plusequals {
             test_codegen_mainfunc_failure("int a = 0; a + = 1; return a;");
-        }
+        });
 
-        #[test]
-        fn malformed_decrement() {
+        test!(malformed_decrement {
             test_codegen_mainfunc_failure("int a = 5; a - -; return a;");
-        }
+        });
 
-        #[test]
-        fn malformed_increment() {
+        test!(malformed_increment {
             test_codegen_mainfunc_failure("int a = 5; a + +; return a;");
-        }
+        });
 
-        #[test]
-        fn malformed_less_equals() {
+        test!(malformed_less_equals {
             test_codegen_mainfunc_failure("return 1 < = 2;");
-        }
+        });
 
-        #[test]
-        fn malformed_not_equals() {
+        test!(malformed_not_equals {
             test_codegen_mainfunc_failure("return 1 ! = 2;");
-        }
+        });
 
-        #[test]
-        fn malformed_divide_equals() {
+        test!(malformed_divide_equals {
             test_codegen_mainfunc_failure("int a = 10; a =/ 5; return a;");
-        }
+        });
 
-        #[test]
-        fn missing_semicolon() {
+        test!(missing_semicolon {
             test_codegen_mainfunc_failure("int a = 5 a = a + 5; return a;");
-        }
+        });
 
-        #[test]
-        fn return_in_assignment() {
+        test!(return_in_assignment {
             test_codegen_mainfunc_failure("int a = return 5;");
-        }
+        });
 
-        #[test]
-        fn declare_keyword_as_var() {
+        test!(declare_keyword_as_var {
             test_codegen_mainfunc_failure("int return = 6; return return + 1;");
-        }
+        });
 
-        #[test]
-        fn declare_after_use() {
+        test!(declare_after_use {
             test_codegen_mainfunc_failure("a = 5; int a; return a;");
-        }
+        });
 
-        #[test]
-        fn invalid_lvalue_binary_op() {
+        test!(invalid_lvalue_binary_op {
             test_codegen_mainfunc_failure("int a = 5; a + 3 = 4; return a;");
-        }
+        });
 
-        #[test]
-        fn invalid_lvalue_unary_op() {
+        test!(invalid_lvalue_unary_op {
             test_codegen_mainfunc_failure("int a = 5; !a = 4; return a;");
-        }
+        });
 
-        #[test]
-        fn declare_invalid_var_name_with_space() {
+        test!(declare_invalid_var_name_with_space {
             test_codegen_mainfunc_failure("int x y = 3; return y;");
-        }
+        });
 
-        #[test]
-        fn declare_invalid_var_name_starting_number() {
+        test!(declare_invalid_var_name_starting_number {
             test_codegen_mainfunc_failure("int 10 = 3; return 10;");
             test_codegen_mainfunc_failure("int 10a = 3; return 10a;");
-        }
+        });
 
-        #[test]
-        fn declare_invalid_type_name() {
+        test!(declare_invalid_type_name {
             test_codegen_mainfunc_failure("ints x = 3; return x;");
-        }
+        });
 
-        #[test]
-        fn invalid_mixed_precedence_assignment() {
+        test!(invalid_mixed_precedence_assignment {
             test_codegen_mainfunc_failure("int a = 1; int b = 2; a = 3 * b = a; return a;");
-        }
+        });
 
-        #[test]
-        fn compound_initializer() {
+        test!(compound_initializer {
             test_codegen_mainfunc_failure("int a += 0; return a;");
-        }
+        });
 
-        #[test]
-        fn invalid_unary_lvalue() {
+        test!(invalid_unary_lvalue {
             test_codegen_mainfunc_failure("int a = 0; -a += 1; return a;");
-        }
+        });
 
-        #[test]
-        fn invalid_compound_lvalue() {
+        test!(invalid_compound_lvalue {
             test_codegen_mainfunc_failure("int a = 10; (a += 1) -= 2;");
-        }
+        });
 
-        #[test]
-        fn decrement_binary_op() {
+        test!(decrement_binary_op {
             test_codegen_mainfunc_failure("int a = 0; return a -- 1;");
-        }
+        });
 
-        #[test]
-        fn increment_binary_op() {
+        test!(increment_binary_op {
             test_codegen_mainfunc_failure("int a = 0; return a ++ 1;");
-        }
+        });
 
-        #[test]
-        fn increment_declaration() {
+        test!(increment_declaration {
             test_codegen_mainfunc_failure("int a++; return 0;");
-        }
+        });
 
-        #[test]
-        fn double_postfix() {
+        test!(double_postfix {
             test_codegen_mainfunc_failure("int a = 10; return a++--;");
-        }
+        });
 
-        #[test]
-        fn postfix_incr_non_lvalue() {
+        test!(postfix_incr_non_lvalue {
             test_codegen_mainfunc_failure("int a = 0; (a = 4)++;");
-        }
+        });
 
-        #[test]
-        fn prefix_incr_non_lvalue() {
+        test!(prefix_incr_non_lvalue {
             test_codegen_mainfunc_failure("int a = 1; ++(a+1); return 0;");
-        }
+        });
 
-        #[test]
-        fn prefix_decr_constant() {
+        test!(prefix_decr_constant {
             test_codegen_mainfunc_failure("return --3;");
-        }
+        });
 
-        #[test]
-        fn postfix_undeclared_var() {
+        test!(postfix_undeclared_var {
             test_codegen_mainfunc_failure("a--; return 0;");
-        }
+        });
 
-        #[test]
-        fn prefix_undeclared_var() {
+        test!(prefix_undeclared_var {
             test_codegen_mainfunc_failure("++a; return 0;");
-        }
+        });
 
-        #[test]
-        fn declaration_as_statement() {
+        test!(declaration_as_statement {
             test_codegen_mainfunc_failure("if (5) int i = 0;");
-        }
+        });
 
-        #[test]
-        fn empty_if_body() {
+        test!(empty_if_body {
             test_codegen_mainfunc_failure("if (0) else return 0;");
-        }
+        });
 
-        #[test]
-        fn if_as_assignment() {
+        test!(if_as_assignment {
             test_codegen_mainfunc_failure("int flag = 0; int a = if (flag) 2; else 3; return a;");
-        }
+        });
 
-        #[test]
-        fn if_no_parentheses() {
+        test!(if_no_parentheses {
             test_codegen_mainfunc_failure("if 0 return 1;");
-        }
+        });
 
-        #[test]
-        fn extra_else() {
+        test!(extra_else {
             test_codegen_mainfunc_failure("if (1) return 1; else return 2; else return 3;");
-        }
+        });
 
-        #[test]
-        fn undeclared_var_in_if() {
+        test!(undeclared_var_in_if {
             test_codegen_mainfunc_failure("if (1) return c; int c = 0;");
-        }
+        });
 
-        #[test]
-        fn incomplete_ternary() {
+        test!(incomplete_ternary {
             test_codegen_mainfunc_failure("return 1 ? 2;");
-        }
+        });
 
-        #[test]
-        fn ternary_extra_left() {
+        test!(ternary_extra_left {
             test_codegen_mainfunc_failure("return 1 ? 2 ? 3 : 4;");
-        }
+        });
 
-        #[test]
-        fn ternary_extra_right() {
+        test!(ternary_extra_right {
             test_codegen_mainfunc_failure("return 1 ? 2 : 3 : 4;");
-        }
+        });
 
-        #[test]
-        fn ternary_wrong_delimiter() {
+        test!(ternary_wrong_delimiter {
             test_codegen_mainfunc_failure("int x = 10; return x ? 1 = 2;");
-        }
+        });
 
-        #[test]
-        fn ternary_undeclared_var() {
+        test!(ternary_undeclared_var {
             test_codegen_mainfunc_failure("return a > 0 ? 1 : 2; int a = 5;");
-        }
+        });
 
-        #[test]
-        fn ternary_invalid_assign() {
+        test!(ternary_invalid_assign {
             test_codegen_mainfunc_failure(
                 r"
             int a = 2;
@@ -4682,53 +4664,44 @@ mod test {
             return a;
             ",
             );
-        }
+        });
 
-        #[test]
-        fn keywords_as_var_identifier() {
+        test!(keywords_as_var_identifier {
             test_codegen_mainfunc_failure("int if = 0; return if;");
             test_codegen_mainfunc_failure("int int = 0; return int;");
             test_codegen_mainfunc_failure("int void = 0; return void;");
             test_codegen_mainfunc_failure("int return = 0; return return;");
-        }
+        });
 
-        #[test]
-        fn extra_closing_brace() {
+        test!(extra_closing_brace {
             test_codegen_mainfunc_failure("if(0){ return 1; }} return 2;");
-        }
+        });
 
-        #[test]
-        fn missing_closing_brace() {
+        test!(missing_closing_brace {
             test_codegen_mainfunc_failure("if(0){ return 1; return 2;");
-        }
+        });
 
-        #[test]
-        fn missing_semicolon_in_block() {
+        test!(missing_semicolon_in_block {
             test_codegen_mainfunc_failure("int a = 4; { a = 5; return a }");
-        }
+        });
 
-        #[test]
-        fn block_in_ternary() {
+        test!(block_in_ternary {
             test_codegen_mainfunc_failure("int a; return 1 ? { a = 2 } : a = 4;");
-        }
+        });
 
-        #[test]
-        fn duplicate_var_declaration() {
+        test!(duplicate_var_declaration {
             test_codegen_mainfunc_failure("{ int a; int a; }");
-        }
+        });
 
-        #[test]
-        fn use_var_after_scope() {
+        test!(use_var_after_scope {
             test_codegen_mainfunc_failure("{ int a = 2; } return a;");
-        }
+        });
 
-        #[test]
-        fn use_var_before_declare() {
+        test!(use_var_before_declare {
             test_codegen_mainfunc_failure("int a; { b = 10; } int b; return b;");
-        }
+        });
 
-        #[test]
-        fn duplicate_var_declaration_after_block() {
+        test!(duplicate_var_declaration_after_block {
             test_codegen_mainfunc_failure(
                 r"
     int a = 3;
@@ -4739,16 +4712,14 @@ mod test {
     return a;
             ",
             );
-        }
+        });
 
-        #[test]
-        fn break_outside_loop() {
-            codegen_run_and_expect_compile_failure(r"if (1) break;");
-        }
+        test!(break_outside_loop {
+            test_codegen_mainfunc_failure(r"if (1) break;");
+        });
 
-        #[test]
-        fn continue_outside_loop() {
-            codegen_run_and_expect_compile_failure(
+        test!(continue_outside_loop {
+            test_codegen_mainfunc_failure(
                 r"
     {
         int a;
@@ -4757,435 +4728,353 @@ mod test {
     return 0;
             ",
             );
-        }
+        });
     }
 
-    #[test]
-    fn unary_neg() {
+    test!(unary_neg {
         test_codegen_expression("-5", -5);
-    }
+    });
 
-    #[test]
-    fn unary_bitnot() {
+    test!(unary_bitnot {
         test_codegen_expression("~12", -13);
-    }
+    });
 
-    #[test]
-    fn unary_not() {
+    test!(unary_not {
         test_codegen_expression("!5", 0);
         test_codegen_expression("!0", 1);
-    }
+    });
 
-    #[test]
-    fn unary_neg_zero() {
+    test!(unary_neg_zero {
         test_codegen_expression("-0", 0);
-    }
+    });
 
-    #[test]
-    fn unary_bitnot_zero() {
+    test!(unary_bitnot_zero {
         test_codegen_expression("~0", -1);
-    }
+    });
 
-    #[test]
-    fn unary_neg_min_val() {
+    test!(unary_neg_min_val {
         test_codegen_expression("-2147483647", -2147483647);
-    }
+    });
 
-    #[test]
-    fn unary_bitnot_and_neg() {
+    test!(unary_bitnot_and_neg {
         test_codegen_expression("~-3", 2);
-    }
+    });
 
-    #[test]
-    fn unary_bitnot_and_neg_zero() {
+    test!(unary_bitnot_and_neg_zero {
         test_codegen_expression("-~0", 1);
-    }
+    });
 
-    #[test]
-    fn unary_bitnot_and_neg_min_val() {
+    test!(unary_bitnot_and_neg_min_val {
         test_codegen_expression("~-2147483647", 2147483646);
-    }
+    });
 
-    #[test]
-    fn unary_grouping_outside() {
+    test!(unary_grouping_outside {
         test_codegen_expression("(-2)", -2);
-    }
+    });
 
-    #[test]
-    fn unary_grouping_inside() {
+    test!(unary_grouping_inside {
         test_codegen_expression("~(2)", -3);
-    }
+    });
 
-    #[test]
-    fn unary_grouping_inside_and_outside() {
+    test!(unary_grouping_inside_and_outside {
         test_codegen_expression("-(-4)", 4);
-    }
+    });
 
-    #[test]
-    fn unary_grouping_several() {
+    test!(unary_grouping_several {
         test_codegen_expression("-((((((10))))))", -10);
-    }
+    });
 
-    #[test]
-    fn unary_not_and_neg() {
+    test!(unary_not_and_neg {
         test_codegen_expression("!-3", 0);
-    }
+    });
 
-    #[test]
-    fn unary_not_and_arithmetic() {
+    test!(unary_not_and_arithmetic {
         test_codegen_expression("!(4-4)", 1);
         test_codegen_expression("!(4 - 5)", 0);
-    }
+    });
 
-    #[test]
-    fn expression_binary_operation() {
+    test!(expression_binary_operation {
         test_codegen_expression("5 + 6", 11);
-    }
+    });
 
-    #[test]
-    fn expression_negative_divide() {
+    test!(expression_negative_divide {
         test_codegen_expression("-110 / 10", -11);
-    }
+    });
 
-    #[test]
-    fn expression_negative_multiply() {
+    test!(expression_negative_multiply {
         test_codegen_expression("10 * -11", -110);
-    }
+    });
 
-    #[test]
-    fn expression_factors_and_terms() {
+    test!(expression_factors_and_terms {
         test_codegen_expression("(1 + 2 + 3 + 4) * (10 - 21)", -110);
-    }
+    });
 
-    #[test]
-    fn and_false() {
+    test!(and_false {
         test_codegen_expression("(10 && 0) + (0 && 4) + (0 && 0)", 0);
-    }
+    });
 
-    #[test]
-    fn and_true() {
+    test!(and_true {
         test_codegen_expression("1 && -1", 1);
-    }
+    });
 
-    #[test]
-    fn and_shortcircuit() {
+    test!(and_shortcircuit {
         test_codegen_expression("0 && (1 / 0)", 0);
-    }
+    });
 
-    #[test]
-    fn or_shortcircuit() {
+    test!(or_shortcircuit {
         test_codegen_expression("1 || (1 / 0)", 1);
-    }
+    });
 
-    #[test]
-    fn multi_shortcircuit() {
+    test!(multi_shortcircuit {
         test_codegen_expression("0 || 0 && (1 / 0)", 0);
-    }
+    });
 
-    #[test]
-    fn and_or_precedence() {
+    test!(and_or_precedence {
         test_codegen_expression("1 || 0 && 2", 1);
-    }
+    });
 
-    #[test]
-    fn and_or_precedence_2() {
+    test!(and_or_precedence_2 {
         test_codegen_expression("(1 || 0) && 0", 0);
-    }
+    });
 
-    #[test]
-    fn relational_lt() {
+    test!(relational_lt {
         test_codegen_expression("1234 < 1234", 0);
         test_codegen_expression("1234 < 1235", 1);
-    }
+    });
 
-    #[test]
-    fn relational_gt() {
+    test!(relational_gt {
         test_codegen_expression("1234 > 1234", 0);
         test_codegen_expression("1234 > 1233", 1);
         test_codegen_expression("(1 > 2) + (1 > 1)", 0);
-    }
+    });
 
-    #[test]
-    fn relational_le() {
+    test!(relational_le {
         test_codegen_expression("1234 <= 1234", 1);
         test_codegen_expression("1234 <= 1233", 0);
         test_codegen_expression("1 <= -1", 0);
         test_codegen_expression("(0 <= 2) + (0 <= 0)", 2);
-    }
+    });
 
-    #[test]
-    fn relational_ge() {
+    test!(relational_ge {
         test_codegen_expression("1234 >= 1234", 1);
         test_codegen_expression("1234 >= 1235", 0);
         test_codegen_expression("(1 >= 1) + (1 >= -4)", 2);
-    }
+    });
 
-    #[test]
-    fn equality_eq() {
+    test!(equality_eq {
         test_codegen_expression("1234 == 1234", 1);
         test_codegen_expression("1234 == 1235", 0);
-    }
+    });
 
-    #[test]
-    fn equality_ne() {
+    test!(equality_ne {
         test_codegen_expression("1234 != 1234", 0);
         test_codegen_expression("1234 != 1235", 1);
-    }
+    });
 
-    #[test]
-    fn logical_and() {
+    test!(logical_and {
         test_codegen_expression("0 && 1 && 2", 0);
         test_codegen_expression("5 && 6 && 7", 1);
         test_codegen_expression("5 && 6 && 0", 0);
-    }
+    });
 
-    #[test]
-    fn logical_or() {
+    test!(logical_or {
         test_codegen_expression("0 || 0 || 1", 1);
         test_codegen_expression("1 || 0 || 0", 1);
         test_codegen_expression("0 || 0 || 0", 0);
-    }
+    });
 
-    #[test]
-    fn equals_precedence() {
+    test!(equals_precedence {
         test_codegen_expression("0 == 0 != 0", 1);
-    }
+    });
 
-    #[test]
-    fn equals_relational_precedence() {
+    test!(equals_relational_precedence {
         test_codegen_expression("2 == 2 >= 0", 0);
-    }
+    });
 
-    #[test]
-    fn equals_or_precedence() {
+    test!(equals_or_precedence {
         test_codegen_expression("2 == 2 || 0", 1);
-    }
+    });
 
-    #[test]
-    fn relational_associativity() {
+    test!(relational_associativity {
         test_codegen_expression("5 >= 0 > 1 <= 0", 1);
-    }
+    });
 
-    #[test]
-    fn compare_arithmetic_results() {
+    test!(compare_arithmetic_results {
         test_codegen_expression("~2 * -2 == 1 + 5", 1);
-    }
+    });
 
-    #[test]
-    fn all_operator_precedence() {
+    test!(all_operator_precedence {
         test_codegen_expression("-1 * -2 + 3 >= 5 == 1 && (6 - 6) || 7", 1);
-    }
+    });
 
-    #[test]
-    fn all_operator_precedence_2() {
+    test!(all_operator_precedence_2 {
         test_codegen_expression("(0 == 0 && 3 == 2 + 1 > 1) + 1", 1);
-    }
+    });
 
-    #[test]
-    fn arithmetic_operator_precedence() {
+    test!(arithmetic_operator_precedence {
         test_codegen_expression("1 * 2 + 3 * -4", -10);
-    }
+    });
 
-    #[test]
-    fn arithmetic_operator_associativity_minus() {
+    test!(arithmetic_operator_associativity_minus {
         test_codegen_expression("5 - 2 - 1", 2);
-    }
+    });
 
-    #[test]
-    fn arithmetic_operator_associativity_div() {
+    test!(arithmetic_operator_associativity_div {
         test_codegen_expression("12 / 3 / 2", 2);
-    }
+    });
 
-    #[test]
-    fn arithmetic_operator_associativity_grouping() {
+    test!(arithmetic_operator_associativity_grouping {
         test_codegen_expression("(3 / 2 * 4) + (5 - 4 + 3)", 8);
-    }
+    });
 
-    #[test]
-    fn arithmetic_operator_associativity_grouping_2() {
+    test!(arithmetic_operator_associativity_grouping_2 {
         test_codegen_expression("5 * 4 / 2 - 3 % (2 + 1)", 10);
-    }
+    });
 
-    #[test]
-    fn sub_neg() {
+    test!(sub_neg {
         test_codegen_expression("2- -1", 3);
-    }
+    });
 
-    #[test]
-    fn unop_add() {
+    test!(unop_add {
         test_codegen_expression("~2 + 3", 0);
-    }
+    });
 
-    #[test]
-    fn unop_parens() {
+    test!(unop_parens {
         test_codegen_expression("~(1 + 2)", -4);
-    }
+    });
 
-    #[test]
-    fn modulus() {
+    test!(modulus {
         test_codegen_expression("10 % 3", 1);
-    }
+    });
 
-    #[test]
-    fn bitand_associativity() {
+    test!(bitand_associativity {
         test_codegen_expression("7 * 1 & 3 * 1", 3);
-    }
+    });
 
-    #[test]
-    fn or_xor_associativity() {
+    test!(or_xor_associativity {
         test_codegen_expression("7 ^ 3 | 3 ^ 1", 6);
-    }
+    });
 
-    #[test]
-    fn and_xor_associativity() {
+    test!(and_xor_associativity {
         test_codegen_expression("7 ^ 3 & 6 ^ 2", 7);
-    }
+    });
 
-    #[test]
-    fn shl_immediate() {
+    test!(shl_immediate {
         test_codegen_expression("5 << 2", 20);
-    }
+    });
 
-    #[test]
-    fn shl_tempvar() {
+    test!(shl_tempvar {
         test_codegen_expression("5 << (2 * 1)", 20);
-    }
+    });
 
-    #[test]
-    fn sar_immediate() {
+    test!(sar_immediate {
         test_codegen_expression("20 >> 2", 5);
-    }
+    });
 
-    #[test]
-    fn sar_tempvar() {
+    test!(sar_tempvar {
         test_codegen_expression("20 >> (2 * 1)", 5);
-    }
+    });
 
-    #[test]
-    fn shift_associativity() {
+    test!(shift_associativity {
         test_codegen_expression("33 << 4 >> 2", 132);
-    }
+    });
 
-    #[test]
-    fn shift_associativity_2() {
+    test!(shift_associativity_2 {
         test_codegen_expression("33 >> 2 << 1", 16);
-    }
+    });
 
-    #[test]
-    fn shift_precedence() {
+    test!(shift_precedence {
         test_codegen_expression("40 << 4 + 12 >> 1", 0x00140000);
-    }
+    });
 
-    #[test]
-    fn sar_negative() {
+    test!(sar_negative {
         test_codegen_expression("-5 >> 1", -3);
-    }
+    });
 
-    #[test]
-    fn bitwise_precedence() {
+    test!(bitwise_precedence {
         test_codegen_expression("80 >> 2 | 1 ^ 5 & 7 << 1", 21);
-    }
+    });
 
-    #[test]
-    fn arithmetic_and_booleans() {
+    test!(arithmetic_and_booleans {
         test_codegen_expression("~(0 && 1) - -(4 || 3)", 0);
-    }
+    });
 
-    #[test]
-    fn bitand_equals_precedence() {
+    test!(bitand_equals_precedence {
         test_codegen_expression("4 & 7 == 4", 0);
-    }
+    });
 
-    #[test]
-    fn bitor_notequals_precedence() {
+    test!(bitor_notequals_precedence {
         test_codegen_expression("4 | 7 != 4", 5);
-    }
+    });
 
-    #[test]
-    fn shift_relational_precedence() {
+    test!(shift_relational_precedence {
         test_codegen_expression("20 >> 4 <= 3 << 1", 1);
-    }
+    });
 
-    #[test]
-    fn xor_relational_precedence() {
+    test!(xor_relational_precedence {
         test_codegen_expression("5 ^ 7 < 5", 5);
-    }
+    });
 
-    #[test]
-    fn var_use() {
+    test!(var_use {
         test_codegen_mainfunc(
             "int _x = 5; int y = 6; int z; _x = 1; z = 3; return _x + y + z;",
             10,
         );
-    }
+    });
 
-    #[test]
-    fn assign_expr() {
+    test!(assign_expr {
         test_codegen_mainfunc("int x = 5; int y = x = 3 + 1; return x + y;", 8);
-    }
+    });
 
-    #[test]
-    fn declaration_after_expression() {
+    test!(declaration_after_expression {
         test_codegen_mainfunc("int x; x = 5; int y = -x; return y;", -5);
-    }
+    });
 
-    #[test]
-    fn mixed_precedence_assignment() {
+    test!(mixed_precedence_assignment {
         test_codegen_mainfunc("int x = 5; int y = 4; x = 3 * (y = x); return x + y;", 20);
-    }
+    });
 
-    #[test]
-    fn assign_after_not_short_circuit_or() {
+    test!(assign_after_not_short_circuit_or {
         test_codegen_mainfunc("int x = 0; 0 || (x = 1); return x;", 1);
-    }
+    });
 
-    #[test]
-    fn assign_after_short_circuit_and() {
+    test!(assign_after_short_circuit_and {
         test_codegen_mainfunc("int x = 0; 0 && (x = 1); return x;", 0);
-    }
+    });
 
-    #[test]
-    fn assign_after_short_circuit_or() {
+    test!(assign_after_short_circuit_or {
         test_codegen_mainfunc("int x = 0; 1 || (x = 1); return x;", 0);
-    }
+    });
 
-    #[test]
-    fn assign_low_precedence() {
+    test!(assign_low_precedence {
         test_codegen_mainfunc("int x; x = 0 || 5; return x;", 1);
-    }
+    });
 
-    #[test]
-    fn assign_var_in_initializer() {
+    test!(assign_var_in_initializer {
         test_codegen_mainfunc("int x = x + 5; return x;", 5);
-    }
+    });
 
-    #[test]
-    fn empty_main_body() {
+    test!(empty_main_body {
         test_codegen_mainfunc("", 0);
-    }
+    });
 
-    #[test]
-    fn null_statement() {
+    test!(null_statement {
         test_codegen_mainfunc(";", 0);
-    }
+    });
 
-    #[test]
-    fn null_then_return() {
+    test!(null_then_return {
         test_codegen_mainfunc("; return 1;", 1);
-    }
+    });
 
-    #[test]
-    fn empty_expression() {
+    test!(empty_expression {
         test_codegen_mainfunc("return 0;;;", 0);
-    }
+    });
 
-    #[test]
-    fn unused_expression() {
+    test!(unused_expression {
         test_codegen_mainfunc("2 + 2; return 0;", 0);
-    }
+    });
 
-    #[test]
-    fn bitwise_in_initializer() {
+    test!(bitwise_in_initializer {
         test_codegen_mainfunc(
             r"
     int a = 15;
@@ -5193,87 +5082,73 @@ mod test {
     return 1 | b;   // 11",
             11,
         );
-    }
+    });
 
-    #[test]
-    fn bitwise_ops_vars() {
+    test!(bitwise_ops_vars {
         test_codegen_mainfunc("int a = 3; int b = 5; int c = 8; return a & b | c;", 9);
-    }
+    });
 
-    #[test]
-    fn bitwise_shl_var() {
+    test!(bitwise_shl_var {
         test_codegen_mainfunc("int x = 3; return x << 3;", 24);
-    }
+    });
 
-    #[test]
-    fn bitwise_sar_assign() {
+    test!(bitwise_sar_assign {
         test_codegen_mainfunc(
             "int var_to_shift = 1234; int x = 0; x = var_to_shift >> 4; return x;",
             77,
         );
-    }
+    });
 
-    #[test]
-    fn compound_bitwise_and() {
+    test!(compound_bitwise_and {
         test_codegen_mainfunc("int to_and = 3; to_and &= 6; return to_and;", 2);
-    }
+    });
 
-    #[test]
-    fn compound_bitwise_or() {
+    test!(compound_bitwise_or {
         test_codegen_mainfunc("int to_or = 1; to_or |= 30; return to_or;", 31);
-    }
+    });
 
-    #[test]
-    fn compound_bitwise_shl() {
+    test!(compound_bitwise_shl {
         test_codegen_mainfunc("int to_shiftl = 3; to_shiftl <<= 4; return to_shiftl;", 48);
-    }
+    });
 
-    #[test]
-    fn compound_bitwise_sar() {
+    test!(compound_bitwise_sar {
         test_codegen_mainfunc(
             "int to_shiftr = 382574; to_shiftr >>= 4; return to_shiftr;",
             23910,
         );
-    }
+    });
 
-    #[test]
-    fn compound_bitwise_xor() {
+    test!(compound_bitwise_xor {
         test_codegen_mainfunc("int to_xor = 7; to_xor ^= 5; return to_xor;", 2);
-    }
+    });
 
-    #[test]
-    fn compound_div() {
+    test!(compound_div {
         test_codegen_mainfunc("int to_divide = 8; to_divide /= 4; return to_divide;", 2);
-    }
+    });
 
-    #[test]
-    fn compound_subtract() {
+    test!(compound_subtract {
         test_codegen_mainfunc(
             "int to_subtract = 10; to_subtract -= 8; return to_subtract;",
             2,
         );
-    }
+    });
 
-    #[test]
-    fn compound_mod() {
+    test!(compound_mod {
         test_codegen_mainfunc("int to_mod = 5; to_mod %= 3; return to_mod;", 2);
-    }
+    });
 
-    #[test]
-    fn compound_mult() {
+    test!(compound_mult {
         test_codegen_mainfunc(
             "int to_multiply = 4; to_multiply *= 3; return to_multiply;",
             12,
         );
-    }
+    });
 
-    #[test]
-    fn compound_add() {
+    test!(compound_add {
         test_codegen_mainfunc("int to_add = 0; to_add += 4; return to_add;", 4);
-    }
+    });
 
-    #[test]
-    fn compound_assignment_chained() {
+    test!(compound_assignment_chained {
         test_codegen_mainfunc(
             r"
     int a = 250;
@@ -5289,10 +5164,9 @@ mod test {
            ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn compound_bitwise_assignment_chained() {
+    test!(compound_bitwise_assignment_chained {
         test_codegen_mainfunc(
             r"
     int a = 250;
@@ -5311,10 +5185,9 @@ mod test {
            ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn compound_assignment_lowest_precedence() {
+    test!(compound_assignment_lowest_precedence {
         test_codegen_mainfunc(
             r"
     int a = 10;
@@ -5331,10 +5204,9 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn compound_bitwise_assignment_lowest_precedence() {
+    test!(compound_bitwise_assignment_lowest_precedence {
         test_codegen_mainfunc(
             r"
     int a = 11;
@@ -5354,18 +5226,16 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn increment_decrement_expressions() {
+    test!(increment_decrement_expressions {
         test_codegen_mainfunc(
             "int a = 0; int b = 0; a++; ++a; b--; --b; return (a == 2 && b == -2);",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn incr_decr_in_binary_expressions() {
+    test!(incr_decr_in_binary_expressions {
         test_codegen_mainfunc(
             r"
     int a = 2;
@@ -5375,10 +5245,9 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn incr_decr_parentheses() {
+    test!(incr_decr_parentheses {
         test_codegen_mainfunc(
             r"
     int a = 1;
@@ -5389,33 +5258,28 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn if_assign() {
+    test!(if_assign {
         test_codegen_mainfunc("int x = 5; if (x == 5) x = 4; return x;", 4);
-    }
+    });
 
-    #[test]
-    fn if_else_assign() {
+    test!(if_else_assign {
         test_codegen_mainfunc(
             "int x = 5; if (x == 5) x = 4; else x == 6; if (x == 6) x = 7; else x = 8; return x;",
             8,
         );
-    }
+    });
 
-    #[test]
-    fn if_binary_op_in_condition_true() {
+    test!(if_binary_op_in_condition_true {
         test_codegen_mainfunc("if (1 + 2 == 3) return 5;", 5);
-    }
+    });
 
-    #[test]
-    fn if_binary_op_in_condition_false() {
+    test!(if_binary_op_in_condition_false {
         test_codegen_mainfunc("if (1 + 2 == 4) return 5;", 0);
-    }
+    });
 
-    #[test]
-    fn if_else_if() {
+    test!(if_else_if {
         test_codegen_mainfunc(
             r"
     int a = 1;
@@ -5428,10 +5292,9 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn if_else_if_nested_execute_else() {
+    test!(if_else_if_nested_execute_else {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -5444,10 +5307,9 @@ mod test {
     ",
             2,
         );
-    }
+    });
 
-    #[test]
-    fn if_nested_twice() {
+    test!(if_nested_twice {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -5460,10 +5322,9 @@ mod test {
     ",
             3,
         );
-    }
+    });
 
-    #[test]
-    fn if_nested_twice_execute_else() {
+    test!(if_nested_twice_execute_else {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -5476,10 +5337,9 @@ mod test {
     ",
             4,
         );
-    }
+    });
 
-    #[test]
-    fn nested_else_execute_outer_else() {
+    test!(nested_else_execute_outer_else {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -5494,10 +5354,9 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn if_null_body() {
+    test!(if_null_body {
         test_codegen_mainfunc(
             r"
     int x = 0;
@@ -5509,10 +5368,9 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn multiple_if_else() {
+    test!(multiple_if_else {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -5532,15 +5390,13 @@ mod test {
     ",
             8,
         );
-    }
+    });
 
-    #[test]
-    fn if_compound_assignment_in_condition() {
+    test!(if_compound_assignment_in_condition {
         test_codegen_mainfunc("int a = 0; if (a += 1) return a; return 10;", 1);
-    }
+    });
 
-    #[test]
-    fn if_postfix_in_condition() {
+    test!(if_postfix_in_condition {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -5552,10 +5408,9 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn if_prefix_in_condition() {
+    test!(if_prefix_in_condition {
         test_codegen_mainfunc(
             r"
     int a = -1;
@@ -5567,30 +5422,25 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn assign_ternary() {
+    test!(assign_ternary {
         test_codegen_mainfunc("int a = 0; a = 1 ? 2 : 3; return a;", 2);
-    }
+    });
 
-    #[test]
-    fn ternary_binary_op_in_middle() {
+    test!(ternary_binary_op_in_middle {
         test_codegen_mainfunc("int a = 1 ? 3 % 2 : 4; return a;", 1);
-    }
+    });
 
-    #[test]
-    fn ternary_logical_or_precedence() {
+    test!(ternary_logical_or_precedence {
         test_codegen_mainfunc("int a = 10; return a || 0 ? 20 : 0;", 20);
-    }
+    });
 
-    #[test]
-    fn ternary_logical_or_precedence_right() {
+    test!(ternary_logical_or_precedence_right {
         test_codegen_mainfunc("return 0 ? 1 : 0 || 2;", 1);
-    }
+    });
 
-    #[test]
-    fn ternary_in_assignment() {
+    test!(ternary_in_assignment {
         test_codegen_mainfunc(
             r"
     int x = 0;
@@ -5600,10 +5450,9 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn nested_ternary() {
+    test!(nested_ternary {
         test_codegen_mainfunc(
             r"
     int a = 1;
@@ -5613,10 +5462,9 @@ mod test {
     ",
             7,
         );
-    }
+    });
 
-    #[test]
-    fn nested_ternary_literals() {
+    test!(nested_ternary_literals {
         test_codegen_mainfunc(
             r"
     int a = 1 ? 2 ? 3 : 4 : 5;
@@ -5625,10 +5473,9 @@ mod test {
     ",
             15,
         );
-    }
+    });
 
-    #[test]
-    fn ternary_assignment_rhs() {
+    test!(ternary_assignment_rhs {
         test_codegen_mainfunc(
             r"
     int flag = 1;
@@ -5638,13 +5485,12 @@ mod test {
     ",
             1,
         );
-    }
+    });
 
     mod goto {
         use super::*;
 
-        #[test]
-        fn skip_declaration() {
+        test!(skip_declaration {
             test_codegen_mainfunc(
                 r"
     int x = 1;
@@ -5659,10 +5505,9 @@ mod test {
             ",
                 1,
             );
-        }
+        });
 
-        #[test]
-        fn same_as_var_name() {
+        test!(same_as_var_name {
             test_codegen_mainfunc(
                 r"
     // it's valid to use the same identifier as a variable and label
@@ -5674,10 +5519,9 @@ ident:
             ",
                 5,
             );
-        }
+        });
 
-        #[test]
-        fn same_as_func_name() {
+        test!(same_as_func_name {
             test_codegen_mainfunc(
                 r"
     // it's legal to use main as both a function name and label
@@ -5688,10 +5532,9 @@ main:
             ",
                 0,
             );
-        }
+        });
 
-        #[test]
-        fn nested_label() {
+        test!(nested_label {
             test_codegen_mainfunc(
                 r"
     goto labelB;
@@ -5703,10 +5546,9 @@ main:
             ",
                 5,
             );
-        }
+        });
 
-        #[test]
-        fn label_all_statements() {
+        test!(label_all_statements {
             test_codegen_mainfunc(
                 r"
     int a = 1;
@@ -5734,10 +5576,9 @@ label_empty:;
             ",
                 100,
             );
-        }
+        });
 
-        #[test]
-        fn label_name() {
+        test!(label_name {
             test_codegen_mainfunc(
                 r"
     goto _foo_1_;  // a label may include numbers and underscores
@@ -5747,10 +5588,9 @@ _foo_1_:
             ",
                 1,
             );
-        }
+        });
 
-        #[test]
-        fn unused_label() {
+        test!(unused_label {
             test_codegen_mainfunc(
                 r"
 unused:
@@ -5758,10 +5598,9 @@ unused:
             ",
                 0,
             );
-        }
+        });
 
-        #[test]
-        fn whitespace_after_label() {
+        test!(whitespace_after_label {
             test_codegen_mainfunc(
                 r"
     goto label2;
@@ -5775,10 +5614,9 @@ unused:
             ",
                 1,
             );
-        }
+        });
 
-        #[test]
-        fn goto_after_declaration() {
+        test!(goto_after_declaration {
             test_codegen_mainfunc(
                 r"
     int a = 0;
@@ -5792,10 +5630,9 @@ unused:
             ",
                 0,
             );
-        }
+        });
 
-        #[test]
-        fn goto_inner_scope() {
+        test!(goto_inner_scope {
             test_codegen_mainfunc(
                 r"
     int x = 5;
@@ -5809,10 +5646,9 @@ unused:
             ",
                 1,
             );
-        }
+        });
 
-        #[test]
-        fn goto_outer_scope() {
+        test!(goto_outer_scope {
             test_codegen_mainfunc(
                 r"
     int a = 10;
@@ -5828,10 +5664,9 @@ end:
             ",
                 1,
             );
-        }
+        });
 
-        #[test]
-        fn jump_between_sibling_scopes() {
+        test!(jump_between_sibling_scopes {
             test_codegen_mainfunc(
                 r"
     int sum = 0;
@@ -5855,23 +5690,20 @@ end:
             ",
                 11,
             );
-        }
+        });
 
         mod fail {
             use super::*;
 
-            #[test]
-            fn label_name() {
+            test!(label_name {
                 test_codegen_mainfunc_failure(r"0invalid_label: return 0;");
-            }
+            });
 
-            #[test]
-            fn label_keyword_name() {
+            test!(label_keyword_name {
                 test_codegen_mainfunc_failure(r"return: return 0;");
-            }
+            });
 
-            #[test]
-            fn whitespace_after_label() {
+            test!(whitespace_after_label {
                 test_codegen_mainfunc_failure(
                     r"
     goto;
@@ -5879,10 +5711,9 @@ lbl:
     return 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn label_declaration() {
+            test!(label_declaration {
                 test_codegen_mainfunc_failure(
                     r"
 // NOTE: this is a syntax error in C17 but valid in C23
@@ -5890,20 +5721,18 @@ label:
     int a = 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn label_without_statement() {
+            test!(label_without_statement {
                 test_codegen_mainfunc_failure(
                     r"
     // NOTE: this is invalid in C17, but valid in C23
     foo:
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn parenthesized_label() {
+            test!(parenthesized_label {
                 test_codegen_mainfunc_failure(
                     r"
     goto(a);
@@ -5911,10 +5740,9 @@ a:
     return 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn duplicate_label() {
+            test!(duplicate_label {
                 test_codegen_mainfunc_failure(
                     r"
     int x = 0;
@@ -5924,20 +5752,18 @@ label:
     return 2;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn unknown_label() {
+            test!(unknown_label {
                 test_codegen_mainfunc_failure(
                     r"
     goto label;
     return 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn variable_as_label() {
+            test!(variable_as_label {
                 test_codegen_mainfunc_failure(
                     r"
     int a;
@@ -5945,10 +5771,9 @@ label:
     return 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn undeclared_var_in_labeled_statement() {
+            test!(undeclared_var_in_labeled_statement {
                 test_codegen_mainfunc_failure(
                     r"
 lbl:
@@ -5956,10 +5781,9 @@ lbl:
     return 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn label_as_variable() {
+            test!(label_as_variable {
                 test_codegen_mainfunc_failure(
                     r"
     int x = 0;
@@ -5968,15 +5792,13 @@ lbl:
     return 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn label_in_expression() {
+            test!(label_in_expression {
                 test_codegen_mainfunc_failure(r"1 && label: 2;");
-            }
+            });
 
-            #[test]
-            fn label_outside_function() {
+            test!(label_outside_function {
                 codegen_run_and_expect_compile_failure(
                     r"
 label:
@@ -5985,11 +5807,10 @@ int main(void) {
 }
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn different_label_same_scope() {
-                codegen_run_and_expect_compile_failure(
+            test!(different_label_same_scope {
+                test_codegen_mainfunc_failure(
                     r"
     // different labels do not define different scopes
 label1:;
@@ -5999,11 +5820,10 @@ label2:;
     return 1;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn duplicate_labels_different_scopes() {
-                codegen_run_and_expect_compile_failure(
+            test!(duplicate_labels_different_scopes {
+                test_codegen_mainfunc_failure(
                     r"
     int x = 0;
     if (x) {
@@ -6020,11 +5840,10 @@ label2:;
     }
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn goto_use_before_declare() {
-                codegen_run_and_expect_compile_failure(
+            test!(goto_use_before_declare {
+                test_codegen_mainfunc_failure(
                     r"
     int x = 0;
     if (x != 0) {
@@ -6035,23 +5854,21 @@ label2:;
     goto return_y;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn labeled_break_outside_loop() {
-                codegen_run_and_expect_compile_failure(
+            test!(labeled_break_outside_loop {
+                test_codegen_mainfunc_failure(
                     r"
     // make sure our usual analysis of break/continue labels also traverses labeled statements
     label: break;
     return 0;
                 ",
                 );
-            }
+            });
         }
     }
 
-    #[test]
-    fn var_assign_to_self() {
+    test!(var_assign_to_self {
         test_codegen_mainfunc(
             r"
     int a = 3;
@@ -6062,10 +5879,9 @@ label2:;
         ",
             4,
         );
-    }
+    });
 
-    #[test]
-    fn var_assign_to_self_inner_block() {
+    test!(var_assign_to_self_inner_block {
         test_codegen_mainfunc(
             r"
     int a = 3;
@@ -6076,10 +5892,9 @@ label2:;
         ",
             3,
         );
-    }
+    });
 
-    #[test]
-    fn var_assign_to_self_from_other_var_declaration_in_inner_block() {
+    test!(var_assign_to_self_from_other_var_declaration_in_inner_block {
         test_codegen_mainfunc(
             r"
     int a;
@@ -6090,10 +5905,9 @@ label2:;
         ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn empty_blocks() {
+    test!(empty_blocks {
         test_codegen_mainfunc(
             r"
     int ten = 10;
@@ -6104,10 +5918,9 @@ label2:;
         ",
             30,
         );
-    }
+    });
 
-    #[test]
-    fn var_hidden_then_visible() {
+    test!(var_hidden_then_visible {
         test_codegen_mainfunc(
             r"
     int a = 2;
@@ -6121,10 +5934,9 @@ label2:;
         ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn var_shadowed() {
+    test!(var_shadowed {
         test_codegen_mainfunc(
             r"
     int a = 2;
@@ -6135,10 +5947,9 @@ label2:;
         ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn var_inner_uninitialized() {
+    test!(var_inner_uninitialized {
         test_codegen_mainfunc(
             r"
     int x = 4;
@@ -6149,10 +5960,9 @@ label2:;
         ",
             4,
         );
-    }
+    });
 
-    #[test]
-    fn var_same_name_different_blocks() {
+    test!(var_same_name_different_blocks {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -6168,10 +5978,9 @@ label2:;
         ",
             2,
         );
-    }
+    });
 
-    #[test]
-    fn nested_if_compound_statements() {
+    test!(nested_if_compound_statements {
         test_codegen_mainfunc(
             r"
     int a = 0;
@@ -6190,10 +5999,9 @@ label2:;
         ",
             1,
         );
-    }
+    });
 
-    #[test]
-    fn nested_var_declarations() {
+    test!(nested_var_declarations {
         test_codegen_mainfunc(
             r"
     int a; // a0
@@ -6241,7 +6049,7 @@ label2:;
         ",
             28,
         );
-    }
+    });
 
     mod loops {
         use super::*;
@@ -6249,8 +6057,7 @@ label2:;
         mod for_loop {
             use super::*;
 
-            #[test]
-            fn empty_header() {
+            test!(empty_header {
                 test_codegen_mainfunc(
                     r"
         int a = 0;
@@ -6264,10 +6071,9 @@ label2:;
                 ",
                     4,
                 );
-            }
+            });
 
-            #[test]
-            fn break_statement() {
+            test!(break_statement {
                 test_codegen_mainfunc(
                     r"
         int a = 10;
@@ -6282,10 +6088,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn continue_statement() {
+            test!(continue_statement {
                 test_codegen_mainfunc(
                     r"
         int sum = 0;
@@ -6301,10 +6106,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn declaration() {
+            test!(declaration {
                 test_codegen_mainfunc(
                     r"
         int a = 0;
@@ -6315,10 +6119,9 @@ label2:;
                 ",
                     101,
                 );
-            }
+            });
 
-            #[test]
-            fn shadow_declaration() {
+            test!(shadow_declaration {
                 test_codegen_mainfunc(
                     r"
         int shadow = 1;
@@ -6330,10 +6133,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn nested_shadowed_declarations() {
+            test!(nested_shadowed_declarations {
                 test_codegen_mainfunc(
                     r"
         int i = 0;
@@ -6349,10 +6151,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn no_post_expression() {
+            test!(no_post_expression {
                 test_codegen_mainfunc(
                     r"
         int a = -2147483647;
@@ -6363,10 +6164,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn continue_with_no_post_expression() {
+            test!(continue_with_no_post_expression {
                 test_codegen_mainfunc(
                     r"
         int sum = 0;
@@ -6380,10 +6180,9 @@ label2:;
                 ",
                     30,
                 );
-            }
+            });
 
-            #[test]
-            fn no_condition() {
+            test!(no_condition {
                 test_codegen_mainfunc(
                     r"
         for (int i = 400; ; i = i - 100)
@@ -6392,10 +6191,9 @@ label2:;
                 ",
                     0,
                 );
-            }
+            });
 
-            #[test]
-            fn nested_break() {
+            test!(nested_break {
                 test_codegen_mainfunc(
                     r"
         int ans = 0;
@@ -6409,10 +6207,9 @@ label2:;
                 ",
                     250,
                 );
-            }
+            });
 
-            #[test]
-            fn compound_assignent_in_post_expression() {
+            test!(compound_assignent_in_post_expression {
                 test_codegen_mainfunc(
                     r"
         int i = 1;
@@ -6422,10 +6219,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn jump_past_initializer() {
+            test!(jump_past_initializer {
                 test_codegen_mainfunc(
                     r"
         int i = 0;
@@ -6438,10 +6234,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn jump_within_body() {
+            test!(jump_within_body {
                 test_codegen_mainfunc(
                     r"
         int sum = 0;
@@ -6457,68 +6252,62 @@ label2:;
                 ",
                     11,
                 );
-            }
+            });
 
             mod fail {
                 use super::*;
 
-                #[test]
-                fn extra_header_clause() {
-                    codegen_run_and_expect_compile_failure(
+                test!(extra_header_clause {
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 0; i < 10; i = i + 1; )
             ;
         return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn missing_header_clause() {
-                    codegen_run_and_expect_compile_failure(
+                test!(missing_header_clause {
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 0;)
             ;
         return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn extra_parens() {
-                    codegen_run_and_expect_compile_failure(
+                test!(extra_parens {
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 2; ))
             int a = 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn invalid_declaration_compound_assignment() {
-                    codegen_run_and_expect_compile_failure(
+                test!(invalid_declaration_compound_assignment {
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i += 1; i < 10; i += 1) {
             return 0;
         }
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn declaration_in_condition() {
-                    codegen_run_and_expect_compile_failure(
+                test!(declaration_in_condition {
+                    test_codegen_mainfunc_failure(
                         r"
         for (; int i = 0; i = i + 1)
             ;
         return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn label_in_header() {
-                    codegen_run_and_expect_compile_failure(
+                test!(label_in_header {
+                    test_codegen_mainfunc_failure(
                         r"
         for (int i = 0; label: i < 10; i = i + 1) {
             ;
@@ -6526,11 +6315,10 @@ label2:;
         return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn undeclared_variable() {
-                    codegen_run_and_expect_compile_failure(
+                test!(undeclared_variable {
+                    test_codegen_mainfunc_failure(
                         r"
         for (i = 0; i < 1; i = i + 1)
         {
@@ -6538,26 +6326,24 @@ label2:;
         }
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn reference_body_variable_in_condition() {
-                    codegen_run_and_expect_compile_failure(
+                test!(reference_body_variable_in_condition {
+                    test_codegen_mainfunc_failure(
                         r"
         for (;; i++) {
             int i = 0;
         }
                     ",
                     );
-                }
+                });
             }
         }
 
         mod while_loop {
             use super::*;
 
-            #[test]
-            fn break_immediate() {
+            test!(break_immediate {
                 test_codegen_mainfunc(
                     r"
         int a = 10;
@@ -6567,10 +6353,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn multi_break() {
+            test!(multi_break {
                 test_codegen_mainfunc(
                     r"
         int i = 0;
@@ -6590,10 +6375,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn nested_continue() {
+            test!(nested_continue {
                 test_codegen_mainfunc(
                     r"
         int x = 5;
@@ -6612,10 +6396,9 @@ label2:;
                 ",
                     24,
                 );
-            }
+            });
 
-            #[test]
-            fn nested_loops() {
+            test!(nested_loops {
                 test_codegen_mainfunc(
                     r"
         int acc = 0;
@@ -6632,10 +6415,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn labeled_body() {
+            test!(labeled_body {
                 test_codegen_mainfunc(
                     r"
     int result = 0;
@@ -6647,10 +6429,9 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
-            #[test]
-            fn condition_postfix() {
+            test!(condition_postfix {
                 test_codegen_mainfunc(
                     r"
     int i = 100;
@@ -6667,51 +6448,47 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
             mod fail {
                 use super::*;
 
-                #[test]
-                fn declaration_in_body() {
-                    codegen_run_and_expect_compile_failure(
+                test!(declaration_in_body {
+                    test_codegen_mainfunc_failure(
                         r"
     while (1)
         int i = 0;
     return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn declaration_in_condition() {
-                    codegen_run_and_expect_compile_failure(
+                test!(declaration_in_condition {
+                    test_codegen_mainfunc_failure(
                         r"
     while(int a) {
         2;
     }
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn missing_parentheses() {
-                    codegen_run_and_expect_compile_failure(
+                test!(missing_parentheses {
+                    test_codegen_mainfunc_failure(
                         r"
     while 1 {
         return 0;
     }
                     ",
                     );
-                }
+                });
             }
         }
 
         mod do_while_loop {
             use super::*;
 
-            #[test]
-            fn simple() {
+            test!(simple {
                 test_codegen_mainfunc(
                     r"
     int a = 1;
@@ -6723,10 +6500,9 @@ label2:;
                 ",
                     16,
                 );
-            }
+            });
 
-            #[test]
-            fn break_immediate() {
+            test!(break_immediate {
                 test_codegen_mainfunc(
                     r"
     int a = 10;
@@ -6737,23 +6513,21 @@ label2:;
                 ",
                     10,
                 );
-            }
+            });
 
-            #[test]
-            fn no_body() {
+            test!(no_body {
                 test_codegen_mainfunc(
                     r"
-    int i = 2147483642;
+    int i = 502;
     do ; while ((i = i - 5) >= 256);
 
     return i;
                 ",
                     252,
                 );
-            }
+            });
 
-            #[test]
-            fn multi_continue_same_loop() {
+            test!(multi_continue_same_loop {
                 test_codegen_mainfunc(
                     r"
     int x = 10;
@@ -6772,14 +6546,13 @@ label2:;
                 ",
                     1,
                 );
-            }
+            });
 
             mod fail {
                 use super::*;
 
-                #[test]
-                fn semicolon_after_body() {
-                    codegen_run_and_expect_compile_failure(
+                test!(semicolon_after_body {
+                    test_codegen_mainfunc_failure(
                         r"
     do {
         int a;
@@ -6787,11 +6560,10 @@ label2:;
     return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn missing_final_semicolon() {
-                    codegen_run_and_expect_compile_failure(
+                test!(missing_final_semicolon {
+                    test_codegen_mainfunc_failure(
                         r"
     do {
         4;
@@ -6799,11 +6571,10 @@ label2:;
     return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn empty_condition() {
-                    codegen_run_and_expect_compile_failure(
+                test!(empty_condition {
+                    test_codegen_mainfunc_failure(
                         r"
     do
         1;
@@ -6811,23 +6582,21 @@ label2:;
     return 0;
                     ",
                     );
-                }
+                });
 
-                #[test]
-                fn variable_in_body_not_in_scope_for_condition() {
-                    codegen_run_and_expect_compile_failure(
+                test!(variable_in_body_not_in_scope_for_condition {
+                    test_codegen_mainfunc_failure(
                         r"
     do {
         int a = a + 1;
     } while (a < 100);
                     ",
                     );
-                }
+                });
             }
         }
 
-        #[test]
-        fn labeled_loops() {
+        test!(labeled_loops {
             test_codegen_mainfunc(
                 r"
     int sum = 0;
@@ -6864,14 +6633,13 @@ for_label:
             ",
                 12,
             );
-        }
+        });
 
         mod fail {
             use super::*;
 
-            #[test]
-            fn label_is_not_block() {
-                codegen_run_and_expect_compile_failure(
+            test!(label_is_not_block {
+                test_codegen_mainfunc_failure(
                     r"
     int a = 0;
     int b = 0;
@@ -6886,11 +6654,10 @@ for_label:
     return 0;
                 ",
                 );
-            }
+            });
 
-            #[test]
-            fn duplicate_label_in_body() {
-                codegen_run_and_expect_compile_failure(
+            test!(duplicate_label_in_body {
+                test_codegen_mainfunc_failure(
                     r"
     do {
         // make sure our label-validation analysis also traverses loop bodies
@@ -6902,7 +6669,7 @@ for_label:
     return 0;
                 ",
                 );
-            }
+            });
         }
     }
 
@@ -7042,7 +6809,7 @@ int main() {
     #[test]
     #[ignore]
     fn parameter_redefinition() {
-        codegen_run_and_expect_compile_failure(
+        test_codegen_mainfunc_failure(
             r"int blah(int x)
 {
     int x;
@@ -7054,7 +6821,7 @@ int main() {
 }",
         );
 
-        codegen_run_and_expect_compile_failure(
+        test_codegen_mainfunc_failure(
             r"int blah(int x)
 {
     {
