@@ -1,10 +1,7 @@
 use {
     crate::*,
-    rand::distributions::Alphanumeric,
-    rand::{thread_rng, Rng},
-    tracing::{debug, info, instrument},
     tracing_subscriber,
-    tracing_subscriber::{prelude::*, util::SubscriberInitExt, EnvFilter, Registry},
+    tracing_subscriber::{util::SubscriberInitExt, EnvFilter, Registry},
 };
 
 #[cfg(test)]
@@ -110,7 +107,7 @@ mod test {
             verbose: true,
         };
 
-        let compile_result = compile_and_link(&args, input, true);
+        let compile_result = compile_and_link(&args, input, true, expected_result.is_some());
         if compile_result.is_ok() {
             let exe_path_abs = Path::new(args.output_path.as_ref().unwrap())
                 .canonicalize()
@@ -142,7 +139,7 @@ mod test {
 
     fn validate_error_count(input: &str, expected_error_count: usize) {
         match parse_and_validate(Mode::All, input) {
-            Ok(ast) => {
+            Ok(_ast) => {
                 // If parsing succeeded, then the caller should have expected 0 errors.
                 assert_eq!(expected_error_count, 0);
             }
@@ -2473,6 +2470,738 @@ for_label:
     lbl:
         return 2;
     } while (1);
+    return 0;
+                ",
+                );
+            });
+        }
+    }
+
+    mod switch {
+        use super::*;
+
+        test!(simple {
+            test_codegen_mainfunc(
+                r"
+    switch(3) {
+        case 0: return 0;
+        case 1: return 1;
+        case 3: return 3;
+        case 5: return 5;
+    }
+            ",
+                3,
+            );
+        });
+
+        test!(simple_with_breaks {
+            test_codegen_mainfunc(
+                r"
+    int a = 5;
+    switch (a) {
+        case 5:
+            a = 10;
+            break;
+        case 6:
+            a = 0;
+            break;
+    }
+    return a;
+            ",
+                10,
+            );
+        });
+
+        test!(simple_with_default {
+            test_codegen_mainfunc(
+                r"
+    int a = 0;
+    switch(a) {
+        case 1:
+            return 1;
+        case 2:
+            return 9;
+        case 4:
+            a = 11;
+            break;
+        default:
+            a = 22;
+    }
+    return a;
+            ",
+                22,
+            );
+        });
+
+        test!(case_expressions {
+            test_codegen_mainfunc(
+                r"
+    int acc = 0;
+    for (int i = 0; i <= 6; i++) {
+        switch(i) {
+            case 0 || 0: acc++; break;
+            case 1 && 1: acc++; break;
+            case (3 < 5) * 2: acc++; break;
+            case (3 << 1) >> 1: acc++; break;
+            case (4 > 1) * 400 / 100: acc++; break;
+            case ~~(5 ^ 5 ^ 5): acc++; break;
+            case -(-6): acc++; break;
+        }
+    }
+    return acc;
+            ",
+                7,
+            );
+        });
+
+        test!(default_fallthrough_out_of_order {
+            test_codegen_mainfunc(
+                r"
+// test that we can fall through from default to other cases
+// if default isn't last
+    int a = 5;
+    switch(0) {
+        default:
+            a = 0;
+        case 1:
+            return a;
+    }
+    return a + 1;
+            ",
+                0,
+            );
+        });
+
+        test!(only_default {
+            test_codegen_mainfunc(
+                r"
+    int a = 1;
+    switch(a) default: return 1;
+    return 0;
+            ",
+                1,
+            );
+        });
+
+        test!(single_case {
+            test_codegen_mainfunc(
+                r"
+    int a = 1;
+    // a switch statement body may be a single case
+    switch(a) case 1: return 1;
+    return 0;
+            ",
+                1,
+            );
+        });
+
+        test!(execute_condition_empty_body {
+            test_codegen_mainfunc(
+                r"
+    int x = 10;
+    // two versions of empty switch statements;
+    // in both , we execute the controlling expression even though there's
+    // nothing to execute in the body
+    switch(x = x + 1) {
+
+    }
+    switch(x = x + 1)
+    ;
+    return x;
+            ",
+                12,
+            );
+        });
+
+        test!(skip_body_no_cases {
+            test_codegen_mainfunc(
+                r"
+    // if a switch statement body contains no case statements,
+    // nothing in it will be executed
+    int a = 4;
+    switch(a)
+        return 0;
+    return a;
+            ",
+                4,
+            );
+        });
+
+        test!(fallthrough {
+            test_codegen_mainfunc(
+                r"
+    int a = 4;
+    int b = 9;
+    int c = 0;
+    switch (a ? b : 7) {
+        case 0:
+            return 5;
+        case 7:
+            c = 1;
+        case 9:
+            c = 2;
+        case 1:
+            c = c + 4;
+    }
+    return c;
+            ",
+                6,
+            );
+        });
+
+        test!(goto_middle_of_case {
+            test_codegen_mainfunc(
+                r"
+    int a = 0;
+    // a goto statement can jump to any point in a switch statement, including the middle of a case
+    goto mid_case;
+    switch (4) {
+        case 4:
+            a = 5;
+        mid_case:
+            a = a + 1;
+            return a;
+    }
+    return 100;
+            ",
+                1,
+            );
+        });
+
+        test!(assign_in_condition {
+            test_codegen_mainfunc(
+                r"
+    int a = 0;
+    switch (a = 1) {
+        case 0:
+            return 10;
+        case 1:
+            a = a * 2;
+            break;
+        default:
+            a = 99;
+    }
+    return a;
+            ",
+                2,
+            );
+        });
+
+        test!(loop_break_in_switch {
+            test_codegen_mainfunc(
+                r"
+    int cond = 10;
+    switch (cond) {
+        case 1:
+            return 0;
+        case 10:
+            for (int i = 0; i < 5; i = i + 1) {
+                cond = cond - 1;
+                if (cond == 8)
+                    // make sure this breaks out of loop,
+                    // not switch
+                    break;
+            }
+            return 123;
+        default:
+            return 2;
+    }
+    return 3;
+            ",
+                123,
+            );
+        });
+
+        test!(switch_break_in_loop {
+            test_codegen_mainfunc(
+                r"
+    int acc = 0;
+    int ctr = 0;
+    for (int i = 0; i < 10; i = i + 1)  {
+        // make sure break statements here break out of switch but not loop
+        switch(i) {
+            case 0:
+                acc = 2;
+                break;
+            case 1:
+                acc = acc * 3;
+                break;
+            case 2:
+                acc = acc * 4;
+                break;
+            default:
+                acc = acc + 1;
+        }
+        ctr = ctr + 1;
+    }
+
+    return ctr == 10 && acc == 31;
+            ",
+                1,
+            );
+        });
+
+        test!(loop_in_switch_continue {
+            test_codegen_mainfunc(
+                r"
+    switch(4) {
+        case 0:
+            return 0;
+        case 4: {
+            int acc = 0;
+            // make sure we can use continue inside a loop
+            // inside a switch
+            for (int i = 0; i < 10; i = i + 1) {
+                if (i % 2)
+                    continue;
+                acc = acc + 1;
+            }
+            return acc;
+        }
+    }
+    return 0;
+            ",
+                5,
+            );
+        });
+
+        test!(switch_in_loop_continue {
+            test_codegen_mainfunc(
+                r"
+    int sum = 0;
+    for (int i = 0; i < 10; i = i + 1) {
+        switch(i % 2) {
+            // make sure continue in switch in loop is permitted
+            case 0: continue;
+            default: sum = sum + 1;
+        }
+    }
+    return sum;
+            ",
+                5,
+            );
+        });
+
+        test!(skip_initializer {
+            test_codegen_mainfunc(
+                r"
+    int a = 3;
+    int b = 0;
+    switch(a) {
+        // a is in scope but we skip its initializer
+        int a = (b = 5);
+    case 3:
+        a = 4;
+        b = b + a;
+    }
+
+    // make sure case was executed but initializer (b = 5) was not
+    return a == 3 && b == 4;
+            ",
+                1,
+            );
+        });
+
+        test!(nested_cases {
+            test_codegen_mainfunc(
+                r"
+    int switch1 = 0;
+    int switch2 = 0;
+    int switch3 = 0;
+    switch(3) {
+        case 0: return 0;
+        case 1: if (0) {
+            case 3: switch1 = 1; break;
+        }
+        default: return 0;
+    }
+    switch(4) {
+        case 0: return 0;
+        if (1) {
+            return 0;
+        } else {
+            case 4: switch2 = 1; break;
+        }
+        default: return 0;
+    }
+    switch (5) {
+        for (int i = 0; i < 10; i = i + 1) {
+            switch1 = 0;
+            case 5: switch3 = 1; break;
+            default: return 0;
+        }
+    }
+
+    return (switch1 && switch2 && switch3);
+            ",
+                1,
+            );
+        });
+
+        test!(nested_switch {
+            test_codegen_mainfunc(
+                r"
+    int a = 0;
+    // outer switch will execute default, not nested 'case 0'
+    switch(a) {
+        case 1:
+            switch(a) {
+                case 0: return 0;
+                default: return 0;
+            }
+        default: a = 2;
+    }
+    return a;
+            ",
+                2,
+            );
+        });
+
+        test!(outer_and_inner {
+            test_codegen_mainfunc(
+                r"
+    // a switch statement cannot jump to cases in a nested switch statement;
+    // here we execute both outer and inner cases
+    switch(3) {
+        case 0:
+            return 1;
+        case 3: {
+            switch(4) {
+                case 3: return 2;
+                case 4: return 3;
+                default: return 4;
+            }
+        }
+        case 4: return 5;
+        default: return 6;
+    }
+            ",
+                3,
+            );
+        });
+
+        mod fail {
+            use super::*;
+
+            test!(case_declaration {
+                test_codegen_mainfunc_failure(
+                    r"
+    switch(3) {
+        case 3:
+            int i = 0;
+            return i;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(goto_case_label {
+                test_codegen_mainfunc_failure(
+                    r"
+    goto 3;
+    switch (3) {
+        case 3: return 0;
+    }
+                ",
+                );
+            });
+
+            test!(missing_condition_parentheses {
+                test_codegen_mainfunc_failure(
+                    r"
+    switch 3 {
+        case 3: return 0;
+    }
+                ",
+                );
+            });
+
+            test!(missing_condition {
+                test_codegen_mainfunc_failure(
+                    r"
+    switch {
+        return 0;
+    }
+                ",
+                );
+            });
+
+            test!(continue_in_case {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 3;
+    switch(a + 1) {
+        case 0:
+            // continue can only break out of loops, not switch statements
+            continue;
+        default: a = 1;
+    }
+    return a;
+                ",
+                );
+            });
+
+            test!(case_outside {
+                test_codegen_mainfunc_failure(
+                    r"
+    for (int i = 0; i < 10; i = i + 1) {
+        // case statements can only appear inside switch statements
+        case 0: return 1;
+    }
+    return 9;
+                ",
+                );
+            });
+
+            test!(default_continue {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 3;
+    switch(a + 1) {
+        case 0:
+            a = 1;
+        // make sure the pass that labels loops and checks for invalid
+        // break/continue statements traverses default statements
+        default: continue;
+    }
+    return a;
+                ",
+                );
+            });
+
+            test!(default_outside {
+                test_codegen_mainfunc_failure(
+                    r"
+    {
+        // case statements can only appear inside switch statements
+        default: return 0;
+    }
+                ",
+                );
+            });
+
+            test!(different_cases_same_scope {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 1;
+    switch (a) {
+        case 1:;
+            int b = 10;
+            break;
+
+        case 2:;
+            // invalid redefinition, because we're in the same scope
+            // as declaration of b above
+            int b = 11;
+            break;
+
+        default:
+            break;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(duplicate_case_constants {
+                test_codegen_mainfunc_failure(
+                    r"
+    switch(4) {
+        case 5: return 0;
+        case 4: return 1;
+        case 5: return 0; // duplicate of previous case 5
+        default: return 2;
+    }
+                ",
+                );
+            });
+
+            test!(duplicate_case_expressions {
+                test_codegen_mainfunc_failure(
+                    r"
+    switch(4) {
+        case 5: return 0;
+        case 4: return 1;
+        case ((4 * 100 - 395) << 1) >> 1: return 0; // duplicate of previous case 5
+        default: return 2;
+    }
+                ",
+                );
+            });
+
+            test!(duplicate_case_in_labeled_switch {
+                test_codegen_mainfunc_failure(
+                    r"
+    // make sure our validation of switch statements also traverses labeled
+    // statements
+    int a = 0;
+label:
+    switch (a) {
+        case 1:
+        case 1:
+            break;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(nested_duplicate_case {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 10;
+    switch (a) {
+        case 1: {
+            if(1) {
+                case 1: // duplicate of previous 'case 1'
+                return 0;
+            }
+        }
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(duplicate_default {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 0;
+    switch(a) {
+        case 0: return 0;
+        default: return 1;
+        case 2: return 2;
+        // can't have two default statements in same enclosing switch
+        default: return 2;
+    }
+                ",
+                );
+            });
+
+            test!(nested_duplicate_default {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 10;
+    switch (a) {
+        case 1:
+        for (int i = 0; i < 10; i = i + 1) {
+            continue;
+            while(1)
+            default:;
+        }
+        case 2:
+        return 0;
+        default:;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(duplicate_label_in_default {
+                test_codegen_mainfunc_failure(
+                    r"
+        int a = 1;
+label:
+
+    switch (a) {
+        case 1:
+            return 0;
+        default:
+        label:
+            return 1;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(duplicate_variable {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 1;
+    switch (a) {
+        // variable resolution must process this even though it's not reachable;
+        // it still declares the variable/brings it into scope
+        int b = 2;
+        case 0:
+            a = 3;
+            int b = 2;  // error - duplicate declaration
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(non_constant_case {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 3;
+    switch(a + 1) {
+        case 0: return 0;
+        case a: return 1; // case statement values must be constant
+        case 1: return 2;
+    }
+                ",
+                );
+            });
+
+            test!(undeclared_variable_in_case {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 10;
+    switch (a) {
+        case 1:
+            return b;
+            break;
+
+        default:
+            break;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(undeclared_variable_in_default {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 10;
+    switch (a) {
+        case 1:
+            break;
+
+        default:
+            return b;
+            break;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(undeclared_label_in_case {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 3;
+    switch (a) {
+        case 1: goto foo;
+        default: return 0;
+    }
+    return 0;
+                ",
+                );
+            });
+
+            test!(undeclared_label_in_default {
+                test_codegen_mainfunc_failure(
+                    r"
+    int a = 3;
+    switch (a) {
+        default: goto foo;
+        case 1: return 0;
+    }
     return 0;
                 ",
                 );

@@ -9,7 +9,13 @@ use {
     rand::{thread_rng, Rng},
     regex::Regex,
     std::{
-        cell::RefCell, collections::HashMap, fmt, fmt::Display, ops::Deref, path::*, process::*,
+        cell::RefCell,
+        collections::{HashMap, HashSet},
+        fmt,
+        fmt::Display,
+        ops::Deref,
+        path::*,
+        process::*,
     },
     tracing::{debug, info, instrument},
     tracing_subscriber,
@@ -150,6 +156,12 @@ impl<T: FmtNode + ?Sized> FmtNode for &T {
     }
 }
 
+impl<T: FmtNode + ?Sized> FmtNode for &mut T {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        (*(self as &T)).fmt_node(f, indent_levels)
+    }
+}
+
 // Because Rust doesn't allow a blanket implementation of fmt::Display for FmtNode, we can instead make a bare wrapper
 // to do it for us.
 struct DisplayFmtNode<T>(T);
@@ -206,9 +218,10 @@ impl<'i, 't> Tokens<'i, 't> {
             lazy_static! {
                 static ref IDENT_REGEX: Regex =
                     Regex::new(r"^[a-zA-Z_]\w*$").expect("failed to compile regex");
-                static ref KEYWORDS_REGEX: Regex =
-                    Regex::new(r"^(?:int|void|return|if|goto|for|break|continue)$")
-                        .expect("failed to compile regex");
+                static ref KEYWORDS_REGEX: Regex = Regex::new(
+                    r"^(?:int|void|return|if|goto|for|break|continue|switch|case|default)$"
+                )
+                .expect("failed to compile regex");
             }
 
             IDENT_REGEX.is_match(token) && !KEYWORDS_REGEX.is_match(token)
@@ -321,6 +334,13 @@ enum AstStatementType {
     ),
     Break(Option<AstLabel>),
     Continue(Option<AstLabel>),
+    Switch(
+        AstExpression,
+        Box<AstStatement>,
+        Option<AstLabel>,
+        Vec<SwitchCase>,
+    ),
+    SwitchCase(SwitchCase, Box<AstStatement>),
     Null,
 }
 
@@ -328,6 +348,12 @@ enum AstStatementType {
 enum AstForInit {
     Declaration(AstDeclaration),
     Expression(Option<AstExpression>),
+}
+
+#[derive(Clone, Debug)]
+struct SwitchCase {
+    expr_opt: Option<AstExpression>,
+    label_opt: Option<AstLabel>,
 }
 
 #[derive(Clone, Debug)]
@@ -409,6 +435,7 @@ enum TacInstruction {
     Jump(TacLabel),
     JumpIfZero(TacVal, TacLabel),
     JumpIfNotZero(TacVal, TacLabel),
+    JumpIfEqual(TacVal, TacVal, TacLabel),
     Label(TacLabel),
 }
 
@@ -546,6 +573,14 @@ struct BreakTracking {
 }
 
 #[derive(Debug)]
+struct SwitchTracking {
+    parent_opt: Option<Box<SwitchTracking>>,
+    is_default_case_found: bool,
+    case_values: HashSet<i32>,
+    cases: Vec<SwitchCase>,
+}
+
+#[derive(Debug)]
 struct FuncStackFrame {
     names: HashMap<String, i32>,
     max_base_offset: u32,
@@ -565,168 +600,30 @@ impl<'i> AstProgram<'i> {
 
     fn validate_and_resolve(&mut self) -> Result<(), Vec<String>> {
         self.global_tracking_opt = Some(GlobalTracking::new());
+        let global_tracking = self.global_tracking_opt.as_mut().unwrap();
 
         let mut errors = vec![];
         for func in self.functions.iter_mut() {
             let mut function_tracking = FunctionTracking::new();
-            let global_tracking = self.global_tracking_opt.as_mut().unwrap();
 
             func.validate_and_resolve_variables(global_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after validate_and_resolve");
 
-            push_error(
-                func.for_each_statement(|ast_statement| {
-                    for label in ast_statement.labels.iter_mut() {
-                        match function_tracking.add_goto_label(global_tracking, label) {
-                            Ok(new_label) => {
-                                *label = new_label;
-                            }
-                            Err(err) => {
-                                errors.push(err);
-                            }
-                        }
-                    }
-
-                    Ok(())
-                }),
+            func.validate_and_allocate_goto_labels(
+                global_tracking,
+                &mut function_tracking,
                 &mut errors,
             );
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after label checking");
 
-            push_error(
-                func.for_each_statement(|ast_statement| {
-                    if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
-                        match function_tracking.resolve_label(label) {
-                            Ok(new_label) => {
-                                *label = new_label;
-                            }
-                            Err(err) => {
-                                errors.push(err);
-                            }
-                        }
-                    }
+            func.rewrite_goto_labels(&function_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after goto resolution");
 
-                    Ok(())
-                }),
-                &mut errors,
-            );
+            func.label_loops_and_switches(global_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after loop labeling");
 
-            // Loop labeling: each loop has two labels associated with it: one that a break statement should jump to
-            // (after the end of the loop) and one that a continue statement should jump to (after the end of the body).
-            // Because of nesting, the current tracking data needs to store a reference to the containing tracking data,
-            // so when the loop is over, we can revert back to the parent.
-            //
-            // Because we are referencing break_tracking_opt in two closures, the borrow checker doesn't know that we
-            // are only referencing it one at a time, so store in a RefCell, to allow for borrowing it in both closures
-            // when needed.
-            let mut break_tracking_opt = RefCell::new(None);
-            push_error(
-                func.for_each_statement_and_after(
-                    |ast_statement| {
-                        match ast_statement.typ {
-                            AstStatementType::For(
-                                _,
-                                _,
-                                _,
-                                _,
-                                ref mut ast_body_end_label_opt,
-                                ref mut ast_loop_end_label_opt,
-                            )
-                            | AstStatementType::While(
-                                _,
-                                _,
-                                ref mut ast_body_end_label_opt,
-                                ref mut ast_loop_end_label_opt,
-                            )
-                            | AstStatementType::DoWhile(
-                                _,
-                                _,
-                                ref mut ast_body_end_label_opt,
-                                ref mut ast_loop_end_label_opt,
-                            ) => {
-                                assert!(ast_body_end_label_opt.is_none());
-                                assert!(ast_loop_end_label_opt.is_none());
-
-                                // Create new labels for this loop's body end and loop end, to be used in break and continue
-                                // statements.
-                                *ast_body_end_label_opt =
-                                    Some(AstLabel(global_tracking.allocate_label("loop_body_end")));
-                                *ast_loop_end_label_opt =
-                                    Some(AstLabel(global_tracking.allocate_label("loop_end")));
-
-                                // Store the pre-existing tracking info into the new tracking info, so we can revert to it
-                                // after this loop is done.
-                                let parent_opt = break_tracking_opt.borrow_mut().take();
-                                *break_tracking_opt.borrow_mut() =
-                                    Some(Box::new(BreakTracking::new(
-                                        parent_opt,
-                                        ast_loop_end_label_opt.as_ref().unwrap().clone(),
-                                        ast_body_end_label_opt.clone(),
-                                    )));
-                            }
-                            AstStatementType::Break(ref mut label_opt) => {
-                                assert!(label_opt.is_none());
-
-                                let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
-                                    errors.push(format!(
-                                        "break statement with no containing loop or switch"
-                                    ));
-                                    return Ok(());
-                                };
-
-                                // Write in the correct label to use for breaking in this scope.
-                                *label_opt = Some(break_tracking.break_label.clone());
-                            }
-                            AstStatementType::Continue(ref mut label_opt) => {
-                                assert!(label_opt.is_none());
-
-                                // This could happen if the continue statement is found outside of a loop.
-                                let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
-                                    errors.push(format!(
-                                        "continue statement with no containing loop"
-                                    ));
-                                    return Ok(());
-                                };
-
-                                // This could happen if the continue statement is found outside of a loop or anything else
-                                // that uses BreakTracking, such as a switch statement.
-                                let Some(ref continue_label) = break_tracking.continue_label_opt
-                                else {
-                                    errors.push(format!(
-                                        "continue statement with no containing loop"
-                                    ));
-                                    return Ok(());
-                                };
-
-                                // Write in the correct label to use for continuing in this scope.
-                                *label_opt = Some(continue_label.clone());
-                            }
-                            _ => {}
-                        }
-
-                        Ok(())
-                    },
-                    |ast_statement| {
-                        if let AstStatementType::For(
-                            _ast_for_init,
-                            _ast_expr_condition_opt,
-                            _ast_expr_final_opt,
-                            _ast_statement_body,
-                            _ast_body_end_label_opt,
-                            _ast_loop_end_label_opt,
-                        ) = &ast_statement.typ
-                        {
-                            assert!(break_tracking_opt.borrow().is_some());
-
-                            // This for loop is done, so revert the break tracking to its containing one.
-                            let parent_opt =
-                                break_tracking_opt.borrow_mut().take().unwrap().parent_opt;
-                            *break_tracking_opt.borrow_mut() = parent_opt;
-                        }
-
-                        Ok(())
-                    },
-                ),
-                &mut errors,
-            );
+            func.resolve_switch_cases(global_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after switch resolving");
         }
 
         if errors.is_empty() {
@@ -845,6 +742,277 @@ impl<'i> AstFunction<'i> {
             name: String::from(self.name),
             body: body_instructions,
         })
+    }
+
+    fn validate_and_allocate_goto_labels(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        function_tracking: &mut FunctionTracking,
+        errors: &mut Vec<String>,
+    ) {
+        // Examine all the goto labels in the function and rewrite them with an internal name while also checking
+        // that there are no duplicates.
+        push_error(
+            self.for_each_statement(|ast_statement| {
+                for label in ast_statement.labels.iter_mut() {
+                    match function_tracking.add_goto_label(global_tracking, label) {
+                        Ok(new_label) => {
+                            *label = new_label;
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+
+                Ok(())
+            }),
+            errors,
+        );
+    }
+
+    fn rewrite_goto_labels(
+        &mut self,
+        function_tracking: &FunctionTracking,
+        errors: &mut Vec<String>,
+    ) {
+        // Examine each goto statement and convert its target label to the internal label name.
+        push_error(
+            self.for_each_statement(|ast_statement| {
+                if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
+                    match function_tracking.resolve_label(label) {
+                        Ok(new_label) => {
+                            *label = new_label;
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+
+                Ok(())
+            }),
+            errors,
+        );
+    }
+
+    // Loop labeling (and also switch statements): each loop has two labels associated with it: one that a break
+    // statement should jump to (after the end of the loop) and one that a continue statement should jump to (after the
+    // end of the body).
+    //
+    // Switch statements are similar but do not have a label for continue statements.
+    //
+    // Because of nesting, the current tracking data needs to store a reference to the containing tracking data, so when
+    // the loop is over, we can revert back to the parent.
+    //
+    // Because we are referencing break_tracking_opt in two closures, the borrow checker doesn't know that we are only
+    // referencing it one at a time, so store in a RefCell, to allow for borrowing it in both closures when needed.
+    fn label_loops_and_switches(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        errors: &mut Vec<String>,
+    ) {
+        let errors_len = errors.len();
+
+        let break_tracking_opt = RefCell::new(None);
+        push_error(
+            self.for_each_statement_and_after(
+                |ast_statement| {
+                    match ast_statement.typ {
+                        AstStatementType::For(
+                            _,
+                            _,
+                            _,
+                            _,
+                            ref mut ast_body_end_label_opt,
+                            ref mut ast_loop_end_label_opt,
+                        )
+                        | AstStatementType::While(
+                            _,
+                            _,
+                            ref mut ast_body_end_label_opt,
+                            ref mut ast_loop_end_label_opt,
+                        )
+                        | AstStatementType::DoWhile(
+                            _,
+                            _,
+                            ref mut ast_body_end_label_opt,
+                            ref mut ast_loop_end_label_opt,
+                        ) => {
+                            assert!(ast_body_end_label_opt.is_none());
+                            assert!(ast_loop_end_label_opt.is_none());
+
+                            // Create new labels for this loop's body end and loop end, to be used in break and continue
+                            // statements.
+                            *ast_body_end_label_opt =
+                                Some(AstLabel(global_tracking.allocate_label("loop_body_end")));
+                            *ast_loop_end_label_opt =
+                                Some(AstLabel(global_tracking.allocate_label("loop_end")));
+
+                            // Store the pre-existing tracking info into the new tracking info, so we can revert to it
+                            // after this loop is done.
+                            let parent_opt = break_tracking_opt.borrow_mut().take();
+                            *break_tracking_opt.borrow_mut() = Some(Box::new(BreakTracking::new(
+                                parent_opt,
+                                ast_loop_end_label_opt.as_ref().unwrap().clone(),
+                                ast_body_end_label_opt.clone(),
+                            )));
+                        }
+                        AstStatementType::Break(ref mut label_opt) => {
+                            assert!(label_opt.is_none());
+
+                            let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
+                                errors.push(format!(
+                                    "break statement with no containing loop or switch"
+                                ));
+                                return Ok(());
+                            };
+
+                            // Write in the correct label to use for breaking in this scope.
+                            *label_opt = Some(break_tracking.break_label.clone());
+                        }
+                        AstStatementType::Continue(ref mut label_opt) => {
+                            assert!(label_opt.is_none());
+
+                            // This could happen if the continue statement is found outside of a loop.
+                            let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
+                                errors.push(format!("continue statement with no containing loop"));
+                                return Ok(());
+                            };
+
+                            // This could happen if the continue statement is found outside of a loop or anything else
+                            // that uses BreakTracking, such as a switch statement.
+                            let Some(continue_label) = break_tracking.find_continue_label() else {
+                                errors.push(format!("continue statement with no containing loop"));
+                                return Ok(());
+                            };
+
+                            // Write in the correct label to use for continuing in this scope.
+                            *label_opt = Some(continue_label.clone());
+                        }
+                        AstStatementType::Switch(_, _, ref mut ast_body_end_label_opt, _) => {
+                            assert!(ast_body_end_label_opt.is_none());
+
+                            // Create new labels for this switch statement's body end, to be used in break
+                            // statements.
+                            *ast_body_end_label_opt =
+                                Some(AstLabel(global_tracking.allocate_label("switch_body_end")));
+
+                            // Store the pre-existing tracking info into the new tracking info, so we can revert to
+                            // it after this loop is done.
+                            let parent_opt = break_tracking_opt.borrow_mut().take();
+                            *break_tracking_opt.borrow_mut() = Some(Box::new(BreakTracking::new(
+                                parent_opt,
+                                ast_body_end_label_opt.as_ref().unwrap().clone(),
+                                None,
+                            )));
+                        }
+                        _ => {}
+                    }
+
+                    Ok(())
+                },
+                |ast_statement| {
+                    match ast_statement.typ {
+                        AstStatementType::For(_, _, _, _, _, _)
+                        | AstStatementType::While(_, _, _, _)
+                        | AstStatementType::DoWhile(_, _, _, _)
+                        | AstStatementType::Switch(_, _, _, _) => {
+                            assert!(break_tracking_opt.borrow().is_some());
+
+                            // This for loop is done, so revert the break tracking to its containing one.
+                            let parent_opt =
+                                break_tracking_opt.borrow_mut().take().unwrap().parent_opt;
+                            *break_tracking_opt.borrow_mut() = parent_opt;
+                        }
+                        _ => {}
+                    }
+
+                    Ok(())
+                },
+            ),
+            errors,
+        );
+
+        // On success, make sure that after the traversal, the break tracking is reverted to its original state.
+        assert!(errors_len != errors.len() || break_tracking_opt.borrow().is_none());
+    }
+
+    fn resolve_switch_cases(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        errors: &mut Vec<String>,
+    ) {
+        let switch_tracking_opt = RefCell::new(None);
+        let errors_len = errors.len();
+
+        push_error(
+            self.for_each_statement_and_after(
+                |ast_statement| {
+                    match ast_statement.typ {
+                        AstStatementType::Switch(_, _, _, _) => {
+                            // Store the pre-existing tracking info into the new tracking info, so we can revert to
+                            // it after this switch is done.
+                            let parent_opt = switch_tracking_opt.borrow_mut().take();
+                            *switch_tracking_opt.borrow_mut() =
+                                Some(Box::new(SwitchTracking::new(parent_opt)));
+                        }
+                        AstStatementType::SwitchCase(ref mut case, _) => {
+                            let Some(ref mut switch_tracking) = *switch_tracking_opt.borrow_mut()
+                            else {
+                                return Err(format!(
+                                    "case statement outside of a switch statement"
+                                ));
+                            };
+
+                            if let Some(expr) = case.expr_opt.as_ref() {
+                                let val = expr.eval_i32_constant()?;
+                                if !switch_tracking.case_values.insert(val) {
+                                    return Err(format!("duplicate case {}", val));
+                                }
+
+                                case.label_opt =
+                                    Some(AstLabel(global_tracking.allocate_label(&format!(
+                                        "case_{}{}",
+                                        if val < 0 { "neg" } else { "" },
+                                        val.abs()
+                                    ))));
+                            } else {
+                                if switch_tracking.is_default_case_found {
+                                    return Err(format!("multiple default cases found"));
+                                }
+
+                                case.label_opt =
+                                    Some(AstLabel(global_tracking.allocate_label("case_def")));
+                                switch_tracking.is_default_case_found = true;
+                            }
+
+                            assert!(case.label_opt.is_some());
+                            switch_tracking.cases.push(case.clone());
+                        }
+                        _ => {}
+                    }
+
+                    Ok(())
+                },
+                |ast_statement| {
+                    if let AstStatementType::Switch(_, _, _, ref mut cases) = ast_statement.typ {
+                        let switch_tracking = switch_tracking_opt.borrow_mut().take().unwrap();
+
+                        *cases = switch_tracking.cases;
+
+                        // This for switch statement is done, so revert the tracking to its containing one.
+                        *switch_tracking_opt.borrow_mut() = switch_tracking.parent_opt;
+                    }
+
+                    Ok(())
+                },
+            ),
+            errors,
+        );
+
+        // On success, we should have unwrapped all the switch tracking.
+        assert!(errors_len != errors.len() || switch_tracking_opt.borrow().is_none());
     }
 }
 
@@ -1004,18 +1172,9 @@ impl AstStatement {
                     );
                 }
             }
-            AstStatementType::While(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            )
-            | AstStatementType::DoWhile(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            ) => {
+            AstStatementType::While(condition_expr, body_statement, _, _)
+            | AstStatementType::DoWhile(condition_expr, body_statement, _, _)
+            | AstStatementType::Switch(condition_expr, body_statement, _, _) => {
                 push_error(
                     condition_expr.validate_and_resolve_variables(block_tracking),
                     errors,
@@ -1073,6 +1232,13 @@ impl AstStatement {
             }
             AstStatementType::Break(_label) => {}
             AstStatementType::Continue(_label) => {}
+            AstStatementType::SwitchCase(SwitchCase { expr_opt, .. }, statement) => {
+                if let Some(expr) = expr_opt {
+                    push_error(expr.validate_and_resolve_variables(block_tracking), errors);
+                }
+
+                statement.validate_and_resolve_variables(global_tracking, block_tracking, errors);
+            }
             AstStatementType::Null => {}
         }
     }
@@ -1097,37 +1263,22 @@ impl AstStatement {
                     else_statement.for_each_statement_and_after(func, func_after)?;
                 }
             }
-            AstStatementType::While(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            )
-            | AstStatementType::DoWhile(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            ) => {
-                body_statement.for_each_statement_and_after(func, func_after)?;
+            AstStatementType::While(_, ast_statement_body, _, _)
+            | AstStatementType::DoWhile(_, ast_statement_body, _, _)
+            | AstStatementType::For(_, _, _, ast_statement_body, _, _)
+            | AstStatementType::Switch(_, ast_statement_body, _, _) => {
+                ast_statement_body.for_each_statement_and_after(func, func_after)?;
             }
             AstStatementType::Expr(_expr) => {}
             AstStatementType::Goto(_label) => {}
             AstStatementType::Compound(block) => {
                 block.for_each_statement_and_after(func, func_after)?;
             }
-            AstStatementType::For(
-                _ast_for_init,
-                _ast_expr_condition_opt,
-                _ast_expr_final_opt,
-                ast_statement_body,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            ) => {
-                ast_statement_body.for_each_statement_and_after(func, func_after)?;
-            }
             AstStatementType::Break(_label) => {}
             AstStatementType::Continue(_label) => {}
+            AstStatementType::SwitchCase(_, statement) => {
+                statement.for_each_statement_and_after(func, func_after)?;
+            }
             AstStatementType::Null => {}
         }
 
@@ -1309,6 +1460,68 @@ impl AstStatement {
             AstStatementType::Break(label_opt) | AstStatementType::Continue(label_opt) => {
                 instructions.push(TacInstruction::Jump(label_opt.as_ref().unwrap().to_tac()));
             }
+            AstStatementType::Switch(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                cases,
+            ) => {
+                // Evaluate the target condition of the switch statement.
+                let tac_condition_val = condition_expr.to_tac(global_tracking, instructions)?;
+
+                // Previously we have gathered all the cases within the switch statement. Emit code that checks each one
+                // to see which should be jumped to. First emit all the explicit cases (not the default case, if there
+                // is one).
+                for case in cases.iter() {
+                    let Some(ref expr) = case.expr_opt else {
+                        continue;
+                    };
+
+                    let tac_case_val = expr.to_tac(global_tracking, instructions)?;
+
+                    instructions.push(TacInstruction::JumpIfEqual(
+                        tac_condition_val.clone(),
+                        tac_case_val,
+                        case.label_opt.as_ref().unwrap().to_tac(),
+                    ));
+                }
+
+                // The default case, if one is present, must be last, so that it's not matched before any spexific case.
+                let mut is_default_case_present = false;
+                for case in cases.iter() {
+                    if case.expr_opt.is_none() {
+                        instructions.push(TacInstruction::Jump(
+                            case.label_opt.as_ref().unwrap().to_tac(),
+                        ));
+
+                        is_default_case_present = true;
+
+                        break;
+                    }
+                }
+
+                // If no default case was present, then unconditionally jump instead to the end of the switch statement.
+                // That means if nothing matches, then nothing in the switch should be executed.
+                if !is_default_case_present {
+                    instructions.push(TacInstruction::Jump(
+                        ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                    ));
+                }
+
+                // The body--the actual contents of the switch statement is emitted after the jump table. If nothing
+                // above matched, then nothing in the body will execute. If something matched, then it'll jump to
+                // somewhere inside the body.
+                body_statement.to_tac(global_tracking, instructions)?;
+
+                instructions.push(TacInstruction::Label(
+                    ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+            }
+            AstStatementType::SwitchCase(SwitchCase { label_opt, .. }, statement) => {
+                instructions.push(TacInstruction::Label(label_opt.as_ref().unwrap().to_tac()));
+
+                statement.to_tac(global_tracking, instructions)?;
+            }
             AstStatementType::Null => {}
         }
 
@@ -1405,6 +1618,52 @@ impl FmtNode for AstStatement {
                     writeln!(f, "{}:", ast_loop_end_label.0)?;
                     Self::write_indent(f, indent_levels)?;
                 }
+            }
+            AstStatementType::Switch(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                _cases,
+            ) => {
+                write!(f, "switch (")?;
+
+                condition_expr.fmt_node(f, indent_levels)?;
+                writeln!(f, ")")?;
+
+                body_statement.fmt_node(f, indent_levels + 1)?;
+
+                writeln!(f)?;
+                Self::write_indent(f, indent_levels)?;
+
+                // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
+                // will jump to.
+                if let Some(ast_body_end_label) = ast_body_end_label_opt {
+                    writeln!(f, "{}:", ast_body_end_label.0)?;
+                    Self::write_indent(f, indent_levels)?;
+                }
+            }
+            AstStatementType::SwitchCase(
+                SwitchCase {
+                    expr_opt,
+                    label_opt,
+                },
+                statement,
+            ) => {
+                if let Some(expr) = expr_opt {
+                    write!(f, "case ")?;
+                    expr.fmt_node(f, indent_levels)?;
+                    write!(f, ":")?;
+
+                    if let Some(label) = label_opt {
+                        write!(f, " {}:", label.0)?;
+                    }
+
+                    writeln!(f)?;
+                } else {
+                    writeln!(f, "default:")?;
+                }
+
+                statement.fmt_node(f, indent_levels)?;
             }
             AstStatementType::Goto(label) => {
                 write!(f, "goto {}", label.0)?;
@@ -1784,12 +2043,88 @@ impl std::str::FromStr for AstBinaryOperator {
 }
 
 impl AstExpression {
+    #[instrument(target = "consteval", level = "debug")]
+    fn eval_i32_constant(&self) -> Result<i32, String> {
+        match self {
+            AstExpression::Constant(num) => Ok(*num as i32),
+            AstExpression::UnaryOperator(ast_unary_op, ast_expr) => {
+                let val = ast_expr.eval_i32_constant()?;
+                // TODO: decent chance this isn't a robust and full-fidelity emulation of how it should act in C.
+                match ast_unary_op {
+                    AstUnaryOperator::Negation => Ok(val * -1),
+                    AstUnaryOperator::BitwiseNot => Ok(!val),
+                    AstUnaryOperator::Not => Ok(if val == 0 { 1 } else { 0 }),
+                    AstUnaryOperator::PrefixIncrement
+                    | AstUnaryOperator::PrefixDecrement
+                    | AstUnaryOperator::PostfixIncrement
+                    | AstUnaryOperator::PostfixDecrement => Err(format!(
+                        "cannot evaluate constant expression with {} operator",
+                        display_with(|f| ast_unary_op.fmt_node(f, 0))
+                    )),
+                }
+            }
+            AstExpression::BinaryOperator(ast_exp_left, ast_binary_op, ast_exp_right) => {
+                let left_val = ast_exp_left.eval_i32_constant()?;
+                let right_val = ast_exp_right.eval_i32_constant()?;
+
+                // TODO: decent chance this isn't a robust and full-fidelity emulation of how it should act in C,
+                // especially at overflow/underflow/boundaries.
+                match ast_binary_op {
+                    AstBinaryOperator::Add => Ok(left_val + right_val),
+                    AstBinaryOperator::Subtract => Ok(left_val - right_val),
+                    AstBinaryOperator::Multiply => Ok(left_val * right_val),
+                    AstBinaryOperator::Divide => Ok(left_val / right_val),
+                    AstBinaryOperator::Modulus => Ok(left_val % right_val),
+                    AstBinaryOperator::BitwiseAnd => Ok(left_val & right_val),
+                    AstBinaryOperator::BitwiseOr => Ok(left_val | right_val),
+                    AstBinaryOperator::BitwiseXor => Ok(left_val ^ right_val),
+                    AstBinaryOperator::ShiftLeft => Ok(left_val << right_val),
+                    AstBinaryOperator::ShiftRight => Ok(left_val >> right_val),
+                    AstBinaryOperator::And => Ok((left_val != 0 && right_val != 0) as i32),
+                    AstBinaryOperator::Or => Ok((left_val != 0 || right_val != 0) as i32),
+                    AstBinaryOperator::Equal => Ok((left_val == right_val) as i32),
+                    AstBinaryOperator::NotEqual => Ok((left_val != right_val) as i32),
+                    AstBinaryOperator::LessThan => Ok((left_val < right_val) as i32),
+                    AstBinaryOperator::LessOrEqual => Ok((left_val <= right_val) as i32),
+                    AstBinaryOperator::GreaterThan => Ok((left_val > right_val) as i32),
+                    AstBinaryOperator::GreaterOrEqual => Ok((left_val >= right_val) as i32),
+                    AstBinaryOperator::Assign
+                    | AstBinaryOperator::AddAssign
+                    | AstBinaryOperator::SubtractAssign
+                    | AstBinaryOperator::MultiplyAssign
+                    | AstBinaryOperator::DivideAssign
+                    | AstBinaryOperator::ModulusAssign
+                    | AstBinaryOperator::BitwiseAndAssign
+                    | AstBinaryOperator::BitwiseOrAssign
+                    | AstBinaryOperator::BitwiseXorAssign
+                    | AstBinaryOperator::ShiftLeftAssign
+                    | AstBinaryOperator::ShiftRightAssign
+                    | AstBinaryOperator::Conditional => {
+                        panic!("should have been handled elsewhere")
+                    }
+                }
+            }
+            AstExpression::Var(_) => {
+                Err(format!("cannot evaluate constant expression with variable"))
+            }
+            AstExpression::Assignment(_, _, _) => {
+                Err(format!("cannot evaluate constant expression with variable"))
+            }
+            AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
+                let left_val = ast_exp_left.eval_i32_constant()?;
+                let middle_val = ast_exp_middle.eval_i32_constant()?;
+                let right_val = ast_exp_right.eval_i32_constant()?;
+                Ok(if left_val != 0 { middle_val } else { right_val })
+            }
+        }
+    }
+
     fn validate_and_resolve_variables(
         &mut self,
         block_tracking: &mut BlockTracking,
     ) -> Result<(), String> {
         match self {
-            AstExpression::Constant(num) => {}
+            AstExpression::Constant(_num) => {}
             AstExpression::UnaryOperator(ast_unary_op, ast_exp_inner) => {
                 match ast_unary_op {
                     AstUnaryOperator::PrefixIncrement
@@ -2267,6 +2602,10 @@ impl TacInstruction {
                     label.to_asm()?,
                 ));
             }
+            TacInstruction::JumpIfEqual(val1, val2, label) => {
+                func_body.push(AsmInstruction::Cmp(val1.to_asm()?, val2.to_asm()?));
+                func_body.push(AsmInstruction::JmpCc(AsmCondCode::E, label.to_asm()?));
+            }
             TacInstruction::Label(label) => {
                 func_body.push(AsmInstruction::Label(label.to_asm()?));
             }
@@ -2317,6 +2656,12 @@ impl FmtNode for TacInstruction {
                 write!(f, "jump :{} if ", label.0)?;
                 val.fmt_node(f, 0)?;
                 write!(f, " != 0")?;
+            }
+            TacInstruction::JumpIfEqual(val1, val2, label) => {
+                write!(f, "jump :{} if ", label.0)?;
+                val1.fmt_node(f, 0)?;
+                write!(f, " == ")?;
+                val2.fmt_node(f, 0)?;
             }
             TacInstruction::Label(label) => {
                 writeln!(f)?;
@@ -3390,6 +3735,28 @@ impl BreakTracking {
             continue_label_opt,
         }
     }
+
+    fn find_continue_label(&self) -> Option<&AstLabel> {
+        // Walk the parent chain until we find the closest continue label.
+        if self.continue_label_opt.is_some() {
+            self.continue_label_opt.as_ref()
+        } else if let Some(parent) = self.parent_opt.as_ref() {
+            parent.find_continue_label()
+        } else {
+            None
+        }
+    }
+}
+
+impl SwitchTracking {
+    fn new(parent_opt: Option<Box<SwitchTracking>>) -> Self {
+        Self {
+            parent_opt,
+            is_default_case_found: false,
+            case_values: HashSet::new(),
+            cases: Vec::new(),
+        }
+    }
 }
 
 impl FuncStackFrame {
@@ -3522,7 +3889,7 @@ fn parse_block<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlock,
     let mut body = vec![];
 
     loop {
-        if let Ok(operator) = tokens.consume_expected_next_token("}") {
+        if tokens.consume_expected_next_token("}").is_ok() {
             break;
         }
 
@@ -3608,6 +3975,34 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
         let st = AstStatementType::Continue(None);
         tokens.consume_expected_next_token(";")?;
         st
+    } else if tokens.consume_expected_next_token("switch").is_ok() {
+        tokens.consume_expected_next_token("(")?;
+        let condition_expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+        let body_statement = parse_statement(&mut tokens)?;
+
+        AstStatementType::Switch(condition_expr, Box::new(body_statement), None, Vec::new())
+    } else if tokens.consume_expected_next_token("case").is_ok() {
+        let expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(":")?;
+
+        AstStatementType::SwitchCase(
+            SwitchCase {
+                expr_opt: Some(expr),
+                label_opt: None,
+            },
+            Box::new(parse_statement(&mut tokens)?),
+        )
+    } else if tokens.consume_expected_next_token("default").is_ok() {
+        tokens.consume_expected_next_token(":")?;
+
+        AstStatementType::SwitchCase(
+            SwitchCase {
+                expr_opt: None,
+                label_opt: None,
+            },
+            Box::new(parse_statement(&mut tokens)?),
+        )
     } else {
         let st = AstStatementType::Expr(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
@@ -3722,6 +4117,7 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
     ) -> Result<AstExpression, String> {
         // Always try for at least one factor in an expression.
         let mut left = parse_factor(original_tokens)?;
+        debug!(target: "parse", expr = %DisplayFmtNode(&left), "parsed expression");
 
         // The tokens we clone here might be committed, or we might not find a valid expression within.
         let mut tokens = original_tokens.clone();
@@ -3793,6 +4189,8 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
                             );
                         }
                     }
+
+                    debug!(target: "parse", expr = %DisplayFmtNode(&left), "parsed expression");
 
                     // Since we successfully consumed an expression, commit the tokens we consumed for this.
                     *original_tokens = tokens.clone();
@@ -4002,7 +4400,7 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
         AstProgram::new(functions)
     };
 
-    info!("AST:\n{}", display_with(|f| ast.fmt_node(f, 0)));
+    info!(target: "parse", ast = %DisplayFmtNode(&ast));
 
     if tokens.0.len() != 0 {
         return Err(vec![format!(
@@ -4017,10 +4415,7 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
 
     ast.validate_and_resolve()?;
 
-    info!(
-        "AST after resolve:\n{}",
-        display_with(|f| ast.fmt_node(f, 0))
-    );
+    info!(target: "resolve", ast = %DisplayFmtNode(&ast), "AST after resolve");
 
     Ok(ast)
 }
@@ -4060,6 +4455,7 @@ fn compile_and_link(
     args: &LcArgs,
     input: &str,
     should_suppress_output: bool,
+    should_expect_success: bool,
 ) -> Result<i32, String> {
     fn helper(
         args: &LcArgs,
@@ -4119,7 +4515,9 @@ fn compile_and_link(
     let temp_dir = Path::new(&temp_dir_name);
     std::fs::create_dir_all(&temp_dir);
     let ret = helper(args, input, should_suppress_output, temp_dir);
-    if ret.is_ok() {
+
+    // Remove the temp dir if the compile result matches what the caller was expecting.
+    if ret.is_ok() == should_expect_success {
         debug!("cleaning up temp dir {}", temp_dir.to_string_lossy());
         std::fs::remove_dir_all(&temp_dir);
     }
@@ -4189,7 +4587,7 @@ fn main() {
     info!("Loading {}", args.input_path);
     let input = std::fs::read_to_string(&args.input_path).unwrap();
 
-    let exit_code = match compile_and_link(&args, &input, false) {
+    let exit_code = match compile_and_link(&args, &input, false, true) {
         Ok(inner_exit_code) => inner_exit_code,
         Err(msg) => {
             println!("error! {}", msg);
