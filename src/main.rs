@@ -9,7 +9,13 @@ use {
     rand::{thread_rng, Rng},
     regex::Regex,
     std::{
-        cell::RefCell, collections::HashMap, fmt, fmt::Display, ops::Deref, path::*, process::*,
+        cell::RefCell,
+        collections::{HashMap, HashSet},
+        fmt,
+        fmt::Display,
+        ops::Deref,
+        path::*,
+        process::*,
     },
     tracing::{debug, info, instrument},
     tracing_subscriber,
@@ -150,6 +156,12 @@ impl<T: FmtNode + ?Sized> FmtNode for &T {
     }
 }
 
+impl<T: FmtNode + ?Sized> FmtNode for &mut T {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        (*(self as &T)).fmt_node(f, indent_levels)
+    }
+}
+
 // Because Rust doesn't allow a blanket implementation of fmt::Display for FmtNode, we can instead make a bare wrapper
 // to do it for us.
 struct DisplayFmtNode<T>(T);
@@ -206,9 +218,10 @@ impl<'i, 't> Tokens<'i, 't> {
             lazy_static! {
                 static ref IDENT_REGEX: Regex =
                     Regex::new(r"^[a-zA-Z_]\w*$").expect("failed to compile regex");
-                static ref KEYWORDS_REGEX: Regex =
-                    Regex::new(r"^(?:int|void|return|if|goto|for|break|continue)$")
-                        .expect("failed to compile regex");
+                static ref KEYWORDS_REGEX: Regex = Regex::new(
+                    r"^(?:int|void|return|if|goto|for|break|continue|switch|case|default)$"
+                )
+                .expect("failed to compile regex");
             }
 
             IDENT_REGEX.is_match(token) && !KEYWORDS_REGEX.is_match(token)
@@ -321,6 +334,13 @@ enum AstStatementType {
     ),
     Break(Option<AstLabel>),
     Continue(Option<AstLabel>),
+    Switch(
+        AstExpression,
+        Box<AstStatement>,
+        Option<AstLabel>,
+        Vec<SwitchCase>,
+    ),
+    SwitchCase(SwitchCase, Box<AstStatement>),
     Null,
 }
 
@@ -328,6 +348,12 @@ enum AstStatementType {
 enum AstForInit {
     Declaration(AstDeclaration),
     Expression(Option<AstExpression>),
+}
+
+#[derive(Clone, Debug)]
+struct SwitchCase {
+    expr_opt: Option<AstExpression>,
+    label_opt: Option<AstLabel>,
 }
 
 #[derive(Clone, Debug)]
@@ -409,6 +435,7 @@ enum TacInstruction {
     Jump(TacLabel),
     JumpIfZero(TacVal, TacLabel),
     JumpIfNotZero(TacVal, TacLabel),
+    JumpIfEqual(TacVal, TacVal, TacLabel),
     Label(TacLabel),
 }
 
@@ -546,6 +573,14 @@ struct BreakTracking {
 }
 
 #[derive(Debug)]
+struct SwitchTracking {
+    parent_opt: Option<Box<SwitchTracking>>,
+    is_default_case_found: bool,
+    case_values: HashSet<i32>,
+    cases: Vec<SwitchCase>,
+}
+
+#[derive(Debug)]
 struct FuncStackFrame {
     names: HashMap<String, i32>,
     max_base_offset: u32,
@@ -565,168 +600,30 @@ impl<'i> AstProgram<'i> {
 
     fn validate_and_resolve(&mut self) -> Result<(), Vec<String>> {
         self.global_tracking_opt = Some(GlobalTracking::new());
+        let global_tracking = self.global_tracking_opt.as_mut().unwrap();
 
         let mut errors = vec![];
         for func in self.functions.iter_mut() {
             let mut function_tracking = FunctionTracking::new();
-            let global_tracking = self.global_tracking_opt.as_mut().unwrap();
 
             func.validate_and_resolve_variables(global_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after validate_and_resolve");
 
-            push_error(
-                func.for_each_statement(|ast_statement| {
-                    for label in ast_statement.labels.iter_mut() {
-                        match function_tracking.add_goto_label(global_tracking, label) {
-                            Ok(new_label) => {
-                                *label = new_label;
-                            }
-                            Err(err) => {
-                                errors.push(err);
-                            }
-                        }
-                    }
-
-                    Ok(())
-                }),
+            func.validate_and_allocate_goto_labels(
+                global_tracking,
+                &mut function_tracking,
                 &mut errors,
             );
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after label checking");
 
-            push_error(
-                func.for_each_statement(|ast_statement| {
-                    if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
-                        match function_tracking.resolve_label(label) {
-                            Ok(new_label) => {
-                                *label = new_label;
-                            }
-                            Err(err) => {
-                                errors.push(err);
-                            }
-                        }
-                    }
+            func.rewrite_goto_labels(&function_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after goto resolution");
 
-                    Ok(())
-                }),
-                &mut errors,
-            );
+            func.label_loops_and_switches(global_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after loop labeling");
 
-            // Loop labeling: each loop has two labels associated with it: one that a break statement should jump to
-            // (after the end of the loop) and one that a continue statement should jump to (after the end of the body).
-            // Because of nesting, the current tracking data needs to store a reference to the containing tracking data,
-            // so when the loop is over, we can revert back to the parent.
-            //
-            // Because we are referencing break_tracking_opt in two closures, the borrow checker doesn't know that we
-            // are only referencing it one at a time, so store in a RefCell, to allow for borrowing it in both closures
-            // when needed.
-            let mut break_tracking_opt = RefCell::new(None);
-            push_error(
-                func.for_each_statement_and_after(
-                    |ast_statement| {
-                        match ast_statement.typ {
-                            AstStatementType::For(
-                                _,
-                                _,
-                                _,
-                                _,
-                                ref mut ast_body_end_label_opt,
-                                ref mut ast_loop_end_label_opt,
-                            )
-                            | AstStatementType::While(
-                                _,
-                                _,
-                                ref mut ast_body_end_label_opt,
-                                ref mut ast_loop_end_label_opt,
-                            )
-                            | AstStatementType::DoWhile(
-                                _,
-                                _,
-                                ref mut ast_body_end_label_opt,
-                                ref mut ast_loop_end_label_opt,
-                            ) => {
-                                assert!(ast_body_end_label_opt.is_none());
-                                assert!(ast_loop_end_label_opt.is_none());
-
-                                // Create new labels for this loop's body end and loop end, to be used in break and continue
-                                // statements.
-                                *ast_body_end_label_opt =
-                                    Some(AstLabel(global_tracking.allocate_label("loop_body_end")));
-                                *ast_loop_end_label_opt =
-                                    Some(AstLabel(global_tracking.allocate_label("loop_end")));
-
-                                // Store the pre-existing tracking info into the new tracking info, so we can revert to it
-                                // after this loop is done.
-                                let parent_opt = break_tracking_opt.borrow_mut().take();
-                                *break_tracking_opt.borrow_mut() =
-                                    Some(Box::new(BreakTracking::new(
-                                        parent_opt,
-                                        ast_loop_end_label_opt.as_ref().unwrap().clone(),
-                                        ast_body_end_label_opt.clone(),
-                                    )));
-                            }
-                            AstStatementType::Break(ref mut label_opt) => {
-                                assert!(label_opt.is_none());
-
-                                let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
-                                    errors.push(format!(
-                                        "break statement with no containing loop or switch"
-                                    ));
-                                    return Ok(());
-                                };
-
-                                // Write in the correct label to use for breaking in this scope.
-                                *label_opt = Some(break_tracking.break_label.clone());
-                            }
-                            AstStatementType::Continue(ref mut label_opt) => {
-                                assert!(label_opt.is_none());
-
-                                // This could happen if the continue statement is found outside of a loop.
-                                let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
-                                    errors.push(format!(
-                                        "continue statement with no containing loop"
-                                    ));
-                                    return Ok(());
-                                };
-
-                                // This could happen if the continue statement is found outside of a loop or anything else
-                                // that uses BreakTracking, such as a switch statement.
-                                let Some(ref continue_label) = break_tracking.continue_label_opt
-                                else {
-                                    errors.push(format!(
-                                        "continue statement with no containing loop"
-                                    ));
-                                    return Ok(());
-                                };
-
-                                // Write in the correct label to use for continuing in this scope.
-                                *label_opt = Some(continue_label.clone());
-                            }
-                            _ => {}
-                        }
-
-                        Ok(())
-                    },
-                    |ast_statement| {
-                        if let AstStatementType::For(
-                            _ast_for_init,
-                            _ast_expr_condition_opt,
-                            _ast_expr_final_opt,
-                            _ast_statement_body,
-                            _ast_body_end_label_opt,
-                            _ast_loop_end_label_opt,
-                        ) = &ast_statement.typ
-                        {
-                            assert!(break_tracking_opt.borrow().is_some());
-
-                            // This for loop is done, so revert the break tracking to its containing one.
-                            let parent_opt =
-                                break_tracking_opt.borrow_mut().take().unwrap().parent_opt;
-                            *break_tracking_opt.borrow_mut() = parent_opt;
-                        }
-
-                        Ok(())
-                    },
-                ),
-                &mut errors,
-            );
+            func.resolve_switch_cases(global_tracking, &mut errors);
+            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after switch resolving");
         }
 
         if errors.is_empty() {
@@ -845,6 +742,277 @@ impl<'i> AstFunction<'i> {
             name: String::from(self.name),
             body: body_instructions,
         })
+    }
+
+    fn validate_and_allocate_goto_labels(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        function_tracking: &mut FunctionTracking,
+        errors: &mut Vec<String>,
+    ) {
+        // Examine all the goto labels in the function and rewrite them with an internal name while also checking
+        // that there are no duplicates.
+        push_error(
+            self.for_each_statement(|ast_statement| {
+                for label in ast_statement.labels.iter_mut() {
+                    match function_tracking.add_goto_label(global_tracking, label) {
+                        Ok(new_label) => {
+                            *label = new_label;
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+
+                Ok(())
+            }),
+            errors,
+        );
+    }
+
+    fn rewrite_goto_labels(
+        &mut self,
+        function_tracking: &FunctionTracking,
+        errors: &mut Vec<String>,
+    ) {
+        // Examine each goto statement and convert its target label to the internal label name.
+        push_error(
+            self.for_each_statement(|ast_statement| {
+                if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
+                    match function_tracking.resolve_label(label) {
+                        Ok(new_label) => {
+                            *label = new_label;
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+
+                Ok(())
+            }),
+            errors,
+        );
+    }
+
+    // Loop labeling (and also switch statements): each loop has two labels associated with it: one that a break
+    // statement should jump to (after the end of the loop) and one that a continue statement should jump to (after the
+    // end of the body).
+    //
+    // Switch statements are similar but do not have a label for continue statements.
+    //
+    // Because of nesting, the current tracking data needs to store a reference to the containing tracking data, so when
+    // the loop is over, we can revert back to the parent.
+    //
+    // Because we are referencing break_tracking_opt in two closures, the borrow checker doesn't know that we are only
+    // referencing it one at a time, so store in a RefCell, to allow for borrowing it in both closures when needed.
+    fn label_loops_and_switches(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        errors: &mut Vec<String>,
+    ) {
+        let errors_len = errors.len();
+
+        let break_tracking_opt = RefCell::new(None);
+        push_error(
+            self.for_each_statement_and_after(
+                |ast_statement| {
+                    match ast_statement.typ {
+                        AstStatementType::For(
+                            _,
+                            _,
+                            _,
+                            _,
+                            ref mut ast_body_end_label_opt,
+                            ref mut ast_loop_end_label_opt,
+                        )
+                        | AstStatementType::While(
+                            _,
+                            _,
+                            ref mut ast_body_end_label_opt,
+                            ref mut ast_loop_end_label_opt,
+                        )
+                        | AstStatementType::DoWhile(
+                            _,
+                            _,
+                            ref mut ast_body_end_label_opt,
+                            ref mut ast_loop_end_label_opt,
+                        ) => {
+                            assert!(ast_body_end_label_opt.is_none());
+                            assert!(ast_loop_end_label_opt.is_none());
+
+                            // Create new labels for this loop's body end and loop end, to be used in break and continue
+                            // statements.
+                            *ast_body_end_label_opt =
+                                Some(AstLabel(global_tracking.allocate_label("loop_body_end")));
+                            *ast_loop_end_label_opt =
+                                Some(AstLabel(global_tracking.allocate_label("loop_end")));
+
+                            // Store the pre-existing tracking info into the new tracking info, so we can revert to it
+                            // after this loop is done.
+                            let parent_opt = break_tracking_opt.borrow_mut().take();
+                            *break_tracking_opt.borrow_mut() = Some(Box::new(BreakTracking::new(
+                                parent_opt,
+                                ast_loop_end_label_opt.as_ref().unwrap().clone(),
+                                ast_body_end_label_opt.clone(),
+                            )));
+                        }
+                        AstStatementType::Break(ref mut label_opt) => {
+                            assert!(label_opt.is_none());
+
+                            let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
+                                errors.push(format!(
+                                    "break statement with no containing loop or switch"
+                                ));
+                                return Ok(());
+                            };
+
+                            // Write in the correct label to use for breaking in this scope.
+                            *label_opt = Some(break_tracking.break_label.clone());
+                        }
+                        AstStatementType::Continue(ref mut label_opt) => {
+                            assert!(label_opt.is_none());
+
+                            // This could happen if the continue statement is found outside of a loop.
+                            let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
+                                errors.push(format!("continue statement with no containing loop"));
+                                return Ok(());
+                            };
+
+                            // This could happen if the continue statement is found outside of a loop or anything else
+                            // that uses BreakTracking, such as a switch statement.
+                            let Some(continue_label) = break_tracking.find_continue_label() else {
+                                errors.push(format!("continue statement with no containing loop"));
+                                return Ok(());
+                            };
+
+                            // Write in the correct label to use for continuing in this scope.
+                            *label_opt = Some(continue_label.clone());
+                        }
+                        AstStatementType::Switch(_, _, ref mut ast_body_end_label_opt, _) => {
+                            assert!(ast_body_end_label_opt.is_none());
+
+                            // Create new labels for this switch statement's body end, to be used in break
+                            // statements.
+                            *ast_body_end_label_opt =
+                                Some(AstLabel(global_tracking.allocate_label("switch_body_end")));
+
+                            // Store the pre-existing tracking info into the new tracking info, so we can revert to
+                            // it after this loop is done.
+                            let parent_opt = break_tracking_opt.borrow_mut().take();
+                            *break_tracking_opt.borrow_mut() = Some(Box::new(BreakTracking::new(
+                                parent_opt,
+                                ast_body_end_label_opt.as_ref().unwrap().clone(),
+                                None,
+                            )));
+                        }
+                        _ => {}
+                    }
+
+                    Ok(())
+                },
+                |ast_statement| {
+                    match ast_statement.typ {
+                        AstStatementType::For(_, _, _, _, _, _)
+                        | AstStatementType::While(_, _, _, _)
+                        | AstStatementType::DoWhile(_, _, _, _)
+                        | AstStatementType::Switch(_, _, _, _) => {
+                            assert!(break_tracking_opt.borrow().is_some());
+
+                            // This for loop is done, so revert the break tracking to its containing one.
+                            let parent_opt =
+                                break_tracking_opt.borrow_mut().take().unwrap().parent_opt;
+                            *break_tracking_opt.borrow_mut() = parent_opt;
+                        }
+                        _ => {}
+                    }
+
+                    Ok(())
+                },
+            ),
+            errors,
+        );
+
+        // On success, make sure that after the traversal, the break tracking is reverted to its original state.
+        assert!(errors_len != errors.len() || break_tracking_opt.borrow().is_none());
+    }
+
+    fn resolve_switch_cases(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        errors: &mut Vec<String>,
+    ) {
+        let switch_tracking_opt = RefCell::new(None);
+        let errors_len = errors.len();
+
+        push_error(
+            self.for_each_statement_and_after(
+                |ast_statement| {
+                    match ast_statement.typ {
+                        AstStatementType::Switch(_, _, _, _) => {
+                            // Store the pre-existing tracking info into the new tracking info, so we can revert to
+                            // it after this switch is done.
+                            let parent_opt = switch_tracking_opt.borrow_mut().take();
+                            *switch_tracking_opt.borrow_mut() =
+                                Some(Box::new(SwitchTracking::new(parent_opt)));
+                        }
+                        AstStatementType::SwitchCase(ref mut case, _) => {
+                            let Some(ref mut switch_tracking) = *switch_tracking_opt.borrow_mut()
+                            else {
+                                return Err(format!(
+                                    "case statement outside of a switch statement"
+                                ));
+                            };
+
+                            if let Some(expr) = case.expr_opt.as_ref() {
+                                let val = expr.eval_i32_constant()?;
+                                if !switch_tracking.case_values.insert(val) {
+                                    return Err(format!("duplicate case {}", val));
+                                }
+
+                                case.label_opt =
+                                    Some(AstLabel(global_tracking.allocate_label(&format!(
+                                        "case_{}{}",
+                                        if val < 0 { "neg" } else { "" },
+                                        val.abs()
+                                    ))));
+                            } else {
+                                if switch_tracking.is_default_case_found {
+                                    return Err(format!("multiple default cases found"));
+                                }
+
+                                case.label_opt =
+                                    Some(AstLabel(global_tracking.allocate_label("case_def")));
+                                switch_tracking.is_default_case_found = true;
+                            }
+
+                            assert!(case.label_opt.is_some());
+                            switch_tracking.cases.push(case.clone());
+                        }
+                        _ => {}
+                    }
+
+                    Ok(())
+                },
+                |ast_statement| {
+                    if let AstStatementType::Switch(_, _, _, ref mut cases) = ast_statement.typ {
+                        let switch_tracking = switch_tracking_opt.borrow_mut().take().unwrap();
+
+                        *cases = switch_tracking.cases;
+
+                        // This for switch statement is done, so revert the tracking to its containing one.
+                        *switch_tracking_opt.borrow_mut() = switch_tracking.parent_opt;
+                    }
+
+                    Ok(())
+                },
+            ),
+            errors,
+        );
+
+        // On success, we should have unwrapped all the switch tracking.
+        assert!(errors_len != errors.len() || switch_tracking_opt.borrow().is_none());
     }
 }
 
@@ -1004,18 +1172,9 @@ impl AstStatement {
                     );
                 }
             }
-            AstStatementType::While(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            )
-            | AstStatementType::DoWhile(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            ) => {
+            AstStatementType::While(condition_expr, body_statement, _, _)
+            | AstStatementType::DoWhile(condition_expr, body_statement, _, _)
+            | AstStatementType::Switch(condition_expr, body_statement, _, _) => {
                 push_error(
                     condition_expr.validate_and_resolve_variables(block_tracking),
                     errors,
@@ -1073,6 +1232,13 @@ impl AstStatement {
             }
             AstStatementType::Break(_label) => {}
             AstStatementType::Continue(_label) => {}
+            AstStatementType::SwitchCase(SwitchCase { expr_opt, .. }, statement) => {
+                if let Some(expr) = expr_opt {
+                    push_error(expr.validate_and_resolve_variables(block_tracking), errors);
+                }
+
+                statement.validate_and_resolve_variables(global_tracking, block_tracking, errors);
+            }
             AstStatementType::Null => {}
         }
     }
@@ -1097,37 +1263,22 @@ impl AstStatement {
                     else_statement.for_each_statement_and_after(func, func_after)?;
                 }
             }
-            AstStatementType::While(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            )
-            | AstStatementType::DoWhile(
-                condition_expr,
-                body_statement,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            ) => {
-                body_statement.for_each_statement_and_after(func, func_after)?;
+            AstStatementType::While(_, ast_statement_body, _, _)
+            | AstStatementType::DoWhile(_, ast_statement_body, _, _)
+            | AstStatementType::For(_, _, _, ast_statement_body, _, _)
+            | AstStatementType::Switch(_, ast_statement_body, _, _) => {
+                ast_statement_body.for_each_statement_and_after(func, func_after)?;
             }
             AstStatementType::Expr(_expr) => {}
             AstStatementType::Goto(_label) => {}
             AstStatementType::Compound(block) => {
                 block.for_each_statement_and_after(func, func_after)?;
             }
-            AstStatementType::For(
-                _ast_for_init,
-                _ast_expr_condition_opt,
-                _ast_expr_final_opt,
-                ast_statement_body,
-                _ast_body_end_label_opt,
-                _ast_loop_end_label_opt,
-            ) => {
-                ast_statement_body.for_each_statement_and_after(func, func_after)?;
-            }
             AstStatementType::Break(_label) => {}
             AstStatementType::Continue(_label) => {}
+            AstStatementType::SwitchCase(_, statement) => {
+                statement.for_each_statement_and_after(func, func_after)?;
+            }
             AstStatementType::Null => {}
         }
 
@@ -1309,6 +1460,68 @@ impl AstStatement {
             AstStatementType::Break(label_opt) | AstStatementType::Continue(label_opt) => {
                 instructions.push(TacInstruction::Jump(label_opt.as_ref().unwrap().to_tac()));
             }
+            AstStatementType::Switch(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                cases,
+            ) => {
+                // Evaluate the target condition of the switch statement.
+                let tac_condition_val = condition_expr.to_tac(global_tracking, instructions)?;
+
+                // Previously we have gathered all the cases within the switch statement. Emit code that checks each one
+                // to see which should be jumped to. First emit all the explicit cases (not the default case, if there
+                // is one).
+                for case in cases.iter() {
+                    let Some(ref expr) = case.expr_opt else {
+                        continue;
+                    };
+
+                    let tac_case_val = expr.to_tac(global_tracking, instructions)?;
+
+                    instructions.push(TacInstruction::JumpIfEqual(
+                        tac_condition_val.clone(),
+                        tac_case_val,
+                        case.label_opt.as_ref().unwrap().to_tac(),
+                    ));
+                }
+
+                // The default case, if one is present, must be last, so that it's not matched before any spexific case.
+                let mut is_default_case_present = false;
+                for case in cases.iter() {
+                    if case.expr_opt.is_none() {
+                        instructions.push(TacInstruction::Jump(
+                            case.label_opt.as_ref().unwrap().to_tac(),
+                        ));
+
+                        is_default_case_present = true;
+
+                        break;
+                    }
+                }
+
+                // If no default case was present, then unconditionally jump instead to the end of the switch statement.
+                // That means if nothing matches, then nothing in the switch should be executed.
+                if !is_default_case_present {
+                    instructions.push(TacInstruction::Jump(
+                        ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                    ));
+                }
+
+                // The body--the actual contents of the switch statement is emitted after the jump table. If nothing
+                // above matched, then nothing in the body will execute. If something matched, then it'll jump to
+                // somewhere inside the body.
+                body_statement.to_tac(global_tracking, instructions)?;
+
+                instructions.push(TacInstruction::Label(
+                    ast_body_end_label_opt.as_ref().unwrap().to_tac(),
+                ));
+            }
+            AstStatementType::SwitchCase(SwitchCase { label_opt, .. }, statement) => {
+                instructions.push(TacInstruction::Label(label_opt.as_ref().unwrap().to_tac()));
+
+                statement.to_tac(global_tracking, instructions)?;
+            }
             AstStatementType::Null => {}
         }
 
@@ -1405,6 +1618,52 @@ impl FmtNode for AstStatement {
                     writeln!(f, "{}:", ast_loop_end_label.0)?;
                     Self::write_indent(f, indent_levels)?;
                 }
+            }
+            AstStatementType::Switch(
+                condition_expr,
+                body_statement,
+                ast_body_end_label_opt,
+                _cases,
+            ) => {
+                write!(f, "switch (")?;
+
+                condition_expr.fmt_node(f, indent_levels)?;
+                writeln!(f, ")")?;
+
+                body_statement.fmt_node(f, indent_levels + 1)?;
+
+                writeln!(f)?;
+                Self::write_indent(f, indent_levels)?;
+
+                // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
+                // will jump to.
+                if let Some(ast_body_end_label) = ast_body_end_label_opt {
+                    writeln!(f, "{}:", ast_body_end_label.0)?;
+                    Self::write_indent(f, indent_levels)?;
+                }
+            }
+            AstStatementType::SwitchCase(
+                SwitchCase {
+                    expr_opt,
+                    label_opt,
+                },
+                statement,
+            ) => {
+                if let Some(expr) = expr_opt {
+                    write!(f, "case ")?;
+                    expr.fmt_node(f, indent_levels)?;
+                    write!(f, ":")?;
+
+                    if let Some(label) = label_opt {
+                        write!(f, " {}:", label.0)?;
+                    }
+
+                    writeln!(f)?;
+                } else {
+                    writeln!(f, "default:")?;
+                }
+
+                statement.fmt_node(f, indent_levels)?;
             }
             AstStatementType::Goto(label) => {
                 write!(f, "goto {}", label.0)?;
@@ -1784,12 +2043,88 @@ impl std::str::FromStr for AstBinaryOperator {
 }
 
 impl AstExpression {
+    #[instrument(target = "consteval", level = "debug")]
+    fn eval_i32_constant(&self) -> Result<i32, String> {
+        match self {
+            AstExpression::Constant(num) => Ok(*num as i32),
+            AstExpression::UnaryOperator(ast_unary_op, ast_expr) => {
+                let val = ast_expr.eval_i32_constant()?;
+                // TODO: decent chance this isn't a robust and full-fidelity emulation of how it should act in C.
+                match ast_unary_op {
+                    AstUnaryOperator::Negation => Ok(val * -1),
+                    AstUnaryOperator::BitwiseNot => Ok(!val),
+                    AstUnaryOperator::Not => Ok(if val == 0 { 1 } else { 0 }),
+                    AstUnaryOperator::PrefixIncrement
+                    | AstUnaryOperator::PrefixDecrement
+                    | AstUnaryOperator::PostfixIncrement
+                    | AstUnaryOperator::PostfixDecrement => Err(format!(
+                        "cannot evaluate constant expression with {} operator",
+                        display_with(|f| ast_unary_op.fmt_node(f, 0))
+                    )),
+                }
+            }
+            AstExpression::BinaryOperator(ast_exp_left, ast_binary_op, ast_exp_right) => {
+                let left_val = ast_exp_left.eval_i32_constant()?;
+                let right_val = ast_exp_right.eval_i32_constant()?;
+
+                // TODO: decent chance this isn't a robust and full-fidelity emulation of how it should act in C,
+                // especially at overflow/underflow/boundaries.
+                match ast_binary_op {
+                    AstBinaryOperator::Add => Ok(left_val + right_val),
+                    AstBinaryOperator::Subtract => Ok(left_val - right_val),
+                    AstBinaryOperator::Multiply => Ok(left_val * right_val),
+                    AstBinaryOperator::Divide => Ok(left_val / right_val),
+                    AstBinaryOperator::Modulus => Ok(left_val % right_val),
+                    AstBinaryOperator::BitwiseAnd => Ok(left_val & right_val),
+                    AstBinaryOperator::BitwiseOr => Ok(left_val | right_val),
+                    AstBinaryOperator::BitwiseXor => Ok(left_val ^ right_val),
+                    AstBinaryOperator::ShiftLeft => Ok(left_val << right_val),
+                    AstBinaryOperator::ShiftRight => Ok(left_val >> right_val),
+                    AstBinaryOperator::And => Ok((left_val != 0 && right_val != 0) as i32),
+                    AstBinaryOperator::Or => Ok((left_val != 0 || right_val != 0) as i32),
+                    AstBinaryOperator::Equal => Ok((left_val == right_val) as i32),
+                    AstBinaryOperator::NotEqual => Ok((left_val != right_val) as i32),
+                    AstBinaryOperator::LessThan => Ok((left_val < right_val) as i32),
+                    AstBinaryOperator::LessOrEqual => Ok((left_val <= right_val) as i32),
+                    AstBinaryOperator::GreaterThan => Ok((left_val > right_val) as i32),
+                    AstBinaryOperator::GreaterOrEqual => Ok((left_val >= right_val) as i32),
+                    AstBinaryOperator::Assign
+                    | AstBinaryOperator::AddAssign
+                    | AstBinaryOperator::SubtractAssign
+                    | AstBinaryOperator::MultiplyAssign
+                    | AstBinaryOperator::DivideAssign
+                    | AstBinaryOperator::ModulusAssign
+                    | AstBinaryOperator::BitwiseAndAssign
+                    | AstBinaryOperator::BitwiseOrAssign
+                    | AstBinaryOperator::BitwiseXorAssign
+                    | AstBinaryOperator::ShiftLeftAssign
+                    | AstBinaryOperator::ShiftRightAssign
+                    | AstBinaryOperator::Conditional => {
+                        panic!("should have been handled elsewhere")
+                    }
+                }
+            }
+            AstExpression::Var(_) => {
+                Err(format!("cannot evaluate constant expression with variable"))
+            }
+            AstExpression::Assignment(_, _, _) => {
+                Err(format!("cannot evaluate constant expression with variable"))
+            }
+            AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
+                let left_val = ast_exp_left.eval_i32_constant()?;
+                let middle_val = ast_exp_middle.eval_i32_constant()?;
+                let right_val = ast_exp_right.eval_i32_constant()?;
+                Ok(if left_val != 0 { middle_val } else { right_val })
+            }
+        }
+    }
+
     fn validate_and_resolve_variables(
         &mut self,
         block_tracking: &mut BlockTracking,
     ) -> Result<(), String> {
         match self {
-            AstExpression::Constant(num) => {}
+            AstExpression::Constant(_num) => {}
             AstExpression::UnaryOperator(ast_unary_op, ast_exp_inner) => {
                 match ast_unary_op {
                     AstUnaryOperator::PrefixIncrement
@@ -2267,6 +2602,10 @@ impl TacInstruction {
                     label.to_asm()?,
                 ));
             }
+            TacInstruction::JumpIfEqual(val1, val2, label) => {
+                func_body.push(AsmInstruction::Cmp(val1.to_asm()?, val2.to_asm()?));
+                func_body.push(AsmInstruction::JmpCc(AsmCondCode::E, label.to_asm()?));
+            }
             TacInstruction::Label(label) => {
                 func_body.push(AsmInstruction::Label(label.to_asm()?));
             }
@@ -2317,6 +2656,12 @@ impl FmtNode for TacInstruction {
                 write!(f, "jump :{} if ", label.0)?;
                 val.fmt_node(f, 0)?;
                 write!(f, " != 0")?;
+            }
+            TacInstruction::JumpIfEqual(val1, val2, label) => {
+                write!(f, "jump :{} if ", label.0)?;
+                val1.fmt_node(f, 0)?;
+                write!(f, " == ")?;
+                val2.fmt_node(f, 0)?;
             }
             TacInstruction::Label(label) => {
                 writeln!(f)?;
@@ -3390,6 +3735,28 @@ impl BreakTracking {
             continue_label_opt,
         }
     }
+
+    fn find_continue_label(&self) -> Option<&AstLabel> {
+        // Walk the parent chain until we find the closest continue label.
+        if self.continue_label_opt.is_some() {
+            self.continue_label_opt.as_ref()
+        } else if let Some(parent) = self.parent_opt.as_ref() {
+            parent.find_continue_label()
+        } else {
+            None
+        }
+    }
+}
+
+impl SwitchTracking {
+    fn new(parent_opt: Option<Box<SwitchTracking>>) -> Self {
+        Self {
+            parent_opt,
+            is_default_case_found: false,
+            case_values: HashSet::new(),
+            cases: Vec::new(),
+        }
+    }
 }
 
 impl FuncStackFrame {
@@ -3522,7 +3889,7 @@ fn parse_block<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlock,
     let mut body = vec![];
 
     loop {
-        if let Ok(operator) = tokens.consume_expected_next_token("}") {
+        if tokens.consume_expected_next_token("}").is_ok() {
             break;
         }
 
@@ -3608,6 +3975,34 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
         let st = AstStatementType::Continue(None);
         tokens.consume_expected_next_token(";")?;
         st
+    } else if tokens.consume_expected_next_token("switch").is_ok() {
+        tokens.consume_expected_next_token("(")?;
+        let condition_expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(")")?;
+        let body_statement = parse_statement(&mut tokens)?;
+
+        AstStatementType::Switch(condition_expr, Box::new(body_statement), None, Vec::new())
+    } else if tokens.consume_expected_next_token("case").is_ok() {
+        let expr = parse_expression(&mut tokens)?;
+        tokens.consume_expected_next_token(":")?;
+
+        AstStatementType::SwitchCase(
+            SwitchCase {
+                expr_opt: Some(expr),
+                label_opt: None,
+            },
+            Box::new(parse_statement(&mut tokens)?),
+        )
+    } else if tokens.consume_expected_next_token("default").is_ok() {
+        tokens.consume_expected_next_token(":")?;
+
+        AstStatementType::SwitchCase(
+            SwitchCase {
+                expr_opt: None,
+                label_opt: None,
+            },
+            Box::new(parse_statement(&mut tokens)?),
+        )
     } else {
         let st = AstStatementType::Expr(parse_expression(&mut tokens)?);
         tokens.consume_expected_next_token(";")?;
@@ -3722,6 +4117,7 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
     ) -> Result<AstExpression, String> {
         // Always try for at least one factor in an expression.
         let mut left = parse_factor(original_tokens)?;
+        debug!(target: "parse", expr = %DisplayFmtNode(&left), "parsed expression");
 
         // The tokens we clone here might be committed, or we might not find a valid expression within.
         let mut tokens = original_tokens.clone();
@@ -3793,6 +4189,8 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
                             );
                         }
                     }
+
+                    debug!(target: "parse", expr = %DisplayFmtNode(&left), "parsed expression");
 
                     // Since we successfully consumed an expression, commit the tokens we consumed for this.
                     *original_tokens = tokens.clone();
@@ -4002,7 +4400,7 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
         AstProgram::new(functions)
     };
 
-    info!("AST:\n{}", display_with(|f| ast.fmt_node(f, 0)));
+    info!(target: "parse", ast = %DisplayFmtNode(&ast));
 
     if tokens.0.len() != 0 {
         return Err(vec![format!(
@@ -4017,10 +4415,7 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
 
     ast.validate_and_resolve()?;
 
-    info!(
-        "AST after resolve:\n{}",
-        display_with(|f| ast.fmt_node(f, 0))
-    );
+    info!(target: "resolve", ast = %DisplayFmtNode(&ast), "AST after resolve");
 
     Ok(ast)
 }
@@ -4060,6 +4455,7 @@ fn compile_and_link(
     args: &LcArgs,
     input: &str,
     should_suppress_output: bool,
+    should_expect_success: bool,
 ) -> Result<i32, String> {
     fn helper(
         args: &LcArgs,
@@ -4119,7 +4515,9 @@ fn compile_and_link(
     let temp_dir = Path::new(&temp_dir_name);
     std::fs::create_dir_all(&temp_dir);
     let ret = helper(args, input, should_suppress_output, temp_dir);
-    if ret.is_ok() {
+
+    // Remove the temp dir if the compile result matches what the caller was expecting.
+    if ret.is_ok() == should_expect_success {
         debug!("cleaning up temp dir {}", temp_dir.to_string_lossy());
         std::fs::remove_dir_all(&temp_dir);
     }
@@ -4189,7 +4587,7 @@ fn main() {
     info!("Loading {}", args.input_path);
     let input = std::fs::read_to_string(&args.input_path).unwrap();
 
-    let exit_code = match compile_and_link(&args, &input, false) {
+    let exit_code = match compile_and_link(&args, &input, false, true) {
         Ok(inner_exit_code) => inner_exit_code,
         Err(msg) => {
             println!("error! {}", msg);
@@ -4201,2638 +4599,4 @@ fn main() {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-
-    macro_rules! test {
-        ($name:ident $body:block) => {
-            #[test]
-            fn $name() {
-                let _ = Registry::default()
-                    .with(
-                        tracing_forest::ForestLayer::new(
-                            tracing_forest::printer::TestCapturePrinter::new(),
-                            tracing_forest::tag::NoTag,
-                        )
-                        .with_filter(EnvFilter::from_default_env()),
-                    )
-                    .try_init();
-
-                $body
-            }
-        };
-    }
-
-    mod lex {
-        use super::*;
-
-        test!(simple {
-            let input = r"int main() {
-        return 2;
-    }";
-            assert_eq!(
-                lex_all_tokens(&input),
-                Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
-            );
-        });
-
-        test!(no_whitespace {
-            let input = r"int main(){return 2;}";
-            assert_eq!(
-                lex_all_tokens(&input),
-                Ok(vec!["int", "main", "(", ")", "{", "return", "2", ";", "}"])
-            );
-        });
-
-        test!(negative {
-            assert_eq!(
-                lex_all_tokens("int main() { return -1; }"),
-                Ok(vec![
-                    "int", "main", "(", ")", "{", "return", "-", "1", ";", "}"
-                ])
-            );
-        });
-
-        test!(bitwise_not {
-            assert_eq!(
-                lex_all_tokens("int main() { return ~1; }"),
-                Ok(vec![
-                    "int", "main", "(", ")", "{", "return", "~", "1", ";", "}"
-                ])
-            );
-        });
-
-        test!(logical_not {
-            assert_eq!(
-                lex_all_tokens("int main() { return !1; }"),
-                Ok(vec![
-                    "int", "main", "(", ")", "{", "return", "!", "1", ";", "}"
-                ])
-            );
-        });
-
-        test!(no_at {
-            assert!(lex_all_tokens("int main() { return 0@1; }").is_err());
-        });
-
-        test!(no_backslash {
-            assert!(lex_all_tokens("\\").is_err());
-        });
-
-        test!(no_backtick {
-            assert!(lex_all_tokens("`").is_err());
-        });
-
-        test!(bad_identifier {
-            assert!(lex_all_tokens("int main() { return 1foo; }").is_err());
-        });
-
-        test!(no_at_identifier {
-            assert!(lex_all_tokens("int main() { return @b; }").is_err());
-        });
-    }
-
-    fn codegen_run_and_check_exit_code_or_compile_failure(
-        input: &str,
-        expected_result: Option<i32>,
-    ) {
-        let args = LcArgs {
-            input_path: String::new(),
-            output_path: Some(format!("test_{}.exe", generate_random_string(8))),
-            mode: Mode::All,
-            verbose: true,
-        };
-
-        let compile_result = compile_and_link(&args, input, true);
-        if compile_result.is_ok() {
-            let exe_path_abs = Path::new(args.output_path.as_ref().unwrap())
-                .canonicalize()
-                .unwrap();
-            let exe_path_str = exe_path_abs.to_str().unwrap();
-            let mut pdb_path = exe_path_abs.clone();
-            pdb_path.set_extension("pdb");
-
-            if let Some(expected_exit_code) = expected_result {
-                let actual_exit_code = Command::new(exe_path_str)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .expect(&format!("failed to run {}", exe_path_str))
-                    .code()
-                    .expect("all processes must have exit code");
-
-                assert_eq!(expected_exit_code, actual_exit_code);
-                std::fs::remove_file(&exe_path_abs);
-                std::fs::remove_file(&pdb_path);
-            } else {
-                assert!(false, "compile succeeded but expected failure");
-            }
-        } else {
-            println!("compile failed! {:?}", compile_result);
-            assert!(expected_result.is_none());
-        }
-    }
-
-    fn validate_error_count(input: &str, expected_error_count: usize) {
-        match parse_and_validate(Mode::All, input) {
-            Ok(ast) => {
-                // If parsing succeeded, then the caller should have expected 0 errors.
-                assert_eq!(expected_error_count, 0);
-            }
-            Err(errors) => {
-                assert_eq!(expected_error_count, errors.len());
-            }
-        }
-    }
-
-    fn codegen_run_and_check_exit_code(input: &str, expected_exit_code: i32) {
-        codegen_run_and_check_exit_code_or_compile_failure(input, Some(expected_exit_code))
-    }
-
-    fn codegen_run_and_expect_compile_failure(input: &str) {
-        codegen_run_and_check_exit_code_or_compile_failure(input, None)
-    }
-
-    fn test_codegen_expression(expression: &str, expected_exit_code: i32) {
-        codegen_run_and_check_exit_code(
-            &format!("int main() {{ return {}; }}", expression),
-            expected_exit_code,
-        );
-    }
-
-    fn test_codegen_mainfunc(body: &str, expected_exit_code: i32) {
-        codegen_run_and_check_exit_code(
-            &format!("int main() {{\n{}\n}}", body),
-            expected_exit_code,
-        );
-    }
-
-    fn test_codegen_mainfunc_failure(body: &str) {
-        codegen_run_and_expect_compile_failure(&format!("int main() {{\n{}\n}}", body))
-    }
-
-    mod fail {
-        use super::*;
-
-        test!(parse_extra_paren {
-            test_codegen_mainfunc_failure("return (3));");
-        });
-
-        test!(parse_unclosed_paren {
-            test_codegen_mainfunc_failure("return (3;");
-        });
-
-        test!(parse_missing_immediate {
-            test_codegen_mainfunc_failure("return ~;");
-        });
-
-        test!(parse_missing_immediate_2 {
-            test_codegen_mainfunc_failure("return -~;");
-        });
-
-        test!(parse_missing_semicolon {
-            test_codegen_mainfunc_failure("return 5");
-        });
-
-        test!(parse_missing_semicolon_binary_op {
-            test_codegen_mainfunc_failure("return 5 + 6");
-        });
-
-        test!(parse_parens_around_operator {
-            test_codegen_mainfunc_failure("return (-)5;");
-        });
-
-        test!(parse_operator_wrong_order {
-            test_codegen_mainfunc_failure("return 5-;");
-        });
-
-        test!(parse_double_operator {
-            test_codegen_mainfunc_failure("return 1 * / 2;");
-        });
-
-        test!(parse_unbalanced_paren {
-            test_codegen_mainfunc_failure("return 1 + (2;");
-        });
-
-        test!(parse_missing_opening_paren {
-            test_codegen_mainfunc_failure("return 1 + 2);");
-        });
-
-        test!(parse_unexpected_paren {
-            test_codegen_mainfunc_failure("return 1 (- 2);");
-        });
-
-        test!(parse_misplaced_semicolon_paren {
-            test_codegen_mainfunc_failure("return 1 + (2;)");
-        });
-
-        test!(parse_missing_first_binary_operand {
-            test_codegen_mainfunc_failure("return / 2;");
-        });
-
-        test!(parse_missing_second_binary_operand {
-            test_codegen_mainfunc_failure("return 2 / ;");
-        });
-
-        test!(parse_relational_missing_first_operand {
-            test_codegen_mainfunc_failure("return <= 2;");
-        });
-
-        test!(parse_relational_missing_second_operand {
-            test_codegen_mainfunc_failure("return 1 < > 3;");
-        });
-
-        test!(parse_and_missing_second_operand {
-            test_codegen_mainfunc_failure("return 2 && ~;");
-        });
-
-        test!(parse_or_missing_semicolon {
-            test_codegen_mainfunc_failure("return 2 || 4");
-        });
-
-        test!(parse_unary_not_missing_semicolon {
-            test_codegen_mainfunc_failure("return !10");
-        });
-
-        test!(parse_double_bitwise_or {
-            test_codegen_mainfunc_failure("return 1 | | 2;");
-        });
-
-        test!(parse_unary_not_missing_operand {
-            test_codegen_mainfunc_failure("return 10 <= !;");
-        });
-
-        test!(duplicate_variable {
-            test_codegen_mainfunc_failure("int x = 5; int x = 4; return x;");
-        });
-
-        test!(duplicate_variable_after_use {
-            test_codegen_mainfunc_failure("int x = 5; return x; int x = 4; return x;");
-        });
-
-        test!(unknown_variable {
-            test_codegen_mainfunc_failure("return x;");
-        });
-
-        test!(unknown_variable_after_shortcircuit {
-            test_codegen_mainfunc_failure("return 0 && x;");
-        });
-
-        test!(unknown_variable_in_binary_op {
-            test_codegen_mainfunc_failure("return x < 5;");
-        });
-
-        test!(unknown_variable_in_bitwise_op {
-            test_codegen_mainfunc_failure("return a >> 2;");
-        });
-
-        test!(unknown_variable_in_unary_op {
-            test_codegen_mainfunc_failure("return -x;");
-        });
-
-        test!(unknown_variable_lhs_compound_assignment {
-            test_codegen_mainfunc_failure("a += 1; return 0;");
-        });
-
-        test!(unknown_variable_rhs_compound_assignment {
-            test_codegen_mainfunc_failure("int b = 10; b *= a; return 0;");
-        });
-
-        test!(malformed_plusequals {
-            test_codegen_mainfunc_failure("int a = 0; a + = 1; return a;");
-        });
-
-        test!(malformed_decrement {
-            test_codegen_mainfunc_failure("int a = 5; a - -; return a;");
-        });
-
-        test!(malformed_increment {
-            test_codegen_mainfunc_failure("int a = 5; a + +; return a;");
-        });
-
-        test!(malformed_less_equals {
-            test_codegen_mainfunc_failure("return 1 < = 2;");
-        });
-
-        test!(malformed_not_equals {
-            test_codegen_mainfunc_failure("return 1 ! = 2;");
-        });
-
-        test!(malformed_divide_equals {
-            test_codegen_mainfunc_failure("int a = 10; a =/ 5; return a;");
-        });
-
-        test!(missing_semicolon {
-            test_codegen_mainfunc_failure("int a = 5 a = a + 5; return a;");
-        });
-
-        test!(return_in_assignment {
-            test_codegen_mainfunc_failure("int a = return 5;");
-        });
-
-        test!(declare_keyword_as_var {
-            test_codegen_mainfunc_failure("int return = 6; return return + 1;");
-        });
-
-        test!(declare_after_use {
-            test_codegen_mainfunc_failure("a = 5; int a; return a;");
-        });
-
-        test!(invalid_lvalue_binary_op {
-            test_codegen_mainfunc_failure("int a = 5; a + 3 = 4; return a;");
-        });
-
-        test!(invalid_lvalue_unary_op {
-            test_codegen_mainfunc_failure("int a = 5; !a = 4; return a;");
-        });
-
-        test!(declare_invalid_var_name_with_space {
-            test_codegen_mainfunc_failure("int x y = 3; return y;");
-        });
-
-        test!(declare_invalid_var_name_starting_number {
-            test_codegen_mainfunc_failure("int 10 = 3; return 10;");
-            test_codegen_mainfunc_failure("int 10a = 3; return 10a;");
-        });
-
-        test!(declare_invalid_type_name {
-            test_codegen_mainfunc_failure("ints x = 3; return x;");
-        });
-
-        test!(invalid_mixed_precedence_assignment {
-            test_codegen_mainfunc_failure("int a = 1; int b = 2; a = 3 * b = a; return a;");
-        });
-
-        test!(compound_initializer {
-            test_codegen_mainfunc_failure("int a += 0; return a;");
-        });
-
-        test!(invalid_unary_lvalue {
-            test_codegen_mainfunc_failure("int a = 0; -a += 1; return a;");
-        });
-
-        test!(invalid_compound_lvalue {
-            test_codegen_mainfunc_failure("int a = 10; (a += 1) -= 2;");
-        });
-
-        test!(decrement_binary_op {
-            test_codegen_mainfunc_failure("int a = 0; return a -- 1;");
-        });
-
-        test!(increment_binary_op {
-            test_codegen_mainfunc_failure("int a = 0; return a ++ 1;");
-        });
-
-        test!(increment_declaration {
-            test_codegen_mainfunc_failure("int a++; return 0;");
-        });
-
-        test!(double_postfix {
-            test_codegen_mainfunc_failure("int a = 10; return a++--;");
-        });
-
-        test!(postfix_incr_non_lvalue {
-            test_codegen_mainfunc_failure("int a = 0; (a = 4)++;");
-        });
-
-        test!(prefix_incr_non_lvalue {
-            test_codegen_mainfunc_failure("int a = 1; ++(a+1); return 0;");
-        });
-
-        test!(prefix_decr_constant {
-            test_codegen_mainfunc_failure("return --3;");
-        });
-
-        test!(postfix_undeclared_var {
-            test_codegen_mainfunc_failure("a--; return 0;");
-        });
-
-        test!(prefix_undeclared_var {
-            test_codegen_mainfunc_failure("++a; return 0;");
-        });
-
-        test!(declaration_as_statement {
-            test_codegen_mainfunc_failure("if (5) int i = 0;");
-        });
-
-        test!(empty_if_body {
-            test_codegen_mainfunc_failure("if (0) else return 0;");
-        });
-
-        test!(if_as_assignment {
-            test_codegen_mainfunc_failure("int flag = 0; int a = if (flag) 2; else 3; return a;");
-        });
-
-        test!(if_no_parentheses {
-            test_codegen_mainfunc_failure("if 0 return 1;");
-        });
-
-        test!(extra_else {
-            test_codegen_mainfunc_failure("if (1) return 1; else return 2; else return 3;");
-        });
-
-        test!(undeclared_var_in_if {
-            test_codegen_mainfunc_failure("if (1) return c; int c = 0;");
-        });
-
-        test!(incomplete_ternary {
-            test_codegen_mainfunc_failure("return 1 ? 2;");
-        });
-
-        test!(ternary_extra_left {
-            test_codegen_mainfunc_failure("return 1 ? 2 ? 3 : 4;");
-        });
-
-        test!(ternary_extra_right {
-            test_codegen_mainfunc_failure("return 1 ? 2 : 3 : 4;");
-        });
-
-        test!(ternary_wrong_delimiter {
-            test_codegen_mainfunc_failure("int x = 10; return x ? 1 = 2;");
-        });
-
-        test!(ternary_undeclared_var {
-            test_codegen_mainfunc_failure("return a > 0 ? 1 : 2; int a = 5;");
-        });
-
-        test!(ternary_invalid_assign {
-            test_codegen_mainfunc_failure(
-                r"
-            int a = 2;
-            int b = 1;
-            a > b ? a = 1 : a = 0;
-            return a;
-            ",
-            );
-        });
-
-        test!(keywords_as_var_identifier {
-            test_codegen_mainfunc_failure("int if = 0; return if;");
-            test_codegen_mainfunc_failure("int int = 0; return int;");
-            test_codegen_mainfunc_failure("int void = 0; return void;");
-            test_codegen_mainfunc_failure("int return = 0; return return;");
-        });
-
-        test!(extra_closing_brace {
-            test_codegen_mainfunc_failure("if(0){ return 1; }} return 2;");
-        });
-
-        test!(missing_closing_brace {
-            test_codegen_mainfunc_failure("if(0){ return 1; return 2;");
-        });
-
-        test!(missing_semicolon_in_block {
-            test_codegen_mainfunc_failure("int a = 4; { a = 5; return a }");
-        });
-
-        test!(block_in_ternary {
-            test_codegen_mainfunc_failure("int a; return 1 ? { a = 2 } : a = 4;");
-        });
-
-        test!(duplicate_var_declaration {
-            test_codegen_mainfunc_failure("{ int a; int a; }");
-        });
-
-        test!(use_var_after_scope {
-            test_codegen_mainfunc_failure("{ int a = 2; } return a;");
-        });
-
-        test!(use_var_before_declare {
-            test_codegen_mainfunc_failure("int a; { b = 10; } int b; return b;");
-        });
-
-        test!(duplicate_var_declaration_after_block {
-            test_codegen_mainfunc_failure(
-                r"
-    int a = 3;
-    {
-        a = 5;
-    }
-    int a = 2;
-    return a;
-            ",
-            );
-        });
-
-        test!(break_outside_loop {
-            test_codegen_mainfunc_failure(r"if (1) break;");
-        });
-
-        test!(continue_outside_loop {
-            test_codegen_mainfunc_failure(
-                r"
-    {
-        int a;
-        continue;
-    }
-    return 0;
-            ",
-            );
-        });
-    }
-
-    test!(unary_neg {
-        test_codegen_expression("-5", -5);
-    });
-
-    test!(unary_bitnot {
-        test_codegen_expression("~12", -13);
-    });
-
-    test!(unary_not {
-        test_codegen_expression("!5", 0);
-        test_codegen_expression("!0", 1);
-    });
-
-    test!(unary_neg_zero {
-        test_codegen_expression("-0", 0);
-    });
-
-    test!(unary_bitnot_zero {
-        test_codegen_expression("~0", -1);
-    });
-
-    test!(unary_neg_min_val {
-        test_codegen_expression("-2147483647", -2147483647);
-    });
-
-    test!(unary_bitnot_and_neg {
-        test_codegen_expression("~-3", 2);
-    });
-
-    test!(unary_bitnot_and_neg_zero {
-        test_codegen_expression("-~0", 1);
-    });
-
-    test!(unary_bitnot_and_neg_min_val {
-        test_codegen_expression("~-2147483647", 2147483646);
-    });
-
-    test!(unary_grouping_outside {
-        test_codegen_expression("(-2)", -2);
-    });
-
-    test!(unary_grouping_inside {
-        test_codegen_expression("~(2)", -3);
-    });
-
-    test!(unary_grouping_inside_and_outside {
-        test_codegen_expression("-(-4)", 4);
-    });
-
-    test!(unary_grouping_several {
-        test_codegen_expression("-((((((10))))))", -10);
-    });
-
-    test!(unary_not_and_neg {
-        test_codegen_expression("!-3", 0);
-    });
-
-    test!(unary_not_and_arithmetic {
-        test_codegen_expression("!(4-4)", 1);
-        test_codegen_expression("!(4 - 5)", 0);
-    });
-
-    test!(expression_binary_operation {
-        test_codegen_expression("5 + 6", 11);
-    });
-
-    test!(expression_negative_divide {
-        test_codegen_expression("-110 / 10", -11);
-    });
-
-    test!(expression_negative_multiply {
-        test_codegen_expression("10 * -11", -110);
-    });
-
-    test!(expression_factors_and_terms {
-        test_codegen_expression("(1 + 2 + 3 + 4) * (10 - 21)", -110);
-    });
-
-    test!(and_false {
-        test_codegen_expression("(10 && 0) + (0 && 4) + (0 && 0)", 0);
-    });
-
-    test!(and_true {
-        test_codegen_expression("1 && -1", 1);
-    });
-
-    test!(and_shortcircuit {
-        test_codegen_expression("0 && (1 / 0)", 0);
-    });
-
-    test!(or_shortcircuit {
-        test_codegen_expression("1 || (1 / 0)", 1);
-    });
-
-    test!(multi_shortcircuit {
-        test_codegen_expression("0 || 0 && (1 / 0)", 0);
-    });
-
-    test!(and_or_precedence {
-        test_codegen_expression("1 || 0 && 2", 1);
-    });
-
-    test!(and_or_precedence_2 {
-        test_codegen_expression("(1 || 0) && 0", 0);
-    });
-
-    test!(relational_lt {
-        test_codegen_expression("1234 < 1234", 0);
-        test_codegen_expression("1234 < 1235", 1);
-    });
-
-    test!(relational_gt {
-        test_codegen_expression("1234 > 1234", 0);
-        test_codegen_expression("1234 > 1233", 1);
-        test_codegen_expression("(1 > 2) + (1 > 1)", 0);
-    });
-
-    test!(relational_le {
-        test_codegen_expression("1234 <= 1234", 1);
-        test_codegen_expression("1234 <= 1233", 0);
-        test_codegen_expression("1 <= -1", 0);
-        test_codegen_expression("(0 <= 2) + (0 <= 0)", 2);
-    });
-
-    test!(relational_ge {
-        test_codegen_expression("1234 >= 1234", 1);
-        test_codegen_expression("1234 >= 1235", 0);
-        test_codegen_expression("(1 >= 1) + (1 >= -4)", 2);
-    });
-
-    test!(equality_eq {
-        test_codegen_expression("1234 == 1234", 1);
-        test_codegen_expression("1234 == 1235", 0);
-    });
-
-    test!(equality_ne {
-        test_codegen_expression("1234 != 1234", 0);
-        test_codegen_expression("1234 != 1235", 1);
-    });
-
-    test!(logical_and {
-        test_codegen_expression("0 && 1 && 2", 0);
-        test_codegen_expression("5 && 6 && 7", 1);
-        test_codegen_expression("5 && 6 && 0", 0);
-    });
-
-    test!(logical_or {
-        test_codegen_expression("0 || 0 || 1", 1);
-        test_codegen_expression("1 || 0 || 0", 1);
-        test_codegen_expression("0 || 0 || 0", 0);
-    });
-
-    test!(equals_precedence {
-        test_codegen_expression("0 == 0 != 0", 1);
-    });
-
-    test!(equals_relational_precedence {
-        test_codegen_expression("2 == 2 >= 0", 0);
-    });
-
-    test!(equals_or_precedence {
-        test_codegen_expression("2 == 2 || 0", 1);
-    });
-
-    test!(relational_associativity {
-        test_codegen_expression("5 >= 0 > 1 <= 0", 1);
-    });
-
-    test!(compare_arithmetic_results {
-        test_codegen_expression("~2 * -2 == 1 + 5", 1);
-    });
-
-    test!(all_operator_precedence {
-        test_codegen_expression("-1 * -2 + 3 >= 5 == 1 && (6 - 6) || 7", 1);
-    });
-
-    test!(all_operator_precedence_2 {
-        test_codegen_expression("(0 == 0 && 3 == 2 + 1 > 1) + 1", 1);
-    });
-
-    test!(arithmetic_operator_precedence {
-        test_codegen_expression("1 * 2 + 3 * -4", -10);
-    });
-
-    test!(arithmetic_operator_associativity_minus {
-        test_codegen_expression("5 - 2 - 1", 2);
-    });
-
-    test!(arithmetic_operator_associativity_div {
-        test_codegen_expression("12 / 3 / 2", 2);
-    });
-
-    test!(arithmetic_operator_associativity_grouping {
-        test_codegen_expression("(3 / 2 * 4) + (5 - 4 + 3)", 8);
-    });
-
-    test!(arithmetic_operator_associativity_grouping_2 {
-        test_codegen_expression("5 * 4 / 2 - 3 % (2 + 1)", 10);
-    });
-
-    test!(sub_neg {
-        test_codegen_expression("2- -1", 3);
-    });
-
-    test!(unop_add {
-        test_codegen_expression("~2 + 3", 0);
-    });
-
-    test!(unop_parens {
-        test_codegen_expression("~(1 + 2)", -4);
-    });
-
-    test!(modulus {
-        test_codegen_expression("10 % 3", 1);
-    });
-
-    test!(bitand_associativity {
-        test_codegen_expression("7 * 1 & 3 * 1", 3);
-    });
-
-    test!(or_xor_associativity {
-        test_codegen_expression("7 ^ 3 | 3 ^ 1", 6);
-    });
-
-    test!(and_xor_associativity {
-        test_codegen_expression("7 ^ 3 & 6 ^ 2", 7);
-    });
-
-    test!(shl_immediate {
-        test_codegen_expression("5 << 2", 20);
-    });
-
-    test!(shl_tempvar {
-        test_codegen_expression("5 << (2 * 1)", 20);
-    });
-
-    test!(sar_immediate {
-        test_codegen_expression("20 >> 2", 5);
-    });
-
-    test!(sar_tempvar {
-        test_codegen_expression("20 >> (2 * 1)", 5);
-    });
-
-    test!(shift_associativity {
-        test_codegen_expression("33 << 4 >> 2", 132);
-    });
-
-    test!(shift_associativity_2 {
-        test_codegen_expression("33 >> 2 << 1", 16);
-    });
-
-    test!(shift_precedence {
-        test_codegen_expression("40 << 4 + 12 >> 1", 0x00140000);
-    });
-
-    test!(sar_negative {
-        test_codegen_expression("-5 >> 1", -3);
-    });
-
-    test!(bitwise_precedence {
-        test_codegen_expression("80 >> 2 | 1 ^ 5 & 7 << 1", 21);
-    });
-
-    test!(arithmetic_and_booleans {
-        test_codegen_expression("~(0 && 1) - -(4 || 3)", 0);
-    });
-
-    test!(bitand_equals_precedence {
-        test_codegen_expression("4 & 7 == 4", 0);
-    });
-
-    test!(bitor_notequals_precedence {
-        test_codegen_expression("4 | 7 != 4", 5);
-    });
-
-    test!(shift_relational_precedence {
-        test_codegen_expression("20 >> 4 <= 3 << 1", 1);
-    });
-
-    test!(xor_relational_precedence {
-        test_codegen_expression("5 ^ 7 < 5", 5);
-    });
-
-    test!(var_use {
-        test_codegen_mainfunc(
-            "int _x = 5; int y = 6; int z; _x = 1; z = 3; return _x + y + z;",
-            10,
-        );
-    });
-
-    test!(assign_expr {
-        test_codegen_mainfunc("int x = 5; int y = x = 3 + 1; return x + y;", 8);
-    });
-
-    test!(declaration_after_expression {
-        test_codegen_mainfunc("int x; x = 5; int y = -x; return y;", -5);
-    });
-
-    test!(mixed_precedence_assignment {
-        test_codegen_mainfunc("int x = 5; int y = 4; x = 3 * (y = x); return x + y;", 20);
-    });
-
-    test!(assign_after_not_short_circuit_or {
-        test_codegen_mainfunc("int x = 0; 0 || (x = 1); return x;", 1);
-    });
-
-    test!(assign_after_short_circuit_and {
-        test_codegen_mainfunc("int x = 0; 0 && (x = 1); return x;", 0);
-    });
-
-    test!(assign_after_short_circuit_or {
-        test_codegen_mainfunc("int x = 0; 1 || (x = 1); return x;", 0);
-    });
-
-    test!(assign_low_precedence {
-        test_codegen_mainfunc("int x; x = 0 || 5; return x;", 1);
-    });
-
-    test!(assign_var_in_initializer {
-        test_codegen_mainfunc("int x = x + 5; return x;", 5);
-    });
-
-    test!(empty_main_body {
-        test_codegen_mainfunc("", 0);
-    });
-
-    test!(null_statement {
-        test_codegen_mainfunc(";", 0);
-    });
-
-    test!(null_then_return {
-        test_codegen_mainfunc("; return 1;", 1);
-    });
-
-    test!(empty_expression {
-        test_codegen_mainfunc("return 0;;;", 0);
-    });
-
-    test!(unused_expression {
-        test_codegen_mainfunc("2 + 2; return 0;", 0);
-    });
-
-    test!(bitwise_in_initializer {
-        test_codegen_mainfunc(
-            r"
-    int a = 15;
-    int b = a ^ 5;  // 10
-    return 1 | b;   // 11",
-            11,
-        );
-    });
-
-    test!(bitwise_ops_vars {
-        test_codegen_mainfunc("int a = 3; int b = 5; int c = 8; return a & b | c;", 9);
-    });
-
-    test!(bitwise_shl_var {
-        test_codegen_mainfunc("int x = 3; return x << 3;", 24);
-    });
-
-    test!(bitwise_sar_assign {
-        test_codegen_mainfunc(
-            "int var_to_shift = 1234; int x = 0; x = var_to_shift >> 4; return x;",
-            77,
-        );
-    });
-
-    test!(compound_bitwise_and {
-        test_codegen_mainfunc("int to_and = 3; to_and &= 6; return to_and;", 2);
-    });
-
-    test!(compound_bitwise_or {
-        test_codegen_mainfunc("int to_or = 1; to_or |= 30; return to_or;", 31);
-    });
-
-    test!(compound_bitwise_shl {
-        test_codegen_mainfunc("int to_shiftl = 3; to_shiftl <<= 4; return to_shiftl;", 48);
-    });
-
-    test!(compound_bitwise_sar {
-        test_codegen_mainfunc(
-            "int to_shiftr = 382574; to_shiftr >>= 4; return to_shiftr;",
-            23910,
-        );
-    });
-
-    test!(compound_bitwise_xor {
-        test_codegen_mainfunc("int to_xor = 7; to_xor ^= 5; return to_xor;", 2);
-    });
-
-    test!(compound_div {
-        test_codegen_mainfunc("int to_divide = 8; to_divide /= 4; return to_divide;", 2);
-    });
-
-    test!(compound_subtract {
-        test_codegen_mainfunc(
-            "int to_subtract = 10; to_subtract -= 8; return to_subtract;",
-            2,
-        );
-    });
-
-    test!(compound_mod {
-        test_codegen_mainfunc("int to_mod = 5; to_mod %= 3; return to_mod;", 2);
-    });
-
-    test!(compound_mult {
-        test_codegen_mainfunc(
-            "int to_multiply = 4; to_multiply *= 3; return to_multiply;",
-            12,
-        );
-    });
-
-    test!(compound_add {
-        test_codegen_mainfunc("int to_add = 0; to_add += 4; return to_add;", 4);
-    });
-
-    test!(compound_assignment_chained {
-        test_codegen_mainfunc(
-            r"
-    int a = 250;
-    int b = 200;
-    int c = 100;
-    int d = 75;
-    int e = -25;
-    int f = 0;
-    int x = 0;
-    x = a += b -= c *= d /= e %= f = -7;
-    return a == 2250 && b == 2000 && c == -1800 && d == -18 && e == -4 &&
-           f == -7 && x == 2250;
-           ",
-            1,
-        );
-    });
-
-    test!(compound_bitwise_assignment_chained {
-        test_codegen_mainfunc(
-            r"
-    int a = 250;
-    int b = 200;
-    int c = 100;
-    int d = 75;
-    int e = 50;
-    int f = 25;
-    int g = 10;
-    int h = 1;
-    int j = 0;
-    int x = 0;
-    x = a &= b *= c |= d = e ^= f += g >>= h <<= j = 1;
-    return (a == 40 && b == 21800 && c == 109 && d == 41 && e == 41 &&
-            f == 27 && g == 2 && h == 2 && j == 1 && x == 40);
-           ",
-            1,
-        );
-    });
-
-    test!(compound_assignment_lowest_precedence {
-        test_codegen_mainfunc(
-            r"
-    int a = 10;
-    int b = 12;
-    a += 0 || b;  // a = 11
-    b *= a && 0;  // b = 0
-
-    int c = 14;
-    c -= a || b;  // c = 13
-
-    int d = 16;
-    d /= c || d; // d = 16
-    return (a == 11 && b == 0 && c == 13 && d == 16);
-    ",
-            1,
-        );
-    });
-
-    test!(compound_bitwise_assignment_lowest_precedence {
-        test_codegen_mainfunc(
-            r"
-    int a = 11;
-    int b = 12;
-    a &= 0 || b;  // a = 1
-    b ^= a || 1;  // b = 13
-
-    int c = 14;
-    c |= a || b;  // c = 15
-
-    int d = 16;
-    d >>= c || d;  // d = 8
-
-    int e = 18;
-    e <<= c || d; // e = 36
-    return (a == 1 && b == 13 && c == 15 && d == 8 && e == 36);
-    ",
-            1,
-        );
-    });
-
-    test!(increment_decrement_expressions {
-        test_codegen_mainfunc(
-            "int a = 0; int b = 0; a++; ++a; b--; --b; return (a == 2 && b == -2);",
-            1,
-        );
-    });
-
-    test!(incr_decr_in_binary_expressions {
-        test_codegen_mainfunc(
-            r"
-    int a = 2;
-    int b = 3 + a++;
-    int c = 4 + ++b;
-    return (a == 3 && b == 6 && c == 10);
-    ",
-            1,
-        );
-    });
-
-    test!(incr_decr_parentheses {
-        test_codegen_mainfunc(
-            r"
-    int a = 1;
-    int b = 2;
-    int c = -++(a);
-    int d = !(b)--;
-    return (a == 2 && b == 1 && c == -2 && d == 0);
-    ",
-            1,
-        );
-    });
-
-    test!(if_assign {
-        test_codegen_mainfunc("int x = 5; if (x == 5) x = 4; return x;", 4);
-    });
-
-    test!(if_else_assign {
-        test_codegen_mainfunc(
-            "int x = 5; if (x == 5) x = 4; else x == 6; if (x == 6) x = 7; else x = 8; return x;",
-            8,
-        );
-    });
-
-    test!(if_binary_op_in_condition_true {
-        test_codegen_mainfunc("if (1 + 2 == 3) return 5;", 5);
-    });
-
-    test!(if_binary_op_in_condition_false {
-        test_codegen_mainfunc("if (1 + 2 == 4) return 5;", 0);
-    });
-
-    test!(if_else_if {
-        test_codegen_mainfunc(
-            r"
-    int a = 1;
-    int b = 0;
-    if (a)
-        b = 1;
-    else if (b)
-        b = 2;
-    return b;
-    ",
-            1,
-        );
-    });
-
-    test!(if_else_if_nested_execute_else {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    int b = 1;
-    if (a)
-        b = 1;
-    else if (~b)
-        b = 2;
-    return b;
-    ",
-            2,
-        );
-    });
-
-    test!(if_nested_twice {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    if ( (a = 1) )
-        if (a == 1)
-            a = 3;
-        else
-            a = 4;
-    return a;
-    ",
-            3,
-        );
-    });
-
-    test!(if_nested_twice_execute_else {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    if (!a)
-        if (3 / 4)
-            a = 3;
-        else
-            a = 8 / 2;
-    return a;
-    ",
-            4,
-        );
-    });
-
-    test!(nested_else_execute_outer_else {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    if (0)
-        if (0)
-            a = 3;
-        else
-            a = 4;
-    else
-        a = 1;
-    return a;
-    ",
-            1,
-        );
-    });
-
-    test!(if_null_body {
-        test_codegen_mainfunc(
-            r"
-    int x = 0;
-    if (0)
-        ;
-    else
-        x = 1;
-    return x;
-    ",
-            1,
-        );
-    });
-
-    test!(multiple_if_else {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    int b = 0;
-
-    if (a)
-        a = 2;
-    else
-        a = 3;
-
-    if (b)
-        b = 4;
-    else
-        b = 5;
-
-    return a + b;
-    ",
-            8,
-        );
-    });
-
-    test!(if_compound_assignment_in_condition {
-        test_codegen_mainfunc("int a = 0; if (a += 1) return a; return 10;", 1);
-    });
-
-    test!(if_postfix_in_condition {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    if (a--)
-        return 0;
-    else if (a--)
-        return 1;
-    return 0;
-    ",
-            1,
-        );
-    });
-
-    test!(if_prefix_in_condition {
-        test_codegen_mainfunc(
-            r"
-    int a = -1;
-    if (++a)
-        return 0;
-    else if (++a)
-        return 1;
-    return 0;
-    ",
-            1,
-        );
-    });
-
-    test!(assign_ternary {
-        test_codegen_mainfunc("int a = 0; a = 1 ? 2 : 3; return a;", 2);
-    });
-
-    test!(ternary_binary_op_in_middle {
-        test_codegen_mainfunc("int a = 1 ? 3 % 2 : 4; return a;", 1);
-    });
-
-    test!(ternary_logical_or_precedence {
-        test_codegen_mainfunc("int a = 10; return a || 0 ? 20 : 0;", 20);
-    });
-
-    test!(ternary_logical_or_precedence_right {
-        test_codegen_mainfunc("return 0 ? 1 : 0 || 2;", 1);
-    });
-
-    test!(ternary_in_assignment {
-        test_codegen_mainfunc(
-            r"
-    int x = 0;
-    int y = 0;
-    y = (x = 5) ? x : 2;
-    return (x == 5 && y == 5);
-    ",
-            1,
-        );
-    });
-
-    test!(nested_ternary {
-        test_codegen_mainfunc(
-            r"
-    int a = 1;
-    int b = 2;
-    int flag = 0;
-    return a > b ? 5 : flag ? 6 : 7;
-    ",
-            7,
-        );
-    });
-
-    test!(nested_ternary_literals {
-        test_codegen_mainfunc(
-            r"
-    int a = 1 ? 2 ? 3 : 4 : 5;
-    int b = 0 ? 2 ? 3 : 4 : 5;
-    return a * b;
-    ",
-            15,
-        );
-    });
-
-    test!(ternary_assignment_rhs {
-        test_codegen_mainfunc(
-            r"
-    int flag = 1;
-    int a = 0;
-    flag ? a = 1 : (a = 0);
-    return a;
-    ",
-            1,
-        );
-    });
-
-    mod goto {
-        use super::*;
-
-        test!(skip_declaration {
-            test_codegen_mainfunc(
-                r"
-    int x = 1;
-    goto post_declaration;
-    // we skip over initializer, so it's not executed
-    int i = (x = 0);
-
-    post_declaration:
-    // even though we didn't initialize i, it's in scope, so we can use it
-    i = 5;
-    return (x == 1 && i == 5);
-            ",
-                1,
-            );
-        });
-
-        test!(same_as_var_name {
-            test_codegen_mainfunc(
-                r"
-    // it's valid to use the same identifier as a variable and label
-    int ident = 5;
-    goto ident;
-    return 0;
-ident:
-    return ident;
-            ",
-                5,
-            );
-        });
-
-        test!(same_as_func_name {
-            test_codegen_mainfunc(
-                r"
-    // it's legal to use main as both a function name and label
-    goto main;
-    return 5;
-main:
-    return 0;
-            ",
-                0,
-            );
-        });
-
-        test!(nested_label {
-            test_codegen_mainfunc(
-                r"
-    goto labelB;
-
-    labelA:
-        labelB:
-            return 5;
-    return 0;
-            ",
-                5,
-            );
-        });
-
-        test!(label_all_statements {
-            test_codegen_mainfunc(
-                r"
-    int a = 1;
-label_if:
-    if (a)
-        goto label_expression;
-    else
-        goto label_empty;
-
-label_goto:
-    goto label_return;
-
-    if (0)
-    label_expression:
-        a = 0;
-
-    goto label_if;
-
-label_return:
-    return a;
-
-label_empty:;
-    a = 100;
-    goto label_goto;
-            ",
-                100,
-            );
-        });
-
-        test!(label_name {
-            test_codegen_mainfunc(
-                r"
-    goto _foo_1_;  // a label may include numbers and underscores
-    return 0;
-_foo_1_:
-    return 1;
-            ",
-                1,
-            );
-        });
-
-        test!(unused_label {
-            test_codegen_mainfunc(
-                r"
-unused:
-    return 0;
-            ",
-                0,
-            );
-        });
-
-        test!(whitespace_after_label {
-            test_codegen_mainfunc(
-                r"
-    goto label2;
-    return 0;
-    // okay to have space or newline between label and colon
-    label1 :
-    return 1;
-    label2
-    :
-    goto label1;
-            ",
-                1,
-            );
-        });
-
-        test!(goto_after_declaration {
-            test_codegen_mainfunc(
-                r"
-    int a = 0;
-    {
-        if (a != 0)
-            return_a:
-                return a;
-        int a = 4;
-        goto return_a;
-    }
-            ",
-                0,
-            );
-        });
-
-        test!(goto_inner_scope {
-            test_codegen_mainfunc(
-                r"
-    int x = 5;
-    goto inner;
-    {
-        int x = 0;
-        inner:
-        x = 1;
-        return x;
-    }
-            ",
-                1,
-            );
-        });
-
-        test!(goto_outer_scope {
-            test_codegen_mainfunc(
-                r"
-    int a = 10;
-    int b = 0;
-    if (a) {
-        int a = 1;
-        b = a;
-        goto end;
-    }
-    a = 9;
-end:
-    return (a == 10 && b == 1);
-            ",
-                1,
-            );
-        });
-
-        test!(jump_between_sibling_scopes {
-            test_codegen_mainfunc(
-                r"
-    int sum = 0;
-    if (1) {
-        int a = 5;
-        goto other_if;
-        sum = 0;  // not executed
-    first_if:
-        // when we jump back into block at this label, a is uninitialized, so we need to initialize it again
-        a = 5;
-        sum = sum + a;  // sum = 11
-    }
-    if (0) {
-    other_if:;
-        int a = 6;
-        sum = sum + a;  // sum = 6
-        goto first_if;
-        sum = 0;
-    }
-    return sum;
-            ",
-                11,
-            );
-        });
-
-        mod fail {
-            use super::*;
-
-            test!(label_name {
-                test_codegen_mainfunc_failure(r"0invalid_label: return 0;");
-            });
-
-            test!(label_keyword_name {
-                test_codegen_mainfunc_failure(r"return: return 0;");
-            });
-
-            test!(whitespace_after_label {
-                test_codegen_mainfunc_failure(
-                    r"
-    goto;
-lbl:
-    return 0;
-                ",
-                );
-            });
-
-            test!(label_declaration {
-                test_codegen_mainfunc_failure(
-                    r"
-// NOTE: this is a syntax error in C17 but valid in C23
-label:
-    int a = 0;
-                ",
-                );
-            });
-
-            test!(label_without_statement {
-                test_codegen_mainfunc_failure(
-                    r"
-    // NOTE: this is invalid in C17, but valid in C23
-    foo:
-                ",
-                );
-            });
-
-            test!(parenthesized_label {
-                test_codegen_mainfunc_failure(
-                    r"
-    goto(a);
-a:
-    return 0;
-                ",
-                );
-            });
-
-            test!(duplicate_label {
-                test_codegen_mainfunc_failure(
-                    r"
-    int x = 0;
-label:
-    x = 1;
-label:
-    return 2;
-                ",
-                );
-            });
-
-            test!(unknown_label {
-                test_codegen_mainfunc_failure(
-                    r"
-    goto label;
-    return 0;
-                ",
-                );
-            });
-
-            test!(variable_as_label {
-                test_codegen_mainfunc_failure(
-                    r"
-    int a;
-    goto a;
-    return 0;
-                ",
-                );
-            });
-
-            test!(undeclared_var_in_labeled_statement {
-                test_codegen_mainfunc_failure(
-                    r"
-lbl:
-    return a;
-    return 0;
-                ",
-                );
-            });
-
-            test!(label_as_variable {
-                test_codegen_mainfunc_failure(
-                    r"
-    int x = 0;
-    a:
-    x = a;
-    return 0;
-                ",
-                );
-            });
-
-            test!(label_in_expression {
-                test_codegen_mainfunc_failure(r"1 && label: 2;");
-            });
-
-            test!(label_outside_function {
-                codegen_run_and_expect_compile_failure(
-                    r"
-label:
-int main(void) {
-    return 0;
-}
-                ",
-                );
-            });
-
-            test!(different_label_same_scope {
-                test_codegen_mainfunc_failure(
-                    r"
-    // different labels do not define different scopes
-label1:;
-    int a = 10;
-label2:;
-    int a = 11;
-    return 1;
-                ",
-                );
-            });
-
-            test!(duplicate_labels_different_scopes {
-                test_codegen_mainfunc_failure(
-                    r"
-    int x = 0;
-    if (x) {
-        x = 5;
-        goto l;
-        return 0;
-        l:
-            return x;
-    } else {
-        goto l;
-        return 0;
-        l:
-            return x;
-    }
-                ",
-                );
-            });
-
-            test!(goto_use_before_declare {
-                test_codegen_mainfunc_failure(
-                    r"
-    int x = 0;
-    if (x != 0) {
-        return_y:
-        return y; // not declared
-    }
-    int y = 4;
-    goto return_y;
-                ",
-                );
-            });
-
-            test!(labeled_break_outside_loop {
-                test_codegen_mainfunc_failure(
-                    r"
-    // make sure our usual analysis of break/continue labels also traverses labeled statements
-    label: break;
-    return 0;
-                ",
-                );
-            });
-        }
-    }
-
-    test!(var_assign_to_self {
-        test_codegen_mainfunc(
-            r"
-    int a = 3;
-    {
-        int a = a = 4;
-        return a;
-    }
-        ",
-            4,
-        );
-    });
-
-    test!(var_assign_to_self_inner_block {
-        test_codegen_mainfunc(
-            r"
-    int a = 3;
-    {
-        int a = a = 4;
-    }
-    return a;
-        ",
-            3,
-        );
-    });
-
-    test!(var_assign_to_self_from_other_var_declaration_in_inner_block {
-        test_codegen_mainfunc(
-            r"
-    int a;
-    {
-        int b = a = 1;
-    }
-    return a;
-        ",
-            1,
-        );
-    });
-
-    test!(empty_blocks {
-        test_codegen_mainfunc(
-            r"
-    int ten = 10;
-    {}
-    int twenty = 10 * 2;
-    {{}}
-    return ten + twenty;
-        ",
-            30,
-        );
-    });
-
-    test!(var_hidden_then_visible {
-        test_codegen_mainfunc(
-            r"
-    int a = 2;
-    int b;
-    {
-        a = -4;
-        int a = 7;
-        b = a + 1;
-    }
-    return b == 8 && a == -4;
-        ",
-            1,
-        );
-    });
-
-    test!(var_shadowed {
-        test_codegen_mainfunc(
-            r"
-    int a = 2;
-    {
-        int a = 1;
-        return a;
-    }
-        ",
-            1,
-        );
-    });
-
-    test!(var_inner_uninitialized {
-        test_codegen_mainfunc(
-            r"
-    int x = 4;
-    {
-        int x;
-    }
-    return x;
-        ",
-            4,
-        );
-    });
-
-    test!(var_same_name_different_blocks {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    {
-        int b = 4;
-        a = b;
-    }
-    {
-        int b = 2;
-        a = a - b;
-    }
-    return a;
-        ",
-            2,
-        );
-    });
-
-    test!(nested_if_compound_statements {
-        test_codegen_mainfunc(
-            r"
-    int a = 0;
-    if (a) {
-        int b = 2;
-        return b;
-    } else {
-        int c = 3;
-        if (a < c) {
-            return !a;
-        } else {
-            return 5;
-        }
-    }
-    return a;
-        ",
-            1,
-        );
-    });
-
-    test!(nested_var_declarations {
-        test_codegen_mainfunc(
-            r"
-    int a; // a0
-    int result;
-    int a1 = 1; // a10
-    {
-        int a = 2; //a1
-        int a1 = 2; // a11
-        {
-            int a; // a2
-            {
-                int a; // a3
-                {
-                    int a; // a4
-                    {
-                        int a; // a5
-                        {
-                            int a; // a6
-                            {
-                                int a; // a7
-                                {
-                                    int a; // a8
-                                    {
-                                        int a; // a9
-                                        {
-                                            int a = 20; // a10
-                                            result = a;
-                                            {
-                                                int a; // a11
-                                                a = 5;
-                                                result = result + a;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        result = result + a1;
-    }
-    return result + a1;
-        ",
-            28,
-        );
-    });
-
-    mod loops {
-        use super::*;
-
-        mod for_loop {
-            use super::*;
-
-            test!(empty_header {
-                test_codegen_mainfunc(
-                    r"
-        int a = 0;
-        for (; ; ) {
-            a = a + 1;
-            if (a > 3)
-                break;
-        }
-
-        return a;
-                ",
-                    4,
-                );
-            });
-
-            test!(break_statement {
-                test_codegen_mainfunc(
-                    r"
-        int a = 10;
-        int b = 20;
-        for (b = -20; b < 0; b = b + 1) {
-            a = a - 1;
-            if (a <= 0)
-                break;
-        }
-
-        return a == 0 && b == -11;
-                ",
-                    1,
-                );
-            });
-
-            test!(continue_statement {
-                test_codegen_mainfunc(
-                    r"
-        int sum = 0;
-        int counter;
-        for (int i = 0; i <= 10; i = i + 1) {
-            counter = i;
-            if (i % 2 == 0)
-                continue;
-            sum = sum + 1;
-        }
-
-        return sum == 5 && counter == 10;
-                ",
-                    1,
-                );
-            });
-
-            test!(declaration {
-                test_codegen_mainfunc(
-                    r"
-        int a = 0;
-
-        for (int i = -100; i <= 0; i = i + 1)
-            a = a + 1;
-        return a;
-                ",
-                    101,
-                );
-            });
-
-            test!(shadow_declaration {
-                test_codegen_mainfunc(
-                    r"
-        int shadow = 1;
-        int acc = 0;
-        for (int shadow = 0; shadow < 10; shadow = shadow + 1) {
-            acc = acc + shadow;
-        }
-        return acc == 45 && shadow == 1;
-                ",
-                    1,
-                );
-            });
-
-            test!(nested_shadowed_declarations {
-                test_codegen_mainfunc(
-                    r"
-        int i = 0;
-        int j = 0;
-        int k = 1;
-        for (int i = 100; i > 0; i = i - 1) {
-            int i = 1;
-            int j = i + k;
-            k = j;
-        }
-
-        return k == 101 && i == 0 && j == 0;
-                ",
-                    1,
-                );
-            });
-
-            test!(no_post_expression {
-                test_codegen_mainfunc(
-                    r"
-        int a = -2147483647;
-        for (; a % 5 != 0;) {
-            a = a + 1;
-        }
-        return a % 5 == 0;
-                ",
-                    1,
-                );
-            });
-
-            test!(continue_with_no_post_expression {
-                test_codegen_mainfunc(
-                    r"
-        int sum = 0;
-        for (int i = 0; i < 10;) {
-            i = i + 1;
-            if (i % 2)
-                continue;
-            sum = sum + i;
-        }
-        return sum;
-                ",
-                    30,
-                );
-            });
-
-            test!(no_condition {
-                test_codegen_mainfunc(
-                    r"
-        for (int i = 400; ; i = i - 100)
-            if (i == 100)
-                return 0;
-                ",
-                    0,
-                );
-            });
-
-            test!(nested_break {
-                test_codegen_mainfunc(
-                    r"
-        int ans = 0;
-        for (int i = 0; i < 10; i = i + 1)
-            for (int j = 0; j < 10; j = j + 1)
-                if ((i / 2)*2 == i)
-                    break;
-                else
-                    ans = ans + i;
-        return ans;
-                ",
-                    250,
-                );
-            });
-
-            test!(compound_assignent_in_post_expression {
-                test_codegen_mainfunc(
-                    r"
-        int i = 1;
-        for (i *= -1; i >= -100; i -=3)
-            ;
-        return (i == -103);
-                ",
-                    1,
-                );
-            });
-
-            test!(jump_past_initializer {
-                test_codegen_mainfunc(
-                    r"
-        int i = 0;
-        goto target;
-        for (i = 5; i < 10; i = i + 1)
-        target:
-            if (i == 0)
-                return 1;
-        return 0;
-                ",
-                    1,
-                );
-            });
-
-            test!(jump_within_body {
-                test_codegen_mainfunc(
-                    r"
-        int sum = 0;
-        for (int i = 0;; i = 0) {
-        lbl:
-            sum = sum + 1;
-            i = i + 1;
-            if (i > 10)
-                break;
-            goto lbl;
-        }
-        return sum;
-                ",
-                    11,
-                );
-            });
-
-            mod fail {
-                use super::*;
-
-                test!(extra_header_clause {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (int i = 0; i < 10; i = i + 1; )
-            ;
-        return 0;
-                    ",
-                    );
-                });
-
-                test!(missing_header_clause {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (int i = 0;)
-            ;
-        return 0;
-                    ",
-                    );
-                });
-
-                test!(extra_parens {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (int i = 2; ))
-            int a = 0;
-                    ",
-                    );
-                });
-
-                test!(invalid_declaration_compound_assignment {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (int i += 1; i < 10; i += 1) {
-            return 0;
-        }
-                    ",
-                    );
-                });
-
-                test!(declaration_in_condition {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (; int i = 0; i = i + 1)
-            ;
-        return 0;
-                    ",
-                    );
-                });
-
-                test!(label_in_header {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (int i = 0; label: i < 10; i = i + 1) {
-            ;
-        }
-        return 0;
-                    ",
-                    );
-                });
-
-                test!(undeclared_variable {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (i = 0; i < 1; i = i + 1)
-        {
-            return 0;
-        }
-                    ",
-                    );
-                });
-
-                test!(reference_body_variable_in_condition {
-                    test_codegen_mainfunc_failure(
-                        r"
-        for (;; i++) {
-            int i = 0;
-        }
-                    ",
-                    );
-                });
-            }
-        }
-
-        mod while_loop {
-            use super::*;
-
-            test!(break_immediate {
-                test_codegen_mainfunc(
-                    r"
-        int a = 10;
-        while ((a = 1))
-            break;
-        return a;
-                ",
-                    1,
-                );
-            });
-
-            test!(multi_break {
-                test_codegen_mainfunc(
-                    r"
-        int i = 0;
-        while (1) {
-            i = i + 1;
-            if (i > 10)
-                break;
-        }
-        int j = 10;
-        while (1) {
-            j = j - 1;
-            if (j < 0)
-                break;
-        }
-        int result = j == -1 && i == 11;
-        return result;
-                ",
-                    1,
-                );
-            });
-
-            test!(nested_continue {
-                test_codegen_mainfunc(
-                    r"
-        int x = 5;
-        int acc = 0;
-        while (x >= 0) {
-            int i = x;
-            while (i <= 10) {
-                i = i + 1;
-                if (i % 2)
-                    continue;
-                acc = acc + 1;
-            }
-            x = x - 1;
-        }
-        return acc;
-                ",
-                    24,
-                );
-            });
-
-            test!(nested_loops {
-                test_codegen_mainfunc(
-                    r"
-        int acc = 0;
-        int x = 100;
-        while (x) {
-            int y = 10;
-            x = x - y;
-            while (y) {
-                acc = acc + 1;
-                y = y - 1;
-            }
-        }
-        return acc == 100 && x == 0;
-                ",
-                    1,
-                );
-            });
-
-            test!(labeled_body {
-                test_codegen_mainfunc(
-                    r"
-    int result = 0;
-    goto label;
-    while (0)
-    label: { result = 1; }
-
-    return result;
-                ",
-                    1,
-                );
-            });
-
-            test!(condition_postfix {
-                test_codegen_mainfunc(
-                    r"
-    int i = 100;
-    int count = 0;
-    while (i--) count++;
-    if (count != 100)
-        return 0;
-    i = 100;
-    count = 0;
-    while (--i) count++;
-    if (count != 99)
-        return 0;
-    return 1;
-                ",
-                    1,
-                );
-            });
-
-            mod fail {
-                use super::*;
-
-                test!(declaration_in_body {
-                    test_codegen_mainfunc_failure(
-                        r"
-    while (1)
-        int i = 0;
-    return 0;
-                    ",
-                    );
-                });
-
-                test!(declaration_in_condition {
-                    test_codegen_mainfunc_failure(
-                        r"
-    while(int a) {
-        2;
-    }
-                    ",
-                    );
-                });
-
-                test!(missing_parentheses {
-                    test_codegen_mainfunc_failure(
-                        r"
-    while 1 {
-        return 0;
-    }
-                    ",
-                    );
-                });
-            }
-        }
-
-        mod do_while_loop {
-            use super::*;
-
-            test!(simple {
-                test_codegen_mainfunc(
-                    r"
-    int a = 1;
-    do {
-        a = a * 2;
-    } while(a < 11);
-
-    return a;
-                ",
-                    16,
-                );
-            });
-
-            test!(break_immediate {
-                test_codegen_mainfunc(
-                    r"
-    int a = 10;
-    do
-        break;
-    while ((a = 1));
-    return a;
-                ",
-                    10,
-                );
-            });
-
-            test!(no_body {
-                test_codegen_mainfunc(
-                    r"
-    int i = 502;
-    do ; while ((i = i - 5) >= 256);
-
-    return i;
-                ",
-                    252,
-                );
-            });
-
-            test!(multi_continue_same_loop {
-                test_codegen_mainfunc(
-                    r"
-    int x = 10;
-    int y = 0;
-    int z = 0;
-    do {
-        z = z + 1;
-        if (x <= 0)
-            continue;
-        x = x - 1;
-        if (y >= 10)
-            continue;
-        y = y + 1;
-    } while (z != 50);
-    return z == 50 && x == 0 && y == 10;
-                ",
-                    1,
-                );
-            });
-
-            mod fail {
-                use super::*;
-
-                test!(semicolon_after_body {
-                    test_codegen_mainfunc_failure(
-                        r"
-    do {
-        int a;
-    }; while(1);
-    return 0;
-                    ",
-                    );
-                });
-
-                test!(missing_final_semicolon {
-                    test_codegen_mainfunc_failure(
-                        r"
-    do {
-        4;
-    } while(1)
-    return 0;
-                    ",
-                    );
-                });
-
-                test!(empty_condition {
-                    test_codegen_mainfunc_failure(
-                        r"
-    do
-        1;
-    while ();
-    return 0;
-                    ",
-                    );
-                });
-
-                test!(variable_in_body_not_in_scope_for_condition {
-                    test_codegen_mainfunc_failure(
-                        r"
-    do {
-        int a = a + 1;
-    } while (a < 100);
-                    ",
-                    );
-                });
-            }
-        }
-
-        test!(labeled_loops {
-            test_codegen_mainfunc(
-                r"
-    int sum = 0;
-    goto do_label;
-    return 0;
-
-do_label:
-    do {
-        sum = 1;
-        goto while_label;
-    } while (1);
-
-while_label:
-    while (1) {
-        sum = sum + 1;
-        goto break_label;
-        return 0;
-    break_label:
-        break;
-    };
-    goto for_label;
-    return 0;
-
-for_label:
-    for (int i = 0; i < 10; i = i + 1) {
-        sum = sum + 1;
-        goto continue_label;
-        return 0;
-    continue_label:
-        continue;
-        return 0;
-    }
-    return sum;
-            ",
-                12,
-            );
-        });
-
-        mod fail {
-            use super::*;
-
-            test!(label_is_not_block {
-                test_codegen_mainfunc_failure(
-                    r"
-    int a = 0;
-    int b = 0;
-    // a label does not start a new block, so you can't use it
-    // to delineate a multi-statement loop body
-    do
-    do_body:
-        a = a + 1;
-        b = b - 1;
-    while (a < 10)
-        ;
-    return 0;
-                ",
-                );
-            });
-
-            test!(duplicate_label_in_body {
-                test_codegen_mainfunc_failure(
-                    r"
-    do {
-        // make sure our label-validation analysis also traverses loop bodies
-    lbl:
-        return 1;
-    lbl:
-        return 2;
-    } while (1);
-    return 0;
-                ",
-                );
-            });
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn wrong_func_arg_count() {
-        validate_error_count(
-            r"int blah(int x, int y)
-{
-    return 5;
-}
-
-int main() {
-    while (blah()) { }
-    do { blah(); } while (blah());
-    if (blah()) { blah(); } else { blah(); }
-    int x = blah();
-    x = blah();
-    for (int y = blah(); blah(); blah()) { blah(); }
-    for (blah(); blah(); blah()) { blah(); }
-    blah();
-
-    int x = -blah();
-    x = blah(blah(10), blah(), blah());
-    return blah() + blah();
-}",
-            24,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn recursive_function() {
-        codegen_run_and_check_exit_code(
-            r"
-int sigma(int x) {
-    if (x == 0) {
-        return 0;
-    }
-
-    return x + sigma(x - 1);
-}
-
-int main() {
-    return sigma(10);
-}
-",
-            55,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn nested_function_arg_counts() {
-        codegen_run_and_check_exit_code(
-            r"
-int func0()
-{
-    return 1;
-}
-
-int func1(int a)
-{
-    return a;
-}
-
-int func2(int a, int b)
-{
-    return a + b;
-}
-
-int func3(int a, int b, int c)
-{
-    return a + b + c;
-}
-
-int func4(int a, int b, int c, int d)
-{
-    return a + b + c + d;
-}
-
-int func5(int a, int b, int c, int d, int e)
-{
-    return a + b + c + d + e;
-}
-
-int func6(int a, int b, int c, int d, int e, int f)
-{
-    return a + b + c + d + e + f;
-}
-
-int main() {
-    return func6(
-        func1(func0()),
-        func2(1, 2),
-        func3(1, 2, 3),
-        func4(1, 2, 3, 4),
-        func5(1, 2, 3, 4, 5),
-        func6(1, 2, 3, 4, 5, 6));
-}
-",
-            56,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn nested_block_variable_allocation() {
-        codegen_run_and_check_exit_code(
-            r"
-int func()
-{
-    int a = 1;
-    {
-        int b = 2;
-        {
-            int c = 3;
-            {
-                int d = 4;
-                a = a + b + c + d;
-            }
-        }
-    }
-    int e = 5;
-    int f = 6;
-    return a + e + f;
-}
-
-int main() {
-    return func();
-}
-",
-            21,
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn parameter_redefinition() {
-        test_codegen_mainfunc_failure(
-            r"int blah(int x)
-{
-    int x;
-    return 5;
-}
-
-int main() {
-    return 1;
-}",
-        );
-
-        test_codegen_mainfunc_failure(
-            r"int blah(int x)
-{
-    {
-        int x;
-        return 5;
-    }
-}
-
-int main() {
-    return 1;
-}",
-        );
-    }
-}
+mod test;
