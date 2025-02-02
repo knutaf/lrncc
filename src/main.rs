@@ -28,6 +28,11 @@ const RDX_SP_OFFSET: u32 = VARIABLE_SIZE * 2;
 const R8_SP_OFFSET: u32 = VARIABLE_SIZE * 3;
 const R9_SP_OFFSET: u32 = VARIABLE_SIZE * 4;
 
+const KEYWORDS: [&'static str; 13] = [
+    "int", "void", "return", "if", "goto", "for", "while", "do", "break", "continue", "switch",
+    "case", "default",
+];
+
 fn generate_random_string(len: usize) -> String {
     thread_rng()
         .sample_iter(&Alphanumeric)
@@ -188,13 +193,17 @@ impl<'i, 't> Tokens<'i, 't> {
         }
     }
 
-    fn consume_expected_next_token(&mut self, expected_token: &str) -> Result<&mut Self, String> {
+    fn try_consume_expected_next_token(&mut self, expected_token: &str) -> bool {
+        self.consume_expected_next_token(expected_token).is_ok()
+    }
+
+    fn consume_expected_next_token(&mut self, expected_token: &str) -> Result<(), String> {
         let (tokens, remaining_tokens) = self.consume_tokens(1)?;
 
         if tokens[0] == expected_token {
             *self = remaining_tokens;
             debug!(name: "consume_expected_token", target: "parse", token = expected_token, "consumed");
-            Ok(self)
+            Ok(())
         } else {
             debug!(
                 "expected next token \"{}\" but found \"{}\"",
@@ -213,15 +222,18 @@ impl<'i, 't> Tokens<'i, 't> {
         Ok(tokens[0])
     }
 
+    fn try_consume_identifier(&mut self) -> Option<&'i str> {
+        self.consume_identifier().ok()
+    }
+
     fn consume_identifier(&mut self) -> Result<&'i str, String> {
         fn is_token_identifier(token: &str) -> bool {
             lazy_static! {
                 static ref IDENT_REGEX: Regex =
                     Regex::new(r"^[a-zA-Z_]\w*$").expect("failed to compile regex");
-                static ref KEYWORDS_REGEX: Regex = Regex::new(
-                    r"^(?:int|void|return|if|goto|for|break|continue|switch|case|default)$"
-                )
-                .expect("failed to compile regex");
+                static ref KEYWORDS_REGEX: Regex =
+                    Regex::new(&format!(r"^(?:{})$", KEYWORDS.join("|")))
+                        .expect("failed to compile regex");
             }
 
             IDENT_REGEX.is_match(token) && !KEYWORDS_REGEX.is_match(token)
@@ -276,7 +288,7 @@ struct AstBlock(Vec<AstBlockItem>);
 #[derive(Debug)]
 struct AstFunction<'i> {
     name: &'i str,
-    parameters: Vec<String>,
+    parameters: Vec<&'i str>,
     body: AstBlock,
 }
 
@@ -3838,152 +3850,153 @@ fn lex_all_tokens<'i>(input: &'i str) -> Result<Vec<&'i str>, Vec<String>> {
     Ok(tokens)
 }
 
-fn parse_function<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstFunction<'i>, String> {
+fn try_parse_function<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+) -> Result<Option<AstFunction<'i>>, String> {
     let mut tokens = original_tokens.clone();
 
-    tokens.consume_expected_next_token("int")?;
-    let name = tokens.consume_next_token()?;
-    tokens.consume_expected_next_token("(")?;
-
-    let mut parameters = vec![];
-    while let Ok(parameter_name) = parse_function_parameter(&mut tokens, parameters.len() == 0) {
-        parameters.push(String::from(parameter_name));
+    if !tokens.try_consume_expected_next_token("int") {
+        return Ok(None);
     }
 
-    tokens.consume_expected_next_token(")")?;
+    let Some(name) = tokens.try_consume_identifier() else {
+        return Ok(None);
+    };
 
-    let body = parse_block(&mut tokens)?;
+    if !tokens.try_consume_expected_next_token("(") {
+        return Ok(None);
+    }
 
     *original_tokens = tokens;
-    Ok(AstFunction {
+
+    let mut parameters = vec![];
+    while let Some(parameter_name) =
+        try_parse_function_parameter(original_tokens, parameters.len() == 0)?
+    {
+        parameters.push(parameter_name);
+    }
+
+    original_tokens.consume_expected_next_token(")")?;
+
+    let body = parse_block(original_tokens)?;
+
+    Ok(Some(AstFunction {
         name,
         parameters,
         body,
-    })
+    }))
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_function_parameter<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
+fn try_parse_function_parameter<'i, 't>(
+    tokens: &mut Tokens<'i, 't>,
     is_first_parameter: bool,
-) -> Result<&'i str, String> {
-    let mut tokens = original_tokens.clone();
-
+) -> Result<Option<&'i str>, String> {
     if !is_first_parameter {
-        tokens.consume_expected_next_token(",")?;
+        if !tokens.try_consume_expected_next_token(",") {
+            return Ok(None);
+        }
     }
 
-    tokens.consume_expected_next_token("int")?;
+    if !tokens.try_consume_expected_next_token("int") {
+        return Ok(None);
+    }
 
-    let var_name = tokens.consume_identifier()?;
-    *original_tokens = tokens;
-    Ok(var_name)
+    tokens.consume_identifier().map(Some)
+}
+
+fn parse_block<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstBlock, String> {
+    try_parse_block(tokens)?.ok_or(format!("required block not found"))
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_block<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlock, String> {
-    let mut tokens = original_tokens.clone();
-
-    tokens.consume_expected_next_token("{")?;
+fn try_parse_block<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<Option<AstBlock>, String> {
+    if !tokens.try_consume_expected_next_token("{") {
+        return Ok(None);
+    }
 
     let mut body = vec![];
 
-    loop {
-        if tokens.consume_expected_next_token("}").is_ok() {
-            break;
-        }
-
-        body.push(parse_block_item(&mut tokens)?);
+    // Keep trying to parse block items until the end of the block is found.
+    while !tokens.try_consume_expected_next_token("}") {
+        body.push(parse_block_item(tokens)?);
     }
 
-    *original_tokens = tokens;
-    Ok(AstBlock(body))
+    Ok(Some(AstBlock(body)))
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_block_item<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
-    let mut tokens = original_tokens.clone();
-
-    let ret = if let Ok(declaration) = parse_declaration(&mut tokens) {
+fn parse_block_item<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
+    if let Some(declaration) = try_parse_declaration(tokens)? {
         Ok(AstBlockItem::Declaration(declaration))
-    } else if let Ok(statement) = parse_statement(&mut tokens) {
-        Ok(AstBlockItem::Statement(statement))
     } else {
-        Err(String::from("failed to parse block item"))
-    };
-
-    if ret.is_ok() {
-        *original_tokens = tokens;
+        Ok(AstBlockItem::Statement(parse_statement(tokens)?))
     }
-
-    ret
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
-    let mut tokens = original_tokens.clone();
+fn parse_statement<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstStatement, String> {
+    let labels = parse_statement_labels(tokens)?;
 
-    let labels = parse_statement_labels(&mut tokens)?;
-
-    let statement_type = if tokens.consume_expected_next_token("return").is_ok() {
-        let st = AstStatementType::Return(parse_expression(&mut tokens)?);
+    let statement_type = if tokens.try_consume_expected_next_token("return") {
+        let st = AstStatementType::Return(parse_expression(tokens)?);
         tokens.consume_expected_next_token(";")?;
         st
-    } else if tokens.consume_expected_next_token(";").is_ok() {
+    } else if tokens.try_consume_expected_next_token(";") {
         AstStatementType::Null
-    } else if tokens.consume_expected_next_token("if").is_ok() {
+    } else if tokens.try_consume_expected_next_token("if") {
         tokens.consume_expected_next_token("(")?;
-        let condition_expr = parse_expression(&mut tokens)?;
+        let condition_expr = parse_expression(tokens)?;
         tokens.consume_expected_next_token(")")?;
-        let then_statement = parse_statement(&mut tokens)?;
+        let then_statement = parse_statement(tokens)?;
 
-        let else_statement_opt = if tokens.consume_expected_next_token("else").is_ok() {
-            Some(Box::new(parse_statement(&mut tokens)?))
+        let else_statement_opt = if tokens.try_consume_expected_next_token("else") {
+            Some(Box::new(parse_statement(tokens)?))
         } else {
             None
         };
 
         AstStatementType::If(condition_expr, Box::new(then_statement), else_statement_opt)
-    } else if tokens.consume_expected_next_token("goto").is_ok() {
+    } else if tokens.try_consume_expected_next_token("goto") {
         let label_name = tokens.consume_identifier()?;
         tokens.consume_expected_next_token(";")?;
         AstStatementType::Goto(AstLabel(String::from(label_name)))
-    } else if let Ok(for_statement) = parse_for_statement(&mut tokens) {
+    } else if let Some(for_statement) = try_parse_for_statement(tokens)? {
         for_statement
-    } else if tokens.consume_expected_next_token("while").is_ok() {
+    } else if tokens.try_consume_expected_next_token("while") {
         tokens.consume_expected_next_token("(")?;
-        let condition_expr = parse_expression(&mut tokens)?;
+        let condition_expr = parse_expression(tokens)?;
         tokens.consume_expected_next_token(")")?;
-        let body_statement = parse_statement(&mut tokens)?;
+        let body_statement = parse_statement(tokens)?;
 
         AstStatementType::While(condition_expr, Box::new(body_statement), None, None)
-    } else if tokens.consume_expected_next_token("do").is_ok() {
-        let body_statement = parse_statement(&mut tokens)?;
+    } else if tokens.try_consume_expected_next_token("do") {
+        let body_statement = parse_statement(tokens)?;
         tokens.consume_expected_next_token("while")?;
         tokens.consume_expected_next_token("(")?;
-        let condition_expr = parse_expression(&mut tokens)?;
+        let condition_expr = parse_expression(tokens)?;
         tokens.consume_expected_next_token(")")?;
         tokens.consume_expected_next_token(";")?;
         AstStatementType::DoWhile(condition_expr, Box::new(body_statement), None, None)
-    } else if let Ok(block) = parse_block(&mut tokens) {
+    } else if let Some(block) = try_parse_block(tokens)? {
         AstStatementType::Compound(Box::new(block))
-    } else if tokens.consume_expected_next_token("break").is_ok() {
+    } else if tokens.try_consume_expected_next_token("break") {
         let st = AstStatementType::Break(None);
         tokens.consume_expected_next_token(";")?;
         st
-    } else if tokens.consume_expected_next_token("continue").is_ok() {
+    } else if tokens.try_consume_expected_next_token("continue") {
         let st = AstStatementType::Continue(None);
         tokens.consume_expected_next_token(";")?;
         st
-    } else if tokens.consume_expected_next_token("switch").is_ok() {
+    } else if tokens.try_consume_expected_next_token("switch") {
         tokens.consume_expected_next_token("(")?;
-        let condition_expr = parse_expression(&mut tokens)?;
+        let condition_expr = parse_expression(tokens)?;
         tokens.consume_expected_next_token(")")?;
-        let body_statement = parse_statement(&mut tokens)?;
+        let body_statement = parse_statement(tokens)?;
 
         AstStatementType::Switch(condition_expr, Box::new(body_statement), None, Vec::new())
-    } else if tokens.consume_expected_next_token("case").is_ok() {
-        let expr = parse_expression(&mut tokens)?;
+    } else if tokens.try_consume_expected_next_token("case") {
+        let expr = parse_expression(tokens)?;
         tokens.consume_expected_next_token(":")?;
 
         AstStatementType::SwitchCase(
@@ -3991,9 +4004,9 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
                 expr_opt: Some(expr),
                 label_opt: None,
             },
-            Box::new(parse_statement(&mut tokens)?),
+            Box::new(parse_statement(tokens)?),
         )
-    } else if tokens.consume_expected_next_token("default").is_ok() {
+    } else if tokens.try_consume_expected_next_token("default") {
         tokens.consume_expected_next_token(":")?;
 
         AstStatementType::SwitchCase(
@@ -4001,58 +4014,53 @@ fn parse_statement<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstSt
                 expr_opt: None,
                 label_opt: None,
             },
-            Box::new(parse_statement(&mut tokens)?),
+            Box::new(parse_statement(tokens)?),
         )
     } else {
-        let st = AstStatementType::Expr(parse_expression(&mut tokens)?);
+        let st = AstStatementType::Expr(parse_expression(tokens)?);
         tokens.consume_expected_next_token(";")?;
         st
     };
 
-    *original_tokens = tokens;
     let st = AstStatement::new(statement_type, labels);
     debug!(target: "parse", st = %DisplayFmtNode(&st), "parsed statement");
     Ok(st)
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_for_statement<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<AstStatementType, String> {
-    let mut tokens = original_tokens.clone();
+fn try_parse_for_statement<'i, 't>(
+    tokens: &mut Tokens<'i, 't>,
+) -> Result<Option<AstStatementType>, String> {
+    if !tokens.try_consume_expected_next_token("for") {
+        return Ok(None);
+    }
 
-    tokens.consume_expected_next_token("for")?;
     tokens.consume_expected_next_token("(")?;
 
-    let initializer = if let Ok(decl) = parse_declaration(&mut tokens) {
+    let initializer = if let Ok(Some(decl)) = try_parse_declaration(tokens) {
         AstForInit::Declaration(decl)
-    } else if let Ok(expr_opt) = parse_optional_expression(&mut tokens, ";") {
-        AstForInit::Expression(expr_opt)
     } else {
-        return Err(format!("failed to parse for loop initializer"));
+        AstForInit::Expression(parse_optional_expression(tokens, ";")?)
     };
 
-    let condition_opt = parse_optional_expression(&mut tokens, ";")?;
+    let condition_opt = parse_optional_expression(tokens, ";")?;
 
-    let final_expr_opt = parse_optional_expression(&mut tokens, ")")?;
+    let final_expr_opt = parse_optional_expression(tokens, ")")?;
 
-    let body = parse_statement(&mut tokens)?;
+    let body = Box::new(parse_statement(tokens)?);
 
-    *original_tokens = tokens;
-    Ok(AstStatementType::For(
+    Ok(Some(AstStatementType::For(
         initializer,
         condition_opt,
         final_expr_opt,
-        Box::new(body),
+        body,
         None,
         None,
-    ))
+    )))
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_statement_labels<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<Vec<AstLabel>, String> {
+fn parse_statement_labels<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<Vec<AstLabel>, String> {
     fn parse_label<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstLabel, String> {
         let mut tokens = original_tokens.clone();
 
@@ -4064,40 +4072,31 @@ fn parse_statement_labels<'i, 't>(
         Ok(AstLabel(String::from(label_name)))
     }
 
-    let mut tokens = original_tokens.clone();
-
     let mut labels = vec![];
-
-    loop {
-        if let Ok(label) = parse_label(&mut tokens) {
-            labels.push(label);
-        } else {
-            *original_tokens = tokens;
-            return Ok(labels);
-        }
+    while let Ok(label) = parse_label(tokens) {
+        labels.push(label);
     }
+    Ok(labels)
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_declaration<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
-) -> Result<AstDeclaration, String> {
-    let mut tokens = original_tokens.clone();
-
-    tokens.consume_expected_next_token("int")?;
+fn try_parse_declaration<'i, 't>(
+    tokens: &mut Tokens<'i, 't>,
+) -> Result<Option<AstDeclaration>, String> {
+    if !tokens.try_consume_expected_next_token("int") {
+        return Ok(None);
+    }
 
     let var_name = tokens.consume_identifier()?;
 
     // Optional initializer is present.
-    let initializer_opt = if let Ok(_) = tokens.consume_expected_next_token("=") {
-        Some(parse_expression(&mut tokens)?)
+    let initializer_opt = if tokens.try_consume_expected_next_token("=") {
+        Some(parse_expression(tokens)?)
     } else {
         None
     };
 
     tokens.consume_expected_next_token(";")?;
-
-    *original_tokens = tokens;
 
     let decl = AstDeclaration {
         identifier: AstIdentifier(String::from(var_name)),
@@ -4106,10 +4105,10 @@ fn parse_declaration<'i, 't>(
 
     debug!(target: "parse", decl = %DisplayFmtNode(&decl), "parsed declaration");
 
-    Ok(decl)
+    Ok(Some(decl))
 }
 
-fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+fn parse_expression<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
     #[instrument(target = "parse", level = "debug")]
     fn parse_expression_with_precedence<'i, 't>(
         original_tokens: &mut Tokens<'i, 't>,
@@ -4140,9 +4139,9 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
                         | AstBinaryOperator::BitwiseXorAssign
                         | AstBinaryOperator::ShiftLeftAssign
                         | AstBinaryOperator::ShiftRightAssign => {
-                            // Assignment is right-associative, not left-associative, so parse with the precedence of the
-                            // operator so that further tokens of the same precedence would also go to the right side, not
-                            // left side.
+                            // Assignment is right-associative, not left-associative, so parse with the precedence of
+                            // the operator so that further tokens of the same precedence would also go to the right
+                            // side, not left side.
                             let right = parse_expression_with_precedence(
                                 &mut tokens,
                                 operator.precedence(),
@@ -4175,7 +4174,8 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
                         }
                         _ => {
                             // If the right hand side is itself going to encounter a binary expression, it can only be a
-                            // strictly higher precedence, or else it shouldn't be part of the right-hand-side expression.
+                            // strictly higher precedence, or else it shouldn't be part of the right-hand-side
+                            // expression.
                             let right = parse_expression_with_precedence(
                                 &mut tokens,
                                 operator.precedence() + 1,
@@ -4205,80 +4205,61 @@ fn parse_expression<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstE
         Ok(left)
     }
 
-    parse_expression_with_precedence(original_tokens, 0)
+    parse_expression_with_precedence(tokens, 0)
 }
 
 #[instrument(target = "parse", level = "debug")]
 fn parse_optional_expression<'i, 't>(
-    original_tokens: &mut Tokens<'i, 't>,
+    tokens: &mut Tokens<'i, 't>,
     terminator: &str,
 ) -> Result<Option<AstExpression>, String> {
-    let mut tokens = original_tokens.clone();
-
     // Try to parse an expression and then the desired terminator.
-    let ret = if let Ok(expr) = parse_expression(&mut tokens) {
+    if let Ok(expr) = parse_expression(tokens) {
         tokens.consume_expected_next_token(terminator)?;
         Ok(Some(expr))
-    } else if tokens.consume_expected_next_token(terminator).is_ok() {
+    } else if tokens.try_consume_expected_next_token(terminator) {
         // Well, the expression wasn't found. See if just the terminator is, in which case the optional expression is
         // valid, just with no expression found.
         Ok(None)
     } else {
         // If the terminator isn't found, then it's not valid.
-        return Err(format!(
+        Err(format!(
             "failed to parse optional expression starting at {:?}",
             tokens
-        ));
-    };
-
-    if ret.is_ok() {
-        *original_tokens = tokens;
+        ))
     }
-
-    ret
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_factor<'i, 't>(original_tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
-    let mut tokens = original_tokens.clone();
-
-    let mut ret = if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
-        Ok(AstExpression::Constant(integer_literal))
-    } else if let Ok(_) = tokens.consume_expected_next_token("(") {
-        let inner = parse_expression(&mut tokens)?;
+fn parse_factor<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, String> {
+    let factor = if let Ok(integer_literal) = tokens.consume_and_parse_next_token::<u32>() {
+        AstExpression::Constant(integer_literal)
+    } else if tokens.try_consume_expected_next_token("(") {
+        let inner = parse_expression(tokens)?;
         tokens.consume_expected_next_token(")")?;
-        Ok(inner)
+        inner
     } else if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
-        let inner = parse_factor(&mut tokens)?;
-        Ok(AstExpression::UnaryOperator(operator, Box::new(inner)))
+        let inner = parse_factor(tokens)?;
+        AstExpression::UnaryOperator(operator, Box::new(inner))
     } else if let Ok(var_name) = tokens.consume_identifier() {
-        Ok(AstExpression::Var(AstIdentifier(String::from(var_name))))
+        AstExpression::Var(AstIdentifier(String::from(var_name)))
     } else {
-        Err(String::from("unknown factor"))
+        return Err(format!("unknown factor \"{}\"", tokens[0]));
     };
 
     // Immediately after parsing a factor, attempt to parse a postfix operator, because it's higher precedence than
     // anything else.
-    if let Ok(factor) = ret {
-        if let Some(suffix_operator) = parse_postfix_operator(&mut tokens) {
-            ret = Ok(AstExpression::UnaryOperator(
-                suffix_operator,
-                Box::new(factor),
-            ));
+    Ok(
+        if let Some(suffix_operator) = try_parse_postfix_operator(tokens) {
+            AstExpression::UnaryOperator(suffix_operator, Box::new(factor))
         } else {
-            ret = Ok(factor);
-        }
-    }
-
-    if ret.is_ok() {
-        *original_tokens = tokens;
-    }
-
-    ret
+            factor
+        },
+    )
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn parse_postfix_operator<'i, 't>(
+fn try_parse_postfix_operator<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
 ) -> Option<AstUnaryOperator> {
     let mut tokens = original_tokens.clone();
@@ -4393,7 +4374,7 @@ fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, 
     // TODO all parsing should return a list of errors, not just one. for now, wrap it in a single error
     let mut ast = {
         let mut functions = vec![];
-        while let Ok(function) = parse_function(&mut tokens) {
+        while let Some(function) = try_parse_function(&mut tokens).map_err(|e| vec![e])? {
             functions.push(function);
         }
 

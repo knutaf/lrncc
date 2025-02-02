@@ -470,11 +470,14 @@ mod test {
             );
         });
 
+        fn test_invalid_identifier(ident: &str) {
+            test_codegen_mainfunc_failure(&format!("int {0}; return {0};", &ident));
+        }
+
         test!(keywords_as_var_identifier {
-            test_codegen_mainfunc_failure("int if = 0; return if;");
-            test_codegen_mainfunc_failure("int int = 0; return int;");
-            test_codegen_mainfunc_failure("int void = 0; return void;");
-            test_codegen_mainfunc_failure("int return = 0; return return;");
+            for keyword in &KEYWORDS {
+                test_invalid_identifier(keyword);
+            }
         });
 
         test!(extra_closing_brace {
