@@ -9,29 +9,31 @@ use {
     rand::{thread_rng, Rng},
     regex::Regex,
     std::{
-        cell::RefCell,
         collections::{HashMap, HashSet},
         fmt,
         fmt::Display,
         ops::Deref,
+        path,
         path::*,
         process::*,
     },
-    tracing::{debug, info, instrument},
+    tracing::{debug, error, info, instrument},
     tracing_subscriber,
     tracing_subscriber::{prelude::*, util::SubscriberInitExt, EnvFilter, Registry},
 };
 
-const VARIABLE_SIZE: u32 = 8;
-const RCX_SP_OFFSET: u32 = VARIABLE_SIZE * 1;
-const RDX_SP_OFFSET: u32 = VARIABLE_SIZE * 2;
-const R8_SP_OFFSET: u32 = VARIABLE_SIZE * 3;
-const R9_SP_OFFSET: u32 = VARIABLE_SIZE * 4;
+const VARIABLE_SIZE: u32 = 4;
+// x64 ABI says that stack parameters are 8-bytes in size, regardless of what data type is passed in them.
+const STACK_PARAMETER_SIZE: u32 = 8;
+const POINTER_SIZE: u32 = 8;
+const FUNCTION_CALL_ALIGNMENT: u32 = 16;
 
 const KEYWORDS: [&'static str; 13] = [
     "int", "void", "return", "if", "goto", "for", "while", "do", "break", "continue", "switch",
     "case", "default",
 ];
+
+const PARAMETER_REG_MAPPING: [&'static str; 4] = ["cx", "dx", "r8", "r9"];
 
 fn generate_random_string(len: usize) -> String {
     thread_rng()
@@ -46,9 +48,36 @@ fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
 }
 
-fn push_error(result: Result<(), String>, errors: &mut Vec<String>) {
+fn pad_to_alignment(num: u32, alignment: u32) -> u32 {
+    if num <= alignment {
+        return alignment;
+    }
+
+    if num % alignment == 0 {
+        return num;
+    }
+
+    ((num / alignment) + 1) * alignment
+}
+
+fn format_command_args(command: &Command) -> String {
+    format!(
+        "{} {}",
+        command.get_program().to_str().unwrap(),
+        command
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect::<Vec<&str>>()
+            .join(" ")
+    )
+}
+
+fn push_error<TError>(result: Result<TError, String>, errors: &mut Vec<String>) -> bool {
     if let Err(error) = result {
         errors.push(error);
+        true
+    } else {
+        false
     }
 }
 
@@ -176,6 +205,16 @@ impl<T: FmtNode> fmt::Display for DisplayFmtNode<T> {
     }
 }
 
+/// Produces a mangled name that won't clash with a C identifier but is valid to use in ASM listings.
+fn mangle_function_name(name: &str) -> String {
+    // Do not mangle "main" or else your program crashes. Not totally sure why.
+    if name == "main" {
+        String::from("main")
+    } else {
+        format!("@@@{}", name)
+    }
+}
+
 // A wrapper around a slice of tokens with convenience functions useful for parsing.
 #[derive(PartialEq, Clone, Debug)]
 struct Tokens<'i, 't>(&'t [&'i str]);
@@ -214,12 +253,6 @@ impl<'i, 't> Tokens<'i, 't> {
                 expected_token, tokens[0]
             ))
         }
-    }
-
-    fn consume_next_token(&mut self) -> Result<&'i str, String> {
-        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
-        *self = remaining_tokens;
-        Ok(tokens[0])
     }
 
     fn try_consume_identifier(&mut self) -> Option<&'i str> {
@@ -277,32 +310,32 @@ impl<'i, 't> Deref for Tokens<'i, 't> {
 }
 
 #[derive(Debug)]
-struct AstProgram<'i> {
-    functions: Vec<AstFunction<'i>>,
-    global_tracking_opt: Option<GlobalTracking>,
+struct AstProgram {
+    functions: Vec<AstFunction>,
 }
 
 #[derive(Debug, Clone)]
 struct AstBlock(Vec<AstBlockItem>);
 
-#[derive(Debug)]
-struct AstFunction<'i> {
-    name: &'i str,
-    parameters: Vec<&'i str>,
-    body: AstBlock,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AstIdentifier(String);
 
 #[derive(Debug, Clone)]
+struct AstFunction {
+    name: AstIdentifier,
+    parameters: Vec<AstIdentifier>,
+    body_opt: Option<Vec<AstBlockItem>>,
+}
+
+#[derive(Debug, Clone)]
 enum AstBlockItem {
     Statement(AstStatement),
-    Declaration(AstDeclaration),
+    VarDeclaration(AstVarDeclaration),
+    FuncDeclaration(AstFunction),
 }
 
 #[derive(Clone, Debug)]
-struct AstDeclaration {
+struct AstVarDeclaration {
     identifier: AstIdentifier,
     initializer_opt: Option<AstExpression>,
 }
@@ -358,7 +391,7 @@ enum AstStatementType {
 
 #[derive(Clone, Debug)]
 enum AstForInit {
-    Declaration(AstDeclaration),
+    Declaration(AstVarDeclaration),
     Expression(Option<AstExpression>),
 }
 
@@ -376,6 +409,7 @@ enum AstExpression {
     Var(AstIdentifier),
     Assignment(Box<AstExpression>, AstBinaryOperator, Box<AstExpression>),
     Conditional(Box<AstExpression>, Box<AstExpression>, Box<AstExpression>),
+    FuncCall(AstIdentifier, Vec<AstExpression>),
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -432,7 +466,8 @@ struct TacProgram {
 #[derive(Debug)]
 struct TacFunction {
     name: String,
-    body: Vec<TacInstruction>,
+    parameters: Vec<TacVar>,
+    body_opt: Option<Vec<TacInstruction>>,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +484,7 @@ enum TacInstruction {
     JumpIfNotZero(TacVal, TacLabel),
     JumpIfEqual(TacVal, TacVal, TacLabel),
     Label(TacLabel),
+    FuncCall(TacLabel, Vec<TacVal>, TacVar),
 }
 
 #[derive(Debug, Clone)]
@@ -496,7 +532,8 @@ struct AsmProgram {
 #[derive(Debug)]
 struct AsmFunction {
     name: String,
-    body: Vec<AsmInstruction>,
+    mangled_name: String,
+    body_opt: Option<Vec<AsmInstruction>>,
 }
 
 #[derive(Debug, Clone)]
@@ -516,6 +553,7 @@ enum AsmInstruction {
     Jmp(AsmLabel),
     JmpCc(AsmCondCode, AsmLabel),
     Label(AsmLabel),
+    Call(String),
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +566,7 @@ enum AsmVal {
 enum AsmLocation {
     Reg(&'static str),
     PseudoReg(String),
+    PseudoArgReg(u32),
     RbpOffset(i32, String),
     RspOffset(u32, String),
 }
@@ -561,9 +600,21 @@ enum AsmCondCode {
 }
 
 #[derive(Debug)]
+struct SymbolTable {
+    symbols: HashMap<AstIdentifier, Symbol>,
+}
+
+#[derive(Debug, Clone)]
+enum Symbol {
+    Var(AstIdentifier),
+    Function(usize, bool),
+}
+
+#[derive(Debug)]
 struct GlobalTracking {
     next_temporary_id: u32,
     next_label_id: u32,
+    symbols: SymbolTable,
 }
 
 #[derive(Debug)]
@@ -572,57 +623,56 @@ struct FunctionTracking {
 }
 
 #[derive(Debug)]
-struct BlockTracking<'p> {
-    parent_opt: Option<&'p BlockTracking<'p>>,
-    variables: HashMap<AstIdentifier, AstIdentifier>,
-}
-
-#[derive(Debug)]
-struct BreakTracking {
-    parent_opt: Option<Box<BreakTracking>>,
-    break_label: AstLabel,
-    continue_label_opt: Option<AstLabel>,
-}
-
-#[derive(Debug)]
-struct SwitchTracking {
-    parent_opt: Option<Box<SwitchTracking>>,
-    is_default_case_found: bool,
-    case_values: HashSet<i32>,
-    cases: Vec<SwitchCase>,
-}
-
-#[derive(Debug)]
 struct FuncStackFrame {
     names: HashMap<String, i32>,
-    max_base_offset: u32,
+    locals_size: u32,
+    arguments_size: u32,
 }
 
-impl<'i> AstProgram<'i> {
-    fn new(functions: Vec<AstFunction<'i>>) -> Self {
-        Self {
-            functions,
-            global_tracking_opt: None,
-        }
-    }
+enum AstNode<'n> {
+    Function(&'n mut AstFunction),
+    Block(&'n mut AstBlock),
+    Statement(&'n mut AstStatement),
+    VarDeclaration(&'n mut AstVarDeclaration),
+    ForInit(&'n mut AstForInit),
+    Expression(&'n mut AstExpression),
+}
 
-    fn lookup_function_definition(&'i self, name: &str) -> Option<&'i AstFunction<'i>> {
-        self.functions.iter().find(|func| func.name == name)
+enum AsmNode<'n> {
+    Loc(&'n mut AsmLocation),
+}
+
+/// A common pattern is traversing a tree and keeping track of some potentially nested context. This object allows for
+/// easy nesting and unnesting as the traversal enters or exits nodes in the tree.
+#[derive(Debug)]
+struct TraversalContext<'e, T> {
+    inner: Option<Box<T>>,
+    errors_opt: Option<&'e mut Vec<String>>,
+    errors_len: usize,
+}
+
+/// To participate in TraversalContext, the context object needs to have a parent reference somewhere in it.
+trait Nestable {
+    fn get_parent_opt_mut(&mut self) -> &mut Option<Box<Self>>;
+}
+
+impl AstProgram {
+    fn new(functions: Vec<AstFunction>) -> Self {
+        Self { functions }
     }
 
     fn validate_and_resolve(&mut self) -> Result<(), Vec<String>> {
-        self.global_tracking_opt = Some(GlobalTracking::new());
-        let global_tracking = self.global_tracking_opt.as_mut().unwrap();
+        let mut global_tracking = GlobalTracking::new();
 
         let mut errors = vec![];
         for func in self.functions.iter_mut() {
             let mut function_tracking = FunctionTracking::new();
 
-            func.validate_and_resolve_variables(global_tracking, &mut errors);
+            func.validate_and_resolve_symbols(&mut global_tracking, &mut errors);
             debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after validate_and_resolve");
 
             func.validate_and_allocate_goto_labels(
-                global_tracking,
+                &mut global_tracking,
                 &mut function_tracking,
                 &mut errors,
             );
@@ -631,10 +681,10 @@ impl<'i> AstProgram<'i> {
             func.rewrite_goto_labels(&function_tracking, &mut errors);
             debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after goto resolution");
 
-            func.label_loops_and_switches(global_tracking, &mut errors);
+            func.label_loops_and_switches(&mut global_tracking, &mut errors);
             debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after loop labeling");
 
-            func.resolve_switch_cases(global_tracking, &mut errors);
+            func.resolve_switch_cases(&mut global_tracking, &mut errors);
             debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after switch resolving");
         }
 
@@ -645,50 +695,43 @@ impl<'i> AstProgram<'i> {
         }
     }
 
-    fn to_tac(&mut self) -> Result<TacProgram, String> {
+    fn to_tac(&self) -> Result<TacProgram, String> {
+        let mut global_tracking = GlobalTracking::new();
+
         let mut functions = vec![];
         for func in self.functions.iter() {
-            functions.push(func.to_tac(self.global_tracking_opt.as_mut().unwrap())?);
+            functions.push(func.to_tac(&mut global_tracking)?);
         }
 
         Ok(TacProgram { functions })
     }
 }
 
-impl<'i> FmtNode for AstProgram<'i> {
+impl FmtNode for AstProgram {
     fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
         Self::fmt_nodelist(f, self.functions.iter(), "\n\n", 0)
     }
 }
 
 impl AstBlock {
-    fn validate_and_resolve_variables(
+    fn traverse_ast<TContext, FuncVisit>(
         &mut self,
-        global_tracking: &mut GlobalTracking,
-        block_tracking: &mut BlockTracking,
-        errors: &mut Vec<String>,
-    ) {
-        for block_item in self.0.iter_mut() {
-            block_item.validate_and_resolve_variables(global_tracking, block_tracking, errors);
-        }
-    }
-
-    fn for_each_statement_and_after<F1, F2>(
-        &mut self,
-        func: &mut F1,
-        func_after: &mut F2,
-    ) -> Result<(), String>
-    where
-        F1: FnMut(&mut AstStatement) -> Result<(), String>,
-        F2: FnMut(&mut AstStatement) -> Result<(), String>,
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
     {
-        for block_item in self.0.iter_mut() {
-            if let AstBlockItem::Statement(ref mut statement) = block_item {
-                statement.for_each_statement_and_after(func, func_after)?;
-            }
+        let res = (func)(true, AstNode::Block(self), context);
+        if context.push_error(res) {
+            return;
         }
 
-        Ok(())
+        for block_item in self.0.iter_mut() {
+            block_item.traverse_ast(context, func);
+        }
+
+        let res = (func)(false, AstNode::Block(self), context);
+        context.push_error(res);
     }
 
     fn to_tac(
@@ -704,55 +747,287 @@ impl AstBlock {
     }
 }
 
-impl<'i> AstFunction<'i> {
-    fn validate_and_resolve_variables(
+impl AstFunction {
+    fn is_definition(&self) -> bool {
+        self.body_opt.is_some()
+    }
+
+    fn validate_and_resolve_symbols(
         &mut self,
         global_tracking: &mut GlobalTracking,
         errors: &mut Vec<String>,
     ) {
-        let mut block_tracking = BlockTracking::new(None);
-        self.body
-            .validate_and_resolve_variables(global_tracking, &mut block_tracking, errors);
-    }
-
-    fn for_each_statement_and_after<F1, F2>(
-        &mut self,
-        mut func: F1,
-        mut func_after: F2,
-    ) -> Result<(), String>
-    where
-        F1: FnMut(&mut AstStatement) -> Result<(), String>,
-        F2: FnMut(&mut AstStatement) -> Result<(), String>,
-    {
-        self.body
-            .for_each_statement_and_after(&mut func, &mut func_after)
-    }
-
-    fn for_each_statement<F>(&mut self, mut func: F) -> Result<(), String>
-    where
-        F: FnMut(&mut AstStatement) -> Result<(), String>,
-    {
-        fn null_func(_statement: &mut AstStatement) -> Result<(), String> {
-            Ok(())
+        struct ResolveTracking<'g, 'e> {
+            global_tracking: &'g mut GlobalTracking,
+            block_tracking_opt: TraversalContext<'e, BlockTracking>,
         }
 
-        self.body
-            .for_each_statement_and_after(&mut func, &mut null_func)
+        impl<'g, 'e> ResolveTracking<'g, 'e> {
+            fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<&Symbol, String> {
+                // First look up the symbol in the current block, which is the narrowest scope. This will also search
+                // parent scopes in turn.
+                if let Some(block_tracking) = self.block_tracking_opt.get() {
+                    if let Ok(symbol) = block_tracking.lookup_symbol(identifier) {
+                        return Ok(symbol);
+                    }
+                }
+
+                // If it wasn't found in any block scope then search the global scope last.
+                match self.global_tracking.symbols.lookup_symbol(identifier) {
+                    Ok(Some(symbol)) => Ok(symbol),
+                    Ok(None) => Err(format!("identifier {} not found", identifier)),
+                    Err(err @ _) => Err(err),
+                }
+            }
+
+            fn lookup_function_declaration(
+                &self,
+                identifier: &AstIdentifier,
+            ) -> Result<&Symbol, String> {
+                let symbol @ Symbol::Function(_, _) = self.lookup_symbol(identifier)? else {
+                    return Err(format!("{} is not a function", identifier));
+                };
+
+                Ok(symbol)
+            }
+        }
+
+        struct BlockTracking {
+            parent_opt: Option<Box<BlockTracking>>,
+            symbols: SymbolTable,
+        }
+
+        impl BlockTracking {
+            fn new() -> Self {
+                Self {
+                    parent_opt: None,
+                    symbols: SymbolTable::new(),
+                }
+            }
+
+            fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<&Symbol, String> {
+                if let Some(symbol) = self.symbols.symbols.get(identifier) {
+                    Ok(symbol)
+                } else {
+                    return if let Some(ref parent) = self.parent_opt {
+                        parent.lookup_symbol(identifier)
+                    } else {
+                        Err(format!("identifier '{}' not found", identifier))
+                    };
+                }
+            }
+
+            fn resolve_variable(
+                &self,
+                identifier: &AstIdentifier,
+            ) -> Result<&AstIdentifier, String> {
+                let Symbol::Var(ref temp_identifier) = self.lookup_symbol(identifier)? else {
+                    return Err(format!("{} is not a variable", identifier));
+                };
+
+                Ok(temp_identifier)
+            }
+        }
+
+        impl Nestable for BlockTracking {
+            fn get_parent_opt_mut(&mut self) -> &mut Option<Box<Self>> {
+                &mut self.parent_opt
+            }
+        }
+
+        let mut resolve_tracking = TraversalContext::new(
+            Some(ResolveTracking {
+                global_tracking,
+                block_tracking_opt: TraversalContext::new(None, None),
+            }),
+            Some(errors),
+        );
+
+        self.traverse_ast(&mut resolve_tracking, &mut |is_enter, node, context| {
+            if is_enter {
+                match node {
+                    AstNode::VarDeclaration(decl) => {
+                        let resolve_tracking = context.get_mut().unwrap();
+
+                        let Some(block_tracking) = resolve_tracking.block_tracking_opt.get_mut()
+                        else {
+                            unreachable!("variable declaration outside of a block");
+                        };
+
+                        decl.identifier = block_tracking.symbols
+                            .add_variable(&mut resolve_tracking.global_tracking, &decl.identifier)?;
+                    }
+                    AstNode::Function(function) => {
+                        let resolve_tracking = context.get_mut().unwrap();
+
+                        // First lookup this new function declaration in the global symbol table. If the symbol is found
+                        // but is not a function, e.g.. is a variable, then no checks need to be done specifically
+                        // against it. We'll next try to add it to the appropriate scope, and that will fail if there's
+                        // a type mismatch.
+                        if let Some(Symbol::Function(param_count, is_definition)) = resolve_tracking.global_tracking.symbols.lookup_symbol(&function.name)? {
+                            // Already had a definition stored in the symbol table, and now trying to store another.
+                            if *is_definition && function.is_definition() {
+                                return Err(format!("duplicate function definition for {}", function.name));
+                            }
+
+                            if *param_count != function.parameters.len() {
+                                return Err(format!("cannot declare function {} with {} parameters. previously declared with {} parameters", function.name, function.parameters.len(), param_count));
+                            }
+                        }
+
+                        // We are in a block, so add this function declaration to the current block.
+                        if let Some(block_tracking) = resolve_tracking.block_tracking_opt.get_mut() {
+                            if function.is_definition() {
+                                return Err(format!("not permitted to have function definition within another function definition"));
+                            }
+
+                            block_tracking.symbols.add_function(&function)?;
+                        }
+
+                        // Function declarations have external linkage, and so all declarations of a given function need
+                        // to have the same signature, so also add it to the global table.
+                        resolve_tracking.global_tracking.symbols.add_function(&function)?;
+
+                        // Entering the function body creates a new scope. Note that this scope includes the parameters
+                        // and the function body together, so that declaring a variable in the function body that
+                        // tries to shadow a parameter is an error.
+                        if function.is_definition() {
+                            let mut new_block_tracking = BlockTracking::new();
+                            for param in function.parameters.iter_mut() {
+                                let temp_ident = new_block_tracking.symbols.add_variable(resolve_tracking.global_tracking, param)?;
+                                *param = temp_ident;
+                            }
+
+                            context
+                                .get_mut()
+                                .unwrap()
+                                .block_tracking_opt
+                                .nest(new_block_tracking);
+                        }
+                    }
+                    AstNode::Block(_)
+                    | AstNode::Statement(AstStatement {
+                        typ: AstStatementType::For(_, _, _, _, _, _),
+                        ..
+                    }) => {
+                        context
+                            .get_mut()
+                            .unwrap()
+                            .block_tracking_opt
+                            .nest(BlockTracking::new());
+                    }
+                    AstNode::Expression(
+                        AstExpression::Assignment(ast_exp_destination, _, _)
+                        | AstExpression::UnaryOperator(
+                            AstUnaryOperator::PrefixIncrement
+                            | AstUnaryOperator::PrefixDecrement
+                            | AstUnaryOperator::PostfixIncrement
+                            | AstUnaryOperator::PostfixDecrement,
+                            ast_exp_destination,
+                        ),
+                    ) => {
+                        let AstExpression::Var(_) = **ast_exp_destination else {
+                            return Err(format!(
+                                "{} is not an lvalue",
+                                display_with(|f| { ast_exp_destination.fmt_node(f, 0) })
+                            ));
+                        };
+                    }
+                    AstNode::Expression(AstExpression::Var(ast_ident)) => {
+                        let Some(block_tracking) =
+                            context.get_mut().unwrap().block_tracking_opt.get_mut()
+                        else {
+                            unreachable!("variable use {} outside of a block", ast_ident);
+                        };
+
+                        *ast_ident = block_tracking.resolve_variable(ast_ident)?.clone();
+                    }
+                    AstNode::Expression(AstExpression::FuncCall(ast_ident, arguments)) => {
+                        let Symbol::Function(param_count, _) = context.get().unwrap().lookup_function_declaration(ast_ident)? else {
+                            unreachable!("lookup_function_declaration returned something other than a function");
+                        };
+
+                        if arguments.len() != *param_count {
+                            return Err(format!("function {} expected {} arguments but was passed {}", ast_ident, param_count, arguments.len()));
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                match node {
+                    AstNode::Function(function) => {
+                        if function.is_definition() {
+                            let _ = context.get_mut().unwrap().block_tracking_opt.unnest();
+                        }
+                    }
+                    AstNode::Block(_)
+                    | AstNode::Statement(AstStatement {
+                        typ: AstStatementType::For(_, _, _, _, _, _),
+                        ..
+                    }) => {
+                        let _ = context.get_mut().unwrap().block_tracking_opt.unnest();
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(())
+        });
+
+        // Either the inner, nested part of the context had a clean traversal or there were errors.
+        assert!(
+            resolve_tracking
+                .get()
+                .unwrap()
+                .block_tracking_opt
+                .is_clean_traversal()
+                || resolve_tracking.had_errors()
+        );
+    }
+
+    fn traverse_ast<TContext, FuncVisit>(
+        &mut self,
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
+        let res = (func)(true, AstNode::Function(self), context);
+        if context.push_error(res) {
+            return;
+        }
+
+        if let Some(ref mut body) = self.body_opt {
+            for block_item in body.iter_mut() {
+                block_item.traverse_ast(context, func);
+            }
+        }
+
+        let res = (func)(false, AstNode::Function(self), context);
+        context.push_error(res);
     }
 
     fn to_tac(&self, global_tracking: &mut GlobalTracking) -> Result<TacFunction, String> {
-        let mut body_instructions = vec![];
-        self.body.to_tac(global_tracking, &mut body_instructions)?;
+        let body_opt = if let Some(body) = self.body_opt.as_ref() {
+            let mut body_instructions = vec![];
+            for block_item in body.iter() {
+                block_item.to_tac(global_tracking, &mut body_instructions)?;
+            }
 
-        // In C, functions lacking a return value either automatically return 0 (in the case of main), have undefined
-        // behavior (if the function's return value is actually used), or the return value doesn't matter (if the return
-        // value isn't examined). To handle all three cases, just add an extra "return 0" to the end of every function
-        // body.
-        body_instructions.push(TacInstruction::Return(TacVal::Constant(0)));
+            // In C, functions lacking a return value either automatically return 0 (in the case of main), have undefined
+            // behavior (if the function's return value is actually used), or the return value doesn't matter (if the return
+            // value isn't examined). To handle all three cases, just add an extra "return 0" to the end of every function
+            // body.
+            body_instructions.push(TacInstruction::Return(TacVal::Constant(0)));
+            Some(body_instructions)
+        } else {
+            None
+        };
 
         Ok(TacFunction {
-            name: String::from(self.name),
-            body: body_instructions,
+            name: self.name.0.clone(),
+            parameters: self.parameters.iter().map(AstIdentifier::to_tac).collect(),
+            body_opt,
         })
     }
 
@@ -764,22 +1039,28 @@ impl<'i> AstFunction<'i> {
     ) {
         // Examine all the goto labels in the function and rewrite them with an internal name while also checking
         // that there are no duplicates.
-        push_error(
-            self.for_each_statement(|ast_statement| {
+        self.traverse_ast(
+            &mut TraversalContext::new_blank(Some(errors)),
+            &mut |is_enter, mut node, context| {
+                if !is_enter {
+                    return Ok(());
+                }
+
+                let AstNode::Statement(ref mut ast_statement) = node else {
+                    return Ok(());
+                };
+
                 for label in ast_statement.labels.iter_mut() {
-                    match function_tracking.add_goto_label(global_tracking, label) {
-                        Ok(new_label) => {
-                            *label = new_label;
-                        }
-                        Err(err) => {
-                            errors.push(err);
-                        }
+                    let res = function_tracking.add_goto_label(global_tracking, label);
+                    if let Ok(new_label) = res {
+                        *label = new_label;
+                    } else {
+                        context.push_error(res);
                     }
                 }
 
                 Ok(())
-            }),
-            errors,
+            },
         );
     }
 
@@ -789,22 +1070,24 @@ impl<'i> AstFunction<'i> {
         errors: &mut Vec<String>,
     ) {
         // Examine each goto statement and convert its target label to the internal label name.
-        push_error(
-            self.for_each_statement(|ast_statement| {
-                if let AstStatementType::Goto(ref mut label) = ast_statement.typ {
-                    match function_tracking.resolve_label(label) {
-                        Ok(new_label) => {
-                            *label = new_label;
-                        }
-                        Err(err) => {
-                            errors.push(err);
-                        }
-                    }
+        self.traverse_ast(
+            &mut TraversalContext::new_blank(Some(errors)),
+            &mut |is_enter, node, _context| {
+                if !is_enter {
+                    return Ok(());
                 }
 
+                let AstNode::Statement(AstStatement {
+                    typ: AstStatementType::Goto(ref mut label),
+                    ..
+                }) = node
+                else {
+                    return Ok(());
+                };
+
+                *label = function_tracking.resolve_label(label)?;
                 Ok(())
-            }),
-            errors,
+            },
         );
     }
 
@@ -813,23 +1096,55 @@ impl<'i> AstFunction<'i> {
     // end of the body).
     //
     // Switch statements are similar but do not have a label for continue statements.
-    //
-    // Because of nesting, the current tracking data needs to store a reference to the containing tracking data, so when
-    // the loop is over, we can revert back to the parent.
-    //
-    // Because we are referencing break_tracking_opt in two closures, the borrow checker doesn't know that we are only
-    // referencing it one at a time, so store in a RefCell, to allow for borrowing it in both closures when needed.
     fn label_loops_and_switches(
         &mut self,
         global_tracking: &mut GlobalTracking,
         errors: &mut Vec<String>,
     ) {
-        let errors_len = errors.len();
+        #[derive(Debug)]
+        struct BreakTracking {
+            parent_opt: Option<Box<BreakTracking>>,
+            break_label: AstLabel,
+            continue_label_opt: Option<AstLabel>,
+        }
 
-        let break_tracking_opt = RefCell::new(None);
-        push_error(
-            self.for_each_statement_and_after(
-                |ast_statement| {
+        impl BreakTracking {
+            fn new(break_label: AstLabel, continue_label_opt: Option<AstLabel>) -> Self {
+                Self {
+                    parent_opt: None,
+                    break_label,
+                    continue_label_opt,
+                }
+            }
+
+            fn find_continue_label(&self) -> Option<&AstLabel> {
+                // Walk the parent chain until we find the closest continue label.
+                if self.continue_label_opt.is_some() {
+                    self.continue_label_opt.as_ref()
+                } else if let Some(parent) = self.parent_opt.as_ref() {
+                    parent.find_continue_label()
+                } else {
+                    None
+                }
+            }
+        }
+
+        impl Nestable for BreakTracking {
+            fn get_parent_opt_mut(&mut self) -> &mut Option<Box<Self>> {
+                &mut self.parent_opt
+            }
+        }
+
+        let mut break_tracking_opt = TraversalContext::new(None, Some(errors));
+
+        self.traverse_ast(
+            &mut break_tracking_opt,
+            &mut |is_enter, mut node, context| {
+                let AstNode::Statement(ref mut ast_statement) = node else {
+                    return Ok(());
+                };
+
+                if is_enter {
                     match ast_statement.typ {
                         AstStatementType::For(
                             _,
@@ -861,23 +1176,18 @@ impl<'i> AstFunction<'i> {
                             *ast_loop_end_label_opt =
                                 Some(AstLabel(global_tracking.allocate_label("loop_end")));
 
-                            // Store the pre-existing tracking info into the new tracking info, so we can revert to it
-                            // after this loop is done.
-                            let parent_opt = break_tracking_opt.borrow_mut().take();
-                            *break_tracking_opt.borrow_mut() = Some(Box::new(BreakTracking::new(
-                                parent_opt,
+                            context.nest(BreakTracking::new(
                                 ast_loop_end_label_opt.as_ref().unwrap().clone(),
                                 ast_body_end_label_opt.clone(),
-                            )));
+                            ));
                         }
                         AstStatementType::Break(ref mut label_opt) => {
                             assert!(label_opt.is_none());
 
-                            let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
-                                errors.push(format!(
+                            let Some(ref break_tracking) = context.get() else {
+                                return Err(format!(
                                     "break statement with no containing loop or switch"
                                 ));
-                                return Ok(());
                             };
 
                             // Write in the correct label to use for breaking in this scope.
@@ -887,16 +1197,14 @@ impl<'i> AstFunction<'i> {
                             assert!(label_opt.is_none());
 
                             // This could happen if the continue statement is found outside of a loop.
-                            let Some(ref break_tracking) = *break_tracking_opt.borrow() else {
-                                errors.push(format!("continue statement with no containing loop"));
-                                return Ok(());
+                            let Some(ref break_tracking) = context.get() else {
+                                return Err(format!("continue statement with no containing loop"));
                             };
 
                             // This could happen if the continue statement is found outside of a loop or anything else
                             // that uses BreakTracking, such as a switch statement.
                             let Some(continue_label) = break_tracking.find_continue_label() else {
-                                errors.push(format!("continue statement with no containing loop"));
-                                return Ok(());
+                                return Err(format!("continue statement with no containing loop"));
                             };
 
                             // Write in the correct label to use for continuing in this scope.
@@ -912,42 +1220,33 @@ impl<'i> AstFunction<'i> {
 
                             // Store the pre-existing tracking info into the new tracking info, so we can revert to
                             // it after this loop is done.
-                            let parent_opt = break_tracking_opt.borrow_mut().take();
-                            *break_tracking_opt.borrow_mut() = Some(Box::new(BreakTracking::new(
-                                parent_opt,
+                            context.nest(BreakTracking::new(
                                 ast_body_end_label_opt.as_ref().unwrap().clone(),
                                 None,
-                            )));
+                            ));
                         }
                         _ => {}
                     }
-
-                    Ok(())
-                },
-                |ast_statement| {
+                } else {
                     match ast_statement.typ {
                         AstStatementType::For(_, _, _, _, _, _)
                         | AstStatementType::While(_, _, _, _)
                         | AstStatementType::DoWhile(_, _, _, _)
                         | AstStatementType::Switch(_, _, _, _) => {
-                            assert!(break_tracking_opt.borrow().is_some());
+                            assert!(context.get().is_some());
 
                             // This for loop is done, so revert the break tracking to its containing one.
-                            let parent_opt =
-                                break_tracking_opt.borrow_mut().take().unwrap().parent_opt;
-                            *break_tracking_opt.borrow_mut() = parent_opt;
+                            let _ = context.unnest();
                         }
                         _ => {}
                     }
+                }
 
-                    Ok(())
-                },
-            ),
-            errors,
+                Ok(())
+            },
         );
 
-        // On success, make sure that after the traversal, the break tracking is reverted to its original state.
-        assert!(errors_len != errors.len() || break_tracking_opt.borrow().is_none());
+        assert!(break_tracking_opt.is_clean_traversal());
     }
 
     fn resolve_switch_cases(
@@ -955,23 +1254,48 @@ impl<'i> AstFunction<'i> {
         global_tracking: &mut GlobalTracking,
         errors: &mut Vec<String>,
     ) {
-        let switch_tracking_opt = RefCell::new(None);
-        let errors_len = errors.len();
+        #[derive(Debug)]
+        struct SwitchTracking {
+            parent_opt: Option<Box<SwitchTracking>>,
+            is_default_case_found: bool,
+            case_values: HashSet<i32>,
+            cases: Vec<SwitchCase>,
+        }
 
-        push_error(
-            self.for_each_statement_and_after(
-                |ast_statement| {
+        impl SwitchTracking {
+            fn new() -> Self {
+                Self {
+                    parent_opt: None,
+                    is_default_case_found: false,
+                    case_values: HashSet::new(),
+                    cases: Vec::new(),
+                }
+            }
+        }
+
+        impl Nestable for SwitchTracking {
+            fn get_parent_opt_mut(&mut self) -> &mut Option<Box<Self>> {
+                &mut self.parent_opt
+            }
+        }
+
+        let mut switch_tracking_opt = TraversalContext::new(None, Some(errors));
+
+        self.traverse_ast(
+            &mut switch_tracking_opt,
+            &mut |is_enter, mut node, context| {
+                let AstNode::Statement(ref mut ast_statement) = node else {
+                    return Ok(());
+                };
+
+                if is_enter {
                     match ast_statement.typ {
                         AstStatementType::Switch(_, _, _, _) => {
-                            // Store the pre-existing tracking info into the new tracking info, so we can revert to
-                            // it after this switch is done.
-                            let parent_opt = switch_tracking_opt.borrow_mut().take();
-                            *switch_tracking_opt.borrow_mut() =
-                                Some(Box::new(SwitchTracking::new(parent_opt)));
+                            // Encountered a switch statement, so enter a new switch tracking.
+                            context.nest(SwitchTracking::new());
                         }
                         AstStatementType::SwitchCase(ref mut case, _) => {
-                            let Some(ref mut switch_tracking) = *switch_tracking_opt.borrow_mut()
-                            else {
+                            let Some(ref mut switch_tracking) = context.get_mut() else {
                                 return Err(format!(
                                     "case statement outside of a switch statement"
                                 ));
@@ -1004,39 +1328,35 @@ impl<'i> AstFunction<'i> {
                         }
                         _ => {}
                     }
-
-                    Ok(())
-                },
-                |ast_statement| {
+                } else {
                     if let AstStatementType::Switch(_, _, _, ref mut cases) = ast_statement.typ {
-                        let switch_tracking = switch_tracking_opt.borrow_mut().take().unwrap();
-
+                        let switch_tracking = context.unnest();
                         *cases = switch_tracking.cases;
-
-                        // This for switch statement is done, so revert the tracking to its containing one.
-                        *switch_tracking_opt.borrow_mut() = switch_tracking.parent_opt;
                     }
+                }
 
-                    Ok(())
-                },
-            ),
-            errors,
+                Ok(())
+            },
         );
 
         // On success, we should have unwrapped all the switch tracking.
-        assert!(errors_len != errors.len() || switch_tracking_opt.borrow().is_none());
+        assert!(switch_tracking_opt.is_clean_traversal());
     }
 }
 
-impl<'i> FmtNode for AstFunction<'i> {
+impl FmtNode for AstFunction {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
         Self::write_indent(f, indent_levels)?;
         write!(f, "FUNC {}(", self.name)?;
         fmt_list(f, self.parameters.iter(), ", ")?;
-        writeln!(f, "):")?;
-        for block_item in self.body.0.iter() {
-            block_item.fmt_node(f, indent_levels + 1)?;
-            writeln!(f)?;
+        write!(f, ")")?;
+
+        if let Some(ref body) = self.body_opt {
+            writeln!(f, ":")?;
+            for block_item in body.iter() {
+                block_item.fmt_node(f, indent_levels + 1)?;
+                writeln!(f)?;
+            }
         }
 
         Ok(())
@@ -1047,21 +1367,35 @@ impl AstIdentifier {
     fn to_tac(&self) -> TacVar {
         TacVar(self.0.clone())
     }
+
+    fn to_tac_label(&self) -> TacLabel {
+        TacLabel(self.0.clone())
+    }
+}
+
+impl fmt::Display for AstIdentifier {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 impl AstBlockItem {
-    fn validate_and_resolve_variables(
+    fn traverse_ast<TContext, FuncVisit>(
         &mut self,
-        global_tracking: &mut GlobalTracking,
-        block_tracking: &mut BlockTracking,
-        errors: &mut Vec<String>,
-    ) {
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
         match self {
             AstBlockItem::Statement(statement) => {
-                statement.validate_and_resolve_variables(global_tracking, block_tracking, errors);
+                statement.traverse_ast(context, func);
             }
-            AstBlockItem::Declaration(declaration) => {
-                declaration.validate_and_resolve_variables(global_tracking, block_tracking, errors);
+            AstBlockItem::VarDeclaration(declaration) => {
+                declaration.traverse_ast(context, func);
+            }
+            AstBlockItem::FuncDeclaration(declaration) => {
+                declaration.traverse_ast(context, func);
             }
         }
     }
@@ -1073,8 +1407,14 @@ impl AstBlockItem {
     ) -> Result<(), String> {
         match self {
             AstBlockItem::Statement(statement) => statement.to_tac(global_tracking, instructions),
-            AstBlockItem::Declaration(declaration) => {
+            AstBlockItem::VarDeclaration(declaration) => {
                 declaration.to_tac(global_tracking, instructions)
+            }
+            AstBlockItem::FuncDeclaration(declaration) => {
+                // Function definitions as block items aren't supported and should have been rejected in a precious
+                // analysis pass. For declarations, no code is emitted.
+                assert!(!declaration.is_definition());
+                Ok(())
             }
         }
     }
@@ -1084,34 +1424,31 @@ impl FmtNode for AstBlockItem {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
         match self {
             AstBlockItem::Statement(statement) => statement.fmt_node(f, indent_levels),
-            AstBlockItem::Declaration(declaration) => declaration.fmt_node(f, indent_levels),
+            AstBlockItem::VarDeclaration(declaration) => declaration.fmt_node(f, indent_levels),
+            AstBlockItem::FuncDeclaration(declaration) => declaration.fmt_node(f, indent_levels),
         }
     }
 }
 
-impl AstDeclaration {
-    fn validate_and_resolve_variables(
+impl AstVarDeclaration {
+    fn traverse_ast<TContext, FuncVisit>(
         &mut self,
-        global_tracking: &mut GlobalTracking,
-        block_tracking: &mut BlockTracking,
-        errors: &mut Vec<String>,
-    ) {
-        match block_tracking.add_variable(global_tracking, &self.identifier) {
-            Ok(identifier) => {
-                self.identifier = identifier;
-            }
-            Err(error) => {
-                errors.push(error);
-                return;
-            }
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
+        let res = (func)(true, AstNode::VarDeclaration(self), context);
+        if context.push_error(res) {
+            return;
         }
 
         if let Some(initializer) = &mut self.initializer_opt {
-            push_error(
-                initializer.validate_and_resolve_variables(block_tracking),
-                errors,
-            );
+            initializer.traverse_ast(context, func);
         }
+
+        let res = (func)(false, AstNode::VarDeclaration(self), context);
+        context.push_error(res);
     }
 
     fn to_tac(
@@ -1128,11 +1465,11 @@ impl AstDeclaration {
     }
 }
 
-impl FmtNode for AstDeclaration {
+impl FmtNode for AstVarDeclaration {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
         Self::write_indent(f, indent_levels)?;
 
-        write!(f, "int {}", self.identifier.0)?;
+        write!(f, "int {}", self.identifier)?;
 
         if let Some(initializer) = &self.initializer_opt {
             write!(f, " = ")?;
@@ -1149,62 +1486,50 @@ impl AstLabel {
     }
 }
 
+impl fmt::Display for AstLabel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl AstStatement {
     fn new(typ: AstStatementType, labels: Vec<AstLabel>) -> Self {
         Self { typ, labels }
     }
 
-    fn validate_and_resolve_variables(
+    fn traverse_ast<TContext, FuncVisit>(
         &mut self,
-        global_tracking: &mut GlobalTracking,
-        block_tracking: &mut BlockTracking,
-        errors: &mut Vec<String>,
-    ) {
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
+        let res = (func)(true, AstNode::Statement(self), context);
+        if context.push_error(res) {
+            return;
+        }
+
         match &mut self.typ {
             AstStatementType::Return(expr) | AstStatementType::Expr(expr) => {
-                push_error(expr.validate_and_resolve_variables(block_tracking), errors);
+                expr.traverse_ast(context, func);
             }
             AstStatementType::If(condition_expr, then_statement, else_statement_opt) => {
-                push_error(
-                    condition_expr.validate_and_resolve_variables(block_tracking),
-                    errors,
-                );
-
-                then_statement.validate_and_resolve_variables(
-                    global_tracking,
-                    block_tracking,
-                    errors,
-                );
+                condition_expr.traverse_ast(context, func);
+                then_statement.traverse_ast(context, func);
 
                 if let Some(else_statement) = else_statement_opt {
-                    else_statement.validate_and_resolve_variables(
-                        global_tracking,
-                        block_tracking,
-                        errors,
-                    );
+                    else_statement.traverse_ast(context, func);
                 }
             }
             AstStatementType::While(condition_expr, body_statement, _, _)
             | AstStatementType::DoWhile(condition_expr, body_statement, _, _)
             | AstStatementType::Switch(condition_expr, body_statement, _, _) => {
-                push_error(
-                    condition_expr.validate_and_resolve_variables(block_tracking),
-                    errors,
-                );
-
-                body_statement.validate_and_resolve_variables(
-                    global_tracking,
-                    block_tracking,
-                    errors,
-                );
+                condition_expr.traverse_ast(context, func);
+                body_statement.traverse_ast(context, func);
             }
             AstStatementType::Goto(_label) => {}
             AstStatementType::Compound(block) => {
-                // Create a new scope contained within this one, so that variables can be declared within that shadow
-                // the outside ones.
-                let mut inner_block = BlockTracking::new(Some(&block_tracking));
-
-                block.validate_and_resolve_variables(global_tracking, &mut inner_block, errors);
+                block.traverse_ast(context, func);
             }
             AstStatementType::For(
                 ast_for_init,
@@ -1214,87 +1539,32 @@ impl AstStatement {
                 _ast_body_end_label_opt,
                 _ast_loop_end_label_opt,
             ) => {
-                // The for loop initializer introduces a new scope for its declarations, if any.
-                let mut inner_block = BlockTracking::new(Some(&block_tracking));
-                ast_for_init.validate_and_resolve_variables(
-                    global_tracking,
-                    &mut inner_block,
-                    errors,
-                );
+                ast_for_init.traverse_ast(context, func);
 
                 if let Some(expr) = ast_expr_condition_opt {
-                    push_error(
-                        expr.validate_and_resolve_variables(&mut inner_block),
-                        errors,
-                    );
+                    expr.traverse_ast(context, func);
                 }
 
                 if let Some(expr) = ast_expr_final_opt {
-                    push_error(
-                        expr.validate_and_resolve_variables(&mut inner_block),
-                        errors,
-                    );
+                    expr.traverse_ast(context, func);
                 }
 
-                ast_statement_body.validate_and_resolve_variables(
-                    global_tracking,
-                    &mut inner_block,
-                    errors,
-                );
+                ast_statement_body.traverse_ast(context, func);
             }
             AstStatementType::Break(_label) => {}
             AstStatementType::Continue(_label) => {}
             AstStatementType::SwitchCase(SwitchCase { expr_opt, .. }, statement) => {
                 if let Some(expr) = expr_opt {
-                    push_error(expr.validate_and_resolve_variables(block_tracking), errors);
+                    expr.traverse_ast(context, func);
                 }
 
-                statement.validate_and_resolve_variables(global_tracking, block_tracking, errors);
-            }
-            AstStatementType::Null => {}
-        }
-    }
-
-    fn for_each_statement_and_after<F1, F2>(
-        &mut self,
-        func: &mut F1,
-        func_after: &mut F2,
-    ) -> Result<(), String>
-    where
-        F1: FnMut(&mut AstStatement) -> Result<(), String>,
-        F2: FnMut(&mut AstStatement) -> Result<(), String>,
-    {
-        (func)(self)?;
-
-        match &mut self.typ {
-            AstStatementType::Return(_expr) => {}
-            AstStatementType::If(_expr, ref mut then_statement, ref mut else_statement_opt) => {
-                then_statement.for_each_statement_and_after(func, func_after)?;
-
-                if let Some(else_statement) = else_statement_opt {
-                    else_statement.for_each_statement_and_after(func, func_after)?;
-                }
-            }
-            AstStatementType::While(_, ast_statement_body, _, _)
-            | AstStatementType::DoWhile(_, ast_statement_body, _, _)
-            | AstStatementType::For(_, _, _, ast_statement_body, _, _)
-            | AstStatementType::Switch(_, ast_statement_body, _, _) => {
-                ast_statement_body.for_each_statement_and_after(func, func_after)?;
-            }
-            AstStatementType::Expr(_expr) => {}
-            AstStatementType::Goto(_label) => {}
-            AstStatementType::Compound(block) => {
-                block.for_each_statement_and_after(func, func_after)?;
-            }
-            AstStatementType::Break(_label) => {}
-            AstStatementType::Continue(_label) => {}
-            AstStatementType::SwitchCase(_, statement) => {
-                statement.for_each_statement_and_after(func, func_after)?;
+                statement.traverse_ast(context, func);
             }
             AstStatementType::Null => {}
         }
 
-        (func_after)(self)
+        let res = (func)(false, AstNode::Statement(self), context);
+        context.push_error(res);
     }
 
     fn to_tac(
@@ -1546,7 +1816,7 @@ impl FmtNode for AstStatement {
         Self::write_indent(f, indent_levels)?;
 
         for label in self.labels.iter() {
-            writeln!(f, "{}:", label.0)?;
+            writeln!(f, "{}:", label)?;
             Self::write_indent(f, indent_levels)?;
         }
 
@@ -1583,7 +1853,7 @@ impl FmtNode for AstStatement {
                 write!(f, "while (")?;
 
                 if let Some(ast_body_end_label) = ast_body_end_label_opt {
-                    write!(f, "{}: ", ast_body_end_label.0)?;
+                    write!(f, "{}: ", ast_body_end_label)?;
                 }
 
                 condition_expr.fmt_node(f, indent_levels)?;
@@ -1596,7 +1866,7 @@ impl FmtNode for AstStatement {
                 // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
                 // will jump to.
                 if let Some(ast_loop_end_label) = ast_loop_end_label_opt {
-                    writeln!(f, "{}:", ast_loop_end_label.0)?;
+                    writeln!(f, "{}:", ast_loop_end_label)?;
                     Self::write_indent(f, indent_levels)?;
                 }
             }
@@ -1614,7 +1884,7 @@ impl FmtNode for AstStatement {
                 Self::write_indent(f, indent_levels)?;
 
                 if let Some(ast_body_end_label) = ast_body_end_label_opt {
-                    write!(f, "{}: ", ast_body_end_label.0)?;
+                    write!(f, "{}: ", ast_body_end_label)?;
                 }
 
                 write!(f, "while (")?;
@@ -1627,7 +1897,7 @@ impl FmtNode for AstStatement {
                     writeln!(f)?;
                     Self::write_indent(f, indent_levels)?;
 
-                    writeln!(f, "{}:", ast_loop_end_label.0)?;
+                    writeln!(f, "{}:", ast_loop_end_label)?;
                     Self::write_indent(f, indent_levels)?;
                 }
             }
@@ -1650,7 +1920,7 @@ impl FmtNode for AstStatement {
                 // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
                 // will jump to.
                 if let Some(ast_body_end_label) = ast_body_end_label_opt {
-                    writeln!(f, "{}:", ast_body_end_label.0)?;
+                    writeln!(f, "{}:", ast_body_end_label)?;
                     Self::write_indent(f, indent_levels)?;
                 }
             }
@@ -1667,7 +1937,7 @@ impl FmtNode for AstStatement {
                     write!(f, ":")?;
 
                     if let Some(label) = label_opt {
-                        write!(f, " {}:", label.0)?;
+                        write!(f, " {}:", label)?;
                     }
 
                     writeln!(f)?;
@@ -1678,7 +1948,7 @@ impl FmtNode for AstStatement {
                 statement.fmt_node(f, indent_levels)?;
             }
             AstStatementType::Goto(label) => {
-                write!(f, "goto {}", label.0)?;
+                write!(f, "goto {}", label)?;
             }
             AstStatementType::Compound(block) => {
                 writeln!(f, "{{")?;
@@ -1710,7 +1980,7 @@ impl FmtNode for AstStatement {
                 // Print out the end label for the body if it's been populated yet. It occurs just before the condition.
                 // Helps with seeing where continue statements will jump to.
                 if let Some(ast_body_end_label) = ast_body_end_label_opt {
-                    write!(f, "; {}: ", ast_body_end_label.0)?;
+                    write!(f, "; {}: ", ast_body_end_label)?;
                 } else {
                     write!(f, ";")?;
                 }
@@ -1727,7 +1997,7 @@ impl FmtNode for AstStatement {
                 // Print out the loop end label if it's been populated yet. Helps with seeing where break statements
                 // will jump to.
                 if let Some(ast_loop_end_label) = ast_loop_end_label_opt {
-                    writeln!(f, "{}:", ast_loop_end_label.0)?;
+                    writeln!(f, "{}:", ast_loop_end_label)?;
                     Self::write_indent(f, indent_levels)?;
                 }
             }
@@ -1738,10 +2008,10 @@ impl FmtNode for AstStatement {
                 write!(f, "continue")?;
             }
             AstStatementType::Break(Some(ref label)) => {
-                write!(f, "break to {}", label.0)?;
+                write!(f, "break to {}", label)?;
             }
             AstStatementType::Continue(Some(ref label)) => {
-                write!(f, "continue to {}", label.0)?;
+                write!(f, "continue to {}", label)?;
             }
             AstStatementType::Null => {}
         }
@@ -1751,21 +2021,30 @@ impl FmtNode for AstStatement {
 }
 
 impl AstForInit {
-    fn validate_and_resolve_variables(
+    fn traverse_ast<TContext, FuncVisit>(
         &mut self,
-        global_tracking: &mut GlobalTracking,
-        block_tracking: &mut BlockTracking,
-        errors: &mut Vec<String>,
-    ) {
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
+        let res = (func)(true, AstNode::ForInit(self), context);
+        if context.push_error(res) {
+            return;
+        }
+
         match self {
             AstForInit::Declaration(decl) => {
-                decl.validate_and_resolve_variables(global_tracking, block_tracking, errors);
+                decl.traverse_ast(context, func);
             }
             AstForInit::Expression(Some(expr)) => {
-                push_error(expr.validate_and_resolve_variables(block_tracking), errors);
+                expr.traverse_ast(context, func);
             }
             AstForInit::Expression(None) => {}
         }
+
+        let res = (func)(false, AstNode::ForInit(self), context);
+        context.push_error(res);
     }
 
     fn to_tac(
@@ -2128,59 +2407,52 @@ impl AstExpression {
                 let right_val = ast_exp_right.eval_i32_constant()?;
                 Ok(if left_val != 0 { middle_val } else { right_val })
             }
+            AstExpression::FuncCall(_, _) => Err(format!(
+                "cannot evaluate constant expression with function call"
+            )),
         }
     }
 
-    fn validate_and_resolve_variables(
+    fn traverse_ast<TContext, FuncVisit>(
         &mut self,
-        block_tracking: &mut BlockTracking,
-    ) -> Result<(), String> {
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
+        let res = (func)(true, AstNode::Expression(self), context);
+        if context.push_error(res) {
+            return;
+        }
+
         match self {
             AstExpression::Constant(_num) => {}
-            AstExpression::UnaryOperator(ast_unary_op, ast_exp_inner) => {
-                match ast_unary_op {
-                    AstUnaryOperator::PrefixIncrement
-                    | AstUnaryOperator::PrefixDecrement
-                    | AstUnaryOperator::PostfixIncrement
-                    | AstUnaryOperator::PostfixDecrement => {
-                        let AstExpression::Var(_) = **ast_exp_inner else {
-                            return Err(format!(
-                                "{} is not an lvalue",
-                                display_with(|f| { ast_exp_inner.fmt_node(f, 0) })
-                            ));
-                        };
-                    }
-                    _ => (),
-                }
-
-                ast_exp_inner.validate_and_resolve_variables(block_tracking)?;
+            AstExpression::UnaryOperator(_ast_unary_op, ast_exp_inner) => {
+                ast_exp_inner.traverse_ast(context, func);
             }
             AstExpression::BinaryOperator(ast_exp_left, _binary_op, ast_exp_right) => {
-                ast_exp_left.validate_and_resolve_variables(block_tracking)?;
-                ast_exp_right.validate_and_resolve_variables(block_tracking)?;
+                ast_exp_left.traverse_ast(context, func);
+                ast_exp_right.traverse_ast(context, func);
             }
-            AstExpression::Var(ref mut ast_ident) => {
-                *ast_ident = block_tracking.resolve_variable(ast_ident)?.clone();
-            }
+            AstExpression::Var(_ast_ident) => {}
             AstExpression::Assignment(ast_exp_left, _operator, ast_exp_right) => {
-                let AstExpression::Var(_) = **ast_exp_left else {
-                    return Err(format!(
-                        "{} is not an lvalue",
-                        display_with(|f| { ast_exp_left.fmt_node(f, 0) })
-                    ));
-                };
-
-                ast_exp_left.validate_and_resolve_variables(block_tracking)?;
-                ast_exp_right.validate_and_resolve_variables(block_tracking)?;
+                ast_exp_left.traverse_ast(context, func);
+                ast_exp_right.traverse_ast(context, func);
             }
             AstExpression::Conditional(ast_exp_left, ast_exp_middle, ast_exp_right) => {
-                ast_exp_left.validate_and_resolve_variables(block_tracking)?;
-                ast_exp_middle.validate_and_resolve_variables(block_tracking)?;
-                ast_exp_right.validate_and_resolve_variables(block_tracking)?;
+                ast_exp_left.traverse_ast(context, func);
+                ast_exp_middle.traverse_ast(context, func);
+                ast_exp_right.traverse_ast(context, func);
+            }
+            AstExpression::FuncCall(_identifier, ref mut arguments) => {
+                for arg in arguments.iter_mut() {
+                    arg.traverse_ast(context, func);
+                }
             }
         }
 
-        Ok(())
+        let res = (func)(false, AstNode::Expression(self), context);
+        context.push_error(res);
     }
 
     fn to_tac(
@@ -2389,6 +2661,21 @@ impl AstExpression {
 
                 TacVal::Var(result_var)
             }
+            AstExpression::FuncCall(identifier, arguments) => {
+                let mut tac_args = vec![];
+                for ast_arg in arguments.iter() {
+                    tac_args.push(ast_arg.to_tac(global_tracking, instructions)?);
+                }
+
+                let tempvar = global_tracking.allocate_temporary();
+                instructions.push(TacInstruction::FuncCall(
+                    identifier.to_tac_label(),
+                    tac_args,
+                    tempvar.clone(),
+                ));
+
+                TacVal::Var(tempvar)
+            }
         })
     }
 }
@@ -2433,6 +2720,17 @@ impl FmtNode for AstExpression {
                 right.fmt_node(f, 0)?;
                 write!(f, ")")?;
             }
+            AstExpression::FuncCall(identifier, arguments) => {
+                write!(f, "CALL {}(", identifier)?;
+                for (i, arg) in arguments.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+
+                    arg.fmt_node(f, 0)?;
+                }
+                write!(f, ")")?;
+            }
         }
 
         Ok(())
@@ -2458,28 +2756,166 @@ impl FmtNode for TacProgram {
 
 impl TacFunction {
     fn to_asm(&self) -> Result<AsmFunction, String> {
+        let Some(ref tac_body) = self.body_opt else {
+            return Ok(AsmFunction::new(&self.name, None));
+        };
+
+        let mut frame = FuncStackFrame::new();
+
         let mut body = Vec::new();
-        for instruction in self.body.iter() {
+
+        // In our generated code, move any arguments passed in registers into their home area in memory. This makes it
+        // easy to reference everything uniformly by stack offsets instead of having to track when a value's storage
+        // location moves into or out of memory.
+        for (i, param) in self.parameters.iter().enumerate() {
+            let location = frame.create_parameter_location(i, param);
+
+            if let Some(reg) = PARAMETER_REG_MAPPING.get(i) {
+                body.push(AsmInstruction::Mov(
+                    AsmVal::Loc(AsmLocation::Reg(reg)),
+                    location.clone(),
+                ));
+            }
+        }
+
+        // In order to allocate sufficient stack space in this frame, iterate over all function calls and find out the
+        // max number of arguments passed to a child function. We'll need to reserve enough space to store all those
+        // arguments.
+        let max_arg_count = tac_body
+            .iter()
+            .map(|instruction| {
+                if let TacInstruction::FuncCall(_, arguments, _) = instruction {
+                    arguments.len() as u32
+                } else {
+                    0
+                }
+            })
+            .max()
+            .unwrap_or(0);
+
+        // We haven't yet stored this arguments information in the frame tracking.
+        assert!(frame.arguments_size == 0);
+
+        if max_arg_count > 0 {
+            // If any arguments were passed, then the entire set of "homed" parameters are allocated on the stack, even
+            // if fewer were used. This is x64 ABI. I don't make the rules.
+            let args_count_to_reserve =
+                std::cmp::max(max_arg_count, PARAMETER_REG_MAPPING.len() as u32);
+            frame.arguments_size = args_count_to_reserve * STACK_PARAMETER_SIZE;
+        }
+
+        for instruction in tac_body.iter() {
             instruction.to_asm(&mut body)?;
         }
 
-        Ok(AsmFunction {
-            name: self.name.clone(),
-            body,
-        })
+        let mut errors = Vec::new();
+        for inst in body.iter_mut() {
+            inst.traverse_asm(
+                &mut TraversalContext::new_blank(Some(&mut errors)),
+                &mut |is_enter, node, _context| {
+                    if !is_enter {
+                        return Ok(());
+                    }
+
+                    match node {
+                        AsmNode::Loc(loc) => loc.resolve_pseudoregister(&mut frame),
+                    }
+                },
+            );
+
+            if !errors.is_empty() {
+                return Err(errors.swap_remove(0));
+            }
+        }
+
+        debug!(target: "asm", func = self.name, locals_size = frame.locals_size, arguments_size = frame.arguments_size, "size before padding");
+
+        // The x64 ABI requires 16-byte alignment of the stack prior to any "call" instruction. If padding is needed,
+        // add it to the arguments size, i.e. after local variables. When setting up the call, argument locations are
+        // addressed relative to RSP rather than RBP, so this extra padding will effectively be between local variables
+        // and arguments.
+        //
+        // Important to remember that even though RSP is 16-byte aligned when issuing the call instruction, RSP is off
+        // by one pointer size when entering the new function, because call pushes the return address on the stack, so
+        // include that in the frame size to figure out the right padding to add.
+        if frame.arguments_size > 0 {
+            // This is the size of the locals size and arguments size and the return address.
+            let total_frame_size = frame.size() + POINTER_SIZE;
+
+            // Pad the total frame size to the required alignment and add to the arguments size whatever padding is
+            // needed to achieve that correct total frame size.
+            frame.arguments_size +=
+                pad_to_alignment(total_frame_size, FUNCTION_CALL_ALIGNMENT) - total_frame_size;
+        }
+
+        debug!(target: "asm", func = self.name, locals_size = frame.locals_size, arguments_size = frame.arguments_size, "size after padding");
+
+        // Allocate the stack frame's size at the beginning of the function body.
+        body.insert(0, AsmInstruction::AllocateStack(frame.size()));
+
+        // Now that the stack frame size is known, in any place that has a Ret instruction, fill it in.
+        for inst in body.iter_mut() {
+            if let AsmInstruction::Ret(size) = inst {
+                *size = frame.size();
+            }
+        }
+
+        let mut asm_func = AsmFunction::new(&self.name, Some(body));
+
+        debug!(target: "asm", asm = %DisplayFmtNode(&asm_func), "before convert rbp to rsp offset");
+
+        // Also now that the frame size is known, all RBP-relative offsets can be converted to RSP-relative.
+        for inst in asm_func.body_opt.as_mut().unwrap().iter_mut() {
+            assert!(errors.is_empty());
+            inst.traverse_asm(
+                &mut TraversalContext::new_blank(Some(&mut errors)),
+                &mut |is_enter, node, _context| {
+                    if !is_enter {
+                        return Ok(());
+                    }
+
+                    match node {
+                        AsmNode::Loc(loc) => {
+                            loc.convert_to_rsp_offset(&mut frame);
+                        }
+                    }
+
+                    Ok(())
+                },
+            );
+
+            if !errors.is_empty() {
+                return Err(errors.swap_remove(0));
+            }
+        }
+
+        Ok(asm_func)
     }
 }
 
 impl FmtNode for TacFunction {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
-        writeln!(f, "FUNC {}", self.name)?;
-        Self::fmt_nodelist(f, self.body.iter(), "\n", indent_levels + 1)
+        write!(f, "FUNC {} (", self.name)?;
+        Self::fmt_nodelist(f, self.parameters.iter(), ", ", indent_levels)?;
+        writeln!(f, ")")?;
+
+        if let Some(ref body) = self.body_opt {
+            Self::fmt_nodelist(f, body.iter(), "\n", indent_levels + 1)?;
+        }
+
+        Ok(())
     }
 }
 
 impl TacLabel {
     fn to_asm(&self) -> Result<AsmLabel, String> {
         Ok(AsmLabel::new(&self.0))
+    }
+}
+
+impl fmt::Display for TacLabel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -2593,8 +3029,8 @@ impl TacInstruction {
                     dest_asm_loc,
                 ));
             }
-            TacInstruction::CopyVal(src_val, dest_loc) => {
-                func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_loc.to_asm()?));
+            TacInstruction::CopyVal(src_val, dest_var) => {
+                func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_var.to_asm()?));
             }
             TacInstruction::Jump(label) => {
                 func_body.push(AsmInstruction::Jmp(label.to_asm()?));
@@ -2620,6 +3056,25 @@ impl TacInstruction {
             }
             TacInstruction::Label(label) => {
                 func_body.push(AsmInstruction::Label(label.to_asm()?));
+            }
+            TacInstruction::FuncCall(label, arguments, dest_var) => {
+                // Each argument is moved into a pseudoregister tagged as belonging to an argument and numbered so that
+                // it can eventually be resolved into the correct slot near the end of the frame. Because arguments are
+                // pushed onto the stack in reverse order, arg 0 will be closest to RSP.
+                for (i, arg) in arguments.iter().enumerate() {
+                    func_body.push(AsmInstruction::Mov(
+                        arg.to_asm()?,
+                        AsmLocation::PseudoArgReg(i as u32),
+                    ));
+                }
+
+                func_body.push(AsmInstruction::Call(mangle_function_name(&label.0)));
+
+                // Function return value is stored in eax. Move it to the expected destination location.
+                func_body.push(AsmInstruction::Mov(
+                    AsmVal::Loc(AsmLocation::Reg("eax")),
+                    dest_var.to_asm()?,
+                ));
             }
         }
 
@@ -2657,27 +3112,41 @@ impl FmtNode for TacInstruction {
                 src_val.fmt_node(f, 0)?;
             }
             TacInstruction::Jump(label) => {
-                write!(f, "jump :{}", label.0)?;
+                write!(f, "jump :{}", label)?;
             }
             TacInstruction::JumpIfZero(val, label) => {
-                write!(f, "jump :{} if ", label.0)?;
+                write!(f, "jump :{} if ", label)?;
                 val.fmt_node(f, 0)?;
                 write!(f, " == 0")?;
             }
             TacInstruction::JumpIfNotZero(val, label) => {
-                write!(f, "jump :{} if ", label.0)?;
+                write!(f, "jump :{} if ", label)?;
                 val.fmt_node(f, 0)?;
                 write!(f, " != 0")?;
             }
             TacInstruction::JumpIfEqual(val1, val2, label) => {
-                write!(f, "jump :{} if ", label.0)?;
+                write!(f, "jump :{} if ", label)?;
                 val1.fmt_node(f, 0)?;
                 write!(f, " == ")?;
                 val2.fmt_node(f, 0)?;
             }
             TacInstruction::Label(label) => {
                 writeln!(f)?;
-                write!(f, "{}:", label.0)?;
+                write!(f, "{}:", label)?;
+            }
+            TacInstruction::FuncCall(label, arguments, dest_var) => {
+                dest_var.fmt_node(f, 0)?;
+                write!(f, " = call :{} (", label)?;
+                let mut first = true;
+                for arg in arguments.iter() {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+
+                    arg.fmt_node(f, 0)?;
+                    first = false;
+                }
+                write!(f, ")")?;
             }
         }
 
@@ -2813,16 +3282,54 @@ impl AsmProgram {
         Ok(format!(
             "{}",
             display_with(|f| {
-                write!(
+                writeln!(
                     f,
-                    "INCLUDELIB msvcrt.lib\n\
-                       .DATA\n\
-                       \n\
-                       .CODE\n"
+                    r"
+INCLUDELIB msvcrt.lib
+                    "
                 )?;
 
-                for func in self.functions.iter() {
+                writeln!(f, "; ALIAS declarations in this section allow for function names with keywords to be used as identifiers")?;
+
+                // Only emit each function once. Let definitions take precedence over declarations.
+                let mut func_names = HashSet::new();
+                for func in self
+                    .functions
+                    .iter()
+                    .filter(|f| f.is_definition())
+                    .chain(self.functions.iter().filter(|f| !f.is_definition()))
+                {
+                    if func_names.insert(&func.name) {
+                        func.emit_declaration(f)?;
+                    }
+                }
+
+                writeln!(
+                    f,
+                    r"
+.DATA
+.CODE
+                         "
+                )?;
+
+                for func in self.functions.iter().filter(|f| f.is_definition()) {
                     func.emit_code(f)?;
+                }
+
+                writeln!(f)?;
+                writeln!(f, "; NOKEYWORD is used here to allow us to import or export the original function name, when that name might be a MASM keyword.")?;
+
+                // Only emit each function once. Let definitions take precedence over declarations.
+                func_names.clear();
+                for func in self
+                    .functions
+                    .iter()
+                    .filter(|f| f.is_definition())
+                    .chain(self.functions.iter().filter(|f| !f.is_definition()))
+                {
+                    if func_names.insert(&func.name) {
+                        func.emit_footer(f)?;
+                    }
                 }
 
                 write!(f, "\nEND")?;
@@ -2840,74 +3347,44 @@ impl FmtNode for AsmProgram {
 }
 
 impl AsmFunction {
+    fn new(name: &str, body_opt: Option<Vec<AsmInstruction>>) -> Self {
+        Self {
+            name: String::from(name),
+            mangled_name: mangle_function_name(name),
+            body_opt,
+        }
+    }
+
+    fn is_definition(&self) -> bool {
+        self.body_opt.is_some()
+    }
+
+    fn has_mangled_name(&self) -> bool {
+        self.name != self.mangled_name
+    }
+
     fn finalize(&mut self) -> Result<(), String> {
-        let mut frame = FuncStackFrame::new();
-
-        // TODO: consider an iterator over all locations
-        for inst in self.body.iter_mut() {
-            match inst {
-                AsmInstruction::Mov(src_val, dest_loc) => {
-                    src_val.resolve_pseudoregister(&mut frame)?;
-                    dest_loc.resolve_pseudoregister(&mut frame)?;
-                }
-                AsmInstruction::UnaryOp(_, dest_loc) => {
-                    dest_loc.resolve_pseudoregister(&mut frame)?;
-                }
-                AsmInstruction::BinaryOp(_, src_val, dest_loc) => {
-                    src_val.resolve_pseudoregister(&mut frame)?;
-                    dest_loc.resolve_pseudoregister(&mut frame)?;
-                }
-                AsmInstruction::Idiv(denom_val) => {
-                    denom_val.resolve_pseudoregister(&mut frame)?;
-                }
-                AsmInstruction::Cdq => {}
-                AsmInstruction::AllocateStack(_) => {}
-                AsmInstruction::Ret(_) => {}
-                AsmInstruction::Cmp(src1_val, src2_val) => {
-                    src1_val.resolve_pseudoregister(&mut frame)?;
-                    src2_val.resolve_pseudoregister(&mut frame)?;
-                }
-                AsmInstruction::SetCc(_cond_code, dest_loc) => {
-                    dest_loc.resolve_pseudoregister(&mut frame)?;
-                }
-                AsmInstruction::Jmp(_label) => {}
-                AsmInstruction::JmpCc(_cond_code, _label) => {}
-                AsmInstruction::Label(_label) => {}
-            }
-        }
-
-        // Allocate the stack frame's size at the beginning of the function body.
-        self.body
-            .insert(0, AsmInstruction::AllocateStack(frame.size()));
-
-        // In any place that has a Ret instruction, fill it in with the stack frame size.
-        for inst in self.body.iter_mut() {
-            if let AsmInstruction::Ret(size) = inst {
-                *size = frame.size();
-            }
-        }
-
-        for inst in self.body.iter_mut() {
-            inst.convert_to_rsp_offset(&frame);
-        }
+        let Some(ref mut body) = self.body_opt else {
+            return Ok(());
+        };
 
         let mut i;
 
         // Shift left and shift right only allow immedate or CL (that's 8-bit ecx) register as the right hand side. If
         // the rhs isn't in there already, move it first.
         i = 0;
-        while i < self.body.len() {
+        while i < body.len() {
             if let AsmInstruction::BinaryOp(
                 AsmBinaryOperator::Shl | AsmBinaryOperator::Sar,
                 ref mut src_val,
                 _dest_loc,
-            ) = &mut self.body[i]
+            ) = &mut body[i]
             {
                 if src_val.get_base_reg_name() != Some("cx") {
                     let real_src_val = src_val.clone();
                     *src_val = AsmVal::Loc(AsmLocation::Reg("cl"));
 
-                    self.body.insert(
+                    body.insert(
                         i,
                         AsmInstruction::Mov(real_src_val, AsmLocation::Reg("ecx")),
                     );
@@ -2923,16 +3400,16 @@ impl AsmFunction {
         // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store it in a
         // temporary register.
         i = 0;
-        while i < self.body.len() {
+        while i < body.len() {
             if let AsmInstruction::Mov(
                 ref _src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
                 ref mut dest_loc @ AsmLocation::RspOffset(_, _),
-            ) = &mut self.body[i]
+            ) = &mut body[i]
             {
                 let real_dest = dest_loc.clone();
                 *dest_loc = AsmLocation::Reg("r10d");
 
-                self.body.insert(
+                body.insert(
                     i + 1,
                     AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r10d")), real_dest),
                 );
@@ -2947,12 +3424,12 @@ impl AsmFunction {
         // Multiply doesn't allow a memory address as the destination. Fix it up so the destination is a temporary
         // register and then written to the destination memory address.
         i = 0;
-        while i < self.body.len() {
+        while i < body.len() {
             if let AsmInstruction::BinaryOp(
                 AsmBinaryOperator::Imul,
                 _src_val,
                 ref mut dest_loc @ AsmLocation::RspOffset(_, _),
-            ) = &mut self.body[i]
+            ) = &mut body[i]
             {
                 let real_dest = dest_loc.clone();
 
@@ -2961,14 +3438,14 @@ impl AsmFunction {
                 *dest_loc = AsmLocation::Reg("r11d");
 
                 // Insert a mov before the multiply, to put the destination value in the temporary register.
-                self.body.insert(
+                body.insert(
                     i,
                     AsmInstruction::Mov(AsmVal::Loc(real_dest.clone()), AsmLocation::Reg("r11d")),
                 );
 
                 // Insert a mov instruction after the multiply, to put the destination value into the intended
                 // memory address.
-                self.body.insert(
+                body.insert(
                     i + 2,
                     AsmInstruction::Mov(AsmVal::Loc(AsmLocation::Reg("r11d")), real_dest),
                 );
@@ -2983,14 +3460,12 @@ impl AsmFunction {
         // Cmp of course can't take immediates for both left and right sides, because otherwise the value is known at
         // compile time. So move the right hand side into a destination register first.
         i = 0;
-        while i < self.body.len() {
-            if let AsmInstruction::Cmp(_src_val, ref mut dest_val @ AsmVal::Imm(_)) =
-                &mut self.body[i]
-            {
+        while i < body.len() {
+            if let AsmInstruction::Cmp(_src_val, ref mut dest_val @ AsmVal::Imm(_)) = &mut body[i] {
                 let real_dest_val = dest_val.clone();
                 *dest_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
 
-                self.body.insert(
+                body.insert(
                     i,
                     AsmInstruction::Mov(real_dest_val, AsmLocation::Reg("r10d")),
                 );
@@ -3004,16 +3479,16 @@ impl AsmFunction {
 
         // Cmp doesn't support memory addresses for both operands, so move the left hand side into a register first.
         i = 0;
-        while i < self.body.len() {
+        while i < body.len() {
             if let AsmInstruction::Cmp(
                 ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
                 ref _dest_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
-            ) = &mut self.body[i]
+            ) = &mut body[i]
             {
                 let real_src_val = src_val.clone();
                 *src_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
 
-                self.body.insert(
+                body.insert(
                     i,
                     AsmInstruction::Mov(real_src_val, AsmLocation::Reg("r10d")),
                 );
@@ -3028,17 +3503,17 @@ impl AsmFunction {
         // For any binary operator that uses a stack offset for both right hand side and dest, x64 assembly requires
         // that we first store the destination in a temporary register.
         i = 0;
-        while i < self.body.len() {
+        while i < body.len() {
             if let AsmInstruction::BinaryOp(
                 _binary_op,
                 ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
                 ref _dest_loc @ AsmLocation::RspOffset(_, _),
-            ) = &mut self.body[i]
+            ) = &mut body[i]
             {
                 let real_src_val = src_val.clone();
                 *src_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
 
-                self.body.insert(
+                body.insert(
                     i,
                     AsmInstruction::Mov(real_src_val, AsmLocation::Reg("r10d")),
                 );
@@ -3052,13 +3527,13 @@ impl AsmFunction {
 
         // idiv doesn't accept an immediate value as the operand, so fixup to put the immediate in a register first.
         i = 0;
-        while i < self.body.len() {
-            if let AsmInstruction::Idiv(ref mut denom_val @ AsmVal::Imm(_)) = &mut self.body[i] {
+        while i < body.len() {
+            if let AsmInstruction::Idiv(ref mut denom_val @ AsmVal::Imm(_)) = &mut body[i] {
                 let real_denom_val = denom_val.clone();
                 *denom_val = AsmVal::Loc(AsmLocation::Reg("r10d"));
 
                 // Insert a mov before this idiv to put its immediate value in a register.
-                self.body.insert(
+                body.insert(
                     i,
                     AsmInstruction::Mov(real_denom_val, AsmLocation::Reg("r10d")),
                 );
@@ -3073,14 +3548,70 @@ impl AsmFunction {
         Ok(())
     }
 
-    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "{} PROC", self.name)?;
+    fn emit_declaration(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // The ALIAS <new_name> = <existing_name> directive creates a new entry with "new_name", and requires that you
+        // have a definition or EXTERN entry for "existing_name" elsewhere in the ASM listing. For functions that don't
+        // have any name mangling, of course this doesn't have any effect and in fact causes a multiple declarations
+        // error.
+        if self.has_mangled_name() {
+            // If we have a definition, it is emitted later in the listing using its mangled name so that it can be
+            // easily referenced within this listing. This is necessary especially if the function name is a built-in,
+            // reserved word like "add", "sub", "mov", etc..
+            //
+            // If we have only a declaration, then there will be an EXTERN directive later in the ASM listing that
+            // brings in the function by its original name from some other compilation unit. But we might not be able
+            // to refer to that original name, if it's one of those reserved words. So set up an alias with a mangled
+            // name that we can use to refer to it in this listing.
+            if !self.is_definition() {
+                writeln!(f, "ALIAS <{}> = <{}>", self.mangled_name, self.name)?;
+            }
+        }
 
-        for inst in self.body.iter() {
+        Ok(())
+    }
+
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let Some(ref body) = self.body_opt else {
+            unreachable!("should not call emit_code on a declaration");
+        };
+
+        write!(f, "{} PROC", self.mangled_name)?;
+
+        // For any functions that have a mangled name, we don't want to expose the mangled name to allow linking against
+        // it from other compilation units. We'll expose the correct name a different way. See `emit_footer` for that.
+        if self.has_mangled_name() {
+            write!(f, " PRIVATE")?;
+        }
+
+        writeln!(f)?;
+
+        for inst in body.iter() {
             inst.emit_code(f)?;
         }
 
-        writeln!(f, "{} ENDP", self.name)?;
+        writeln!(f, "{} ENDP", self.mangled_name)
+    }
+
+    fn emit_footer(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // If we are defining a new function in this listing, we did so using a mangled name to avoid clashing with
+        // reserved MASM keywords. Because we mangled the name, we also declared it as PRIVATE (a.k.a. static) so that
+        // other compilation units can't link against it. But we do want the original name available to be linked
+        // against, so make it not a keyword and assign a new label to it, then publicize that label. That makes it show
+        // up properly in the object file.
+        if self.is_definition() {
+            if self.has_mangled_name() {
+                writeln!(f, "OPTION NOKEYWORD: <{}>", self.name)?;
+                writeln!(f, "{} = {}", self.name, self.mangled_name)?;
+                writeln!(f, "PUBLIC {}", self.name)?;
+            }
+
+        // If we were bringing in a function, it needs an EXTERN declaration. Because it might be a reserved MASM
+        // keyword, remove the name from the keywords list.
+        } else {
+            writeln!(f, "OPTION NOKEYWORD: <{}>", self.name)?;
+            writeln!(f, "EXTERN {}:PROC", self.name)?;
+        }
+
         Ok(())
     }
 }
@@ -3088,7 +3619,12 @@ impl AsmFunction {
 impl FmtNode for AsmFunction {
     fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
         writeln!(f, "FUNC {}", self.name)?;
-        Self::fmt_nodelist(f, self.body.iter(), "\n", 1)
+
+        if let Some(ref body) = self.body_opt {
+            Self::fmt_nodelist(f, body.iter(), "\n", 1)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -3109,35 +3645,42 @@ impl FmtNode for AsmLabel {
 }
 
 impl AsmInstruction {
-    fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
+    fn traverse_asm<TContext, FuncVisit>(
+        &mut self,
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AsmNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
         match self {
             AsmInstruction::Mov(src_val, dest_loc) => {
-                src_val.convert_to_rsp_offset(frame);
-                dest_loc.convert_to_rsp_offset(frame);
+                src_val.traverse_asm(context, func);
+                dest_loc.traverse_asm(context, func);
             }
             AsmInstruction::UnaryOp(_, dest_loc) => {
-                dest_loc.convert_to_rsp_offset(frame);
+                dest_loc.traverse_asm(context, func);
             }
             AsmInstruction::BinaryOp(_, src_val, dest_loc) => {
-                src_val.convert_to_rsp_offset(frame);
-                dest_loc.convert_to_rsp_offset(frame);
+                src_val.traverse_asm(context, func);
+                dest_loc.traverse_asm(context, func);
             }
             AsmInstruction::Idiv(denom_val) => {
-                denom_val.convert_to_rsp_offset(frame);
+                denom_val.traverse_asm(context, func);
             }
             AsmInstruction::Cdq => {}
             AsmInstruction::AllocateStack(_) => {}
             AsmInstruction::Ret(_) => {}
             AsmInstruction::Cmp(src1_val, src2_val) => {
-                src1_val.convert_to_rsp_offset(frame);
-                src2_val.convert_to_rsp_offset(frame);
+                src1_val.traverse_asm(context, func);
+                src2_val.traverse_asm(context, func);
             }
             AsmInstruction::SetCc(_cond_code, dest_loc) => {
-                dest_loc.convert_to_rsp_offset(frame);
+                dest_loc.traverse_asm(context, func);
             }
             AsmInstruction::Jmp(_label) => {}
             AsmInstruction::JmpCc(_cond_code, _label) => {}
             AsmInstruction::Label(_label) => {}
+            AsmInstruction::Call(_func_name) => {}
         }
     }
 
@@ -3148,9 +3691,9 @@ impl AsmInstruction {
                     f,
                     |f| {
                         write!(f, "mov ")?;
-                        dest_loc.emit_code(f, 4)?;
+                        dest_loc.emit_code(f, VARIABLE_SIZE as u8)?;
                         write!(f, ",")?;
-                        src_val.emit_code(f, 4)
+                        src_val.emit_code(f, VARIABLE_SIZE as u8)
                     },
                     |f| {
                         dest_loc.fmt_asm_comment(f)?;
@@ -3165,7 +3708,7 @@ impl AsmInstruction {
                     |f| {
                         unary_op.emit_code(f)?;
                         write!(f, " ")?;
-                        dest_loc.emit_code(f, 4)
+                        dest_loc.emit_code(f, VARIABLE_SIZE as u8)
                     },
                     |f| {
                         unary_op.emit_code(f)?;
@@ -3178,7 +3721,7 @@ impl AsmInstruction {
                 // sar and shl require only 1-byte operand for the shift amount.
                 let src_size = match binary_op {
                     AsmBinaryOperator::Shl | AsmBinaryOperator::Sar => 1,
-                    _ => 4,
+                    _ => VARIABLE_SIZE as u8,
                 };
 
                 format_code_and_comment(
@@ -3186,7 +3729,7 @@ impl AsmInstruction {
                     |f| {
                         binary_op.emit_code(f)?;
                         write!(f, " ")?;
-                        dest_loc.emit_code(f, 4)?;
+                        dest_loc.emit_code(f, VARIABLE_SIZE as u8)?;
                         write!(f, ",")?;
                         src_val.emit_code(f, src_size)
                     },
@@ -3209,7 +3752,7 @@ impl AsmInstruction {
                     f,
                     |f| {
                         write!(f, "idiv ")?;
-                        denom_val.emit_code(f, 4)
+                        denom_val.emit_code(f, VARIABLE_SIZE as u8)
                     },
                     |f| {
                         write!(f, "edx:eax <- idiv ")?;
@@ -3228,7 +3771,7 @@ impl AsmInstruction {
                 format_code_and_comment(
                     f,
                     |f| write!(f, "add rsp,{}", size),
-                    |f| write!(f, "stack_alloc {} bytes", size),
+                    |f| write!(f, "stack_dealloc {} bytes", size),
                 )?;
 
                 writeln!(f, "    ret")?;
@@ -3238,9 +3781,9 @@ impl AsmInstruction {
                     f,
                     |f| {
                         write!(f, "cmp ")?;
-                        src2_val.emit_code(f, 4)?;
+                        src2_val.emit_code(f, VARIABLE_SIZE as u8)?;
                         write!(f, ",")?;
-                        src1_val.emit_code(f, 4)
+                        src1_val.emit_code(f, VARIABLE_SIZE as u8)
                     },
                     |f| {
                         src2_val.fmt_asm_comment(f)?;
@@ -3288,6 +3831,9 @@ impl AsmInstruction {
                 writeln!(f)?;
                 label.emit_code(f)?;
                 writeln!(f, ":")?;
+            }
+            AsmInstruction::Call(func_name) => {
+                writeln!(f, "    call {}", func_name)?;
             }
         }
 
@@ -3354,6 +3900,9 @@ impl FmtNode for AsmInstruction {
                 label.fmt_node(f, 0)?;
                 write!(f, ":")?;
             }
+            AsmInstruction::Call(func_name) => {
+                write!(f, "Call {}", func_name)?;
+            }
         }
 
         Ok(())
@@ -3368,18 +3917,16 @@ impl AsmVal {
         }
     }
 
-    fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
+    fn traverse_asm<TContext, FuncVisit>(
+        &mut self,
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AsmNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
         if let AsmVal::Loc(loc) = self {
-            loc.convert_to_rsp_offset(frame);
+            loc.traverse_asm(context, func);
         }
-    }
-
-    fn resolve_pseudoregister(&mut self, frame: &mut FuncStackFrame) -> Result<(), String> {
-        if let AsmVal::Loc(loc) = self {
-            return loc.resolve_pseudoregister(frame);
-        }
-
-        Ok(())
     }
 
     fn emit_code(&self, f: &mut fmt::Formatter, size: u8) -> fmt::Result {
@@ -3425,6 +3972,22 @@ impl FmtNode for AsmVal {
 }
 
 impl AsmLocation {
+    fn traverse_asm<TContext, FuncVisit>(
+        &mut self,
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AsmNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
+        let res = (func)(true, AsmNode::Loc(self), context);
+        if context.push_error(res) {
+            return;
+        }
+
+        let res = (func)(false, AsmNode::Loc(self), context);
+        context.push_error(res);
+    }
+
     fn get_base_reg_name(&self) -> Option<&'static str> {
         match self {
             AsmLocation::Reg("rax" | "eax" | "ax" | "al") => Some("ax"),
@@ -3448,8 +4011,29 @@ impl AsmLocation {
     }
 
     fn resolve_pseudoregister(&mut self, frame: &mut FuncStackFrame) -> Result<(), String> {
-        if let AsmLocation::PseudoReg(psr) = self {
-            *self = frame.create_or_get_location(&psr)?;
+        match self {
+            AsmLocation::PseudoReg(psr) => {
+                *self = frame.create_or_get_location(&psr)?;
+            }
+
+            // This is a pseudoregister that represents an argument rather than a local variable. arg_num 0 is the first
+            // in the parameter list and therefore closest to RSP.
+            AsmLocation::PseudoArgReg(arg_num) => {
+                // Some arguments are passed in registers, so first check if this is one of those.
+                *self = if let Some(reg) = PARAMETER_REG_MAPPING.get(*arg_num as usize) {
+                    AsmLocation::Reg(reg)
+                } else {
+                    // Beyond the register arguments, the rest are stored on the stack. The stack grows
+                    // downwards, meaning that allocating space on the stack means making RSP have a numerically
+                    // smaller value. So the first argument (0th) would be written at bytes [RSP + 0, RSP + 8), i.e.
+                    // RSP+0.
+                    AsmLocation::RspOffset(
+                        *arg_num * STACK_PARAMETER_SIZE,
+                        format!("arg_{}", *arg_num),
+                    )
+                };
+            }
+            _ => {}
         }
 
         Ok(())
@@ -3457,9 +4041,8 @@ impl AsmLocation {
 
     fn convert_to_rsp_offset(&mut self, frame: &FuncStackFrame) {
         if let AsmLocation::RbpOffset(rbp_offset, name) = self {
-            let rsp_offset = frame.size() as i32 + *rbp_offset;
-            assert!(rsp_offset >= 0);
-            *self = AsmLocation::RspOffset(rsp_offset as u32, name.clone());
+            *self =
+                AsmLocation::RspOffset(frame.rsp_offset_from_rbp_offset(*rbp_offset), name.clone());
         }
     }
 
@@ -3545,6 +4128,9 @@ impl FmtNode for AsmLocation {
             }
             AsmLocation::PseudoReg(name) => {
                 f.write_str(&name)?;
+            }
+            AsmLocation::PseudoArgReg(num) => {
+                write!(f, "arg_{}", num)?;
             }
             AsmLocation::RbpOffset(offset, name) => {
                 write!(
@@ -3635,11 +4221,90 @@ impl fmt::Display for AsmCondCode {
     }
 }
 
+impl SymbolTable {
+    fn new() -> Self {
+        Self {
+            symbols: HashMap::new(),
+        }
+    }
+
+    fn add_function(&mut self, function: &AstFunction) -> Result<(), String> {
+        if let Some(symbol) = self.symbols.get(&function.name) {
+            return match symbol {
+                Symbol::Var(_) => Err(format!(
+                    "function {} previously defined as a variable in this scope",
+                    function.name
+                )),
+                Symbol::Function(param_count, _) => {
+                    if *param_count != function.parameters.len() {
+                        Err(format!("function {} declared with {} parameters, but previously declared with {} parameters", function.name, function.parameters.len(), param_count))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+        }
+
+        let old_value = self.symbols.insert(
+            function.name.clone(),
+            Symbol::Function(function.parameters.len(), function.is_definition()),
+        );
+        assert!(old_value.is_none());
+
+        Ok(())
+    }
+
+    fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<Option<&Symbol>, String> {
+        if let Some(symbol) = self.symbols.get(identifier) {
+            if let Symbol::Function(_, _) = symbol {
+                Ok(Some(symbol))
+            } else {
+                Err(format!(
+                    "identifier {} declared as not a function",
+                    identifier
+                ))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Adds a variable to the map and returns a unique, mangled identifier to refer to the variable with.
+    fn add_variable(
+        &mut self,
+        global_tracking: &mut GlobalTracking,
+        ast_identifier: &AstIdentifier,
+    ) -> Result<AstIdentifier, String> {
+        if let Some(symbol) = self.symbols.get(&ast_identifier) {
+            match symbol {
+                Symbol::Var(_) => {
+                    return Err(format!("duplicate variable declaration {}", ast_identifier));
+                }
+                Symbol::Function(_, _) => {
+                    return Err(format!(
+                        "variable {} previously defined as a function in this scope",
+                        ast_identifier
+                    ));
+                }
+            }
+        }
+
+        let temp_var = global_tracking.create_temporary_ast_ident(&ast_identifier);
+        let old_value = self
+            .symbols
+            .insert(ast_identifier.clone(), Symbol::Var(temp_var.clone()));
+        assert!(old_value.is_none());
+
+        Ok(temp_var)
+    }
+}
+
 impl GlobalTracking {
     fn new() -> Self {
         Self {
             next_temporary_id: 0,
             next_label_id: 0,
+            symbols: SymbolTable::new(),
         }
     }
 
@@ -3653,7 +4318,7 @@ impl GlobalTracking {
         AstIdentifier(format!(
             "{:03}_var_{}",
             self.next_temporary_id - 1,
-            identifier.0
+            identifier
         ))
     }
 
@@ -3676,11 +4341,10 @@ impl FunctionTracking {
         label: &AstLabel,
     ) -> Result<AstLabel, String> {
         if self.labels.contains_key(&label) {
-            return Err(format!("duplicate label declaration \"{}\"", &label.0));
+            return Err(format!("duplicate label declaration \"{}\"", label));
         }
 
-        let temp_label =
-            AstLabel(global_tracking.allocate_label(&format!("0userlabel_{}", &label.0)));
+        let temp_label = AstLabel(global_tracking.allocate_label(&format!("0userlabel_{}", label)));
         let old_value = self.labels.insert(label.clone(), temp_label.clone());
         assert!(old_value.is_none());
 
@@ -3692,109 +4356,184 @@ impl FunctionTracking {
         if let Some(temp_label) = self.labels.get(label) {
             Ok(temp_label.clone())
         } else {
-            Err(format!("label '{}' not found", &label.0))
+            Err(format!("label '{}' not found", label))
         }
     }
 }
 
-impl<'p> BlockTracking<'p> {
-    fn new(parent_opt: Option<&'p BlockTracking>) -> Self {
-        Self {
-            parent_opt,
-            variables: HashMap::new(),
-        }
-    }
-
-    /// Adds a variable to the map and returns a unique, mangled identifier to refer to the variable with.
-    fn add_variable(
-        &mut self,
-        global_tracking: &mut GlobalTracking,
-        identifier: &AstIdentifier,
-    ) -> Result<AstIdentifier, String> {
-        if self.variables.contains_key(&identifier) {
-            return Err(format!("duplicate variable declaration {}", &identifier.0));
-        }
-
-        let temp_var = global_tracking.create_temporary_ast_ident(&identifier);
-        let old_value = self.variables.insert(identifier.clone(), temp_var.clone());
-        assert!(old_value.is_none());
-
-        Ok(temp_var)
-    }
-
-    fn resolve_variable(&self, identifier: &AstIdentifier) -> Result<&AstIdentifier, String> {
-        // If the variable was found in this scope, return its mangled version.
-        if let Some(temp_ident) = self.variables.get(identifier) {
-            Ok(temp_ident)
-        } else if let Some(parent) = self.parent_opt {
-            // If this block is contained within another block, search that one for a variable instead.
-            parent.resolve_variable(identifier)
-        } else {
-            Err(format!("variable '{}' not found", &identifier.0))
-        }
-    }
-}
-
-impl BreakTracking {
-    fn new(
-        parent_opt: Option<Box<BreakTracking>>,
-        break_label: AstLabel,
-        continue_label_opt: Option<AstLabel>,
-    ) -> Self {
-        Self {
-            parent_opt,
-            break_label,
-            continue_label_opt,
-        }
-    }
-
-    fn find_continue_label(&self) -> Option<&AstLabel> {
-        // Walk the parent chain until we find the closest continue label.
-        if self.continue_label_opt.is_some() {
-            self.continue_label_opt.as_ref()
-        } else if let Some(parent) = self.parent_opt.as_ref() {
-            parent.find_continue_label()
-        } else {
-            None
-        }
-    }
-}
-
-impl SwitchTracking {
-    fn new(parent_opt: Option<Box<SwitchTracking>>) -> Self {
-        Self {
-            parent_opt,
-            is_default_case_found: false,
-            case_values: HashSet::new(),
-            cases: Vec::new(),
-        }
-    }
-}
-
+// Example stack. Caller passed us 6 parameters. This function uses 3 local variables and itself calls another function
+// that takes 5 parameters.
+//
+// param 5         | 8   | RBP + 48  | RSP + 104
+// param 4         | 8   | RBP + 40  | RSP + 96
+// param 3         | 8   | RBP + 32  | RSP + 88
+// param 2         | 8   | RBP + 24  | RSP + 80
+// param 1         | 8   | RBP + 16  | RSP + 72
+// param 0         | 8   | RBP + 8   | RSP + 64
+// return addr     | 8   | RBP + 0   | RSP + 56
+// local 1         | 4   | RBP - 4   | RSP + 52
+// local 2         | 4   | RBP - 8   | RSP + 48
+// local 3         | 4   | RBP - 12  | RSP + 44
+// padding         | 4   |           | RSP + 40
+// arg 4           | 8   |           | RSP + 32
+// arg 3           | 8   |           | RSP + 24
+// arg 2           | 8   |           | RSP + 16
+// arg 1           | 8   |           | RSP + 8
+// arg 0           | 8   |           | RSP + 0
+//
+// Locals size: 3 * 4 = 12
+// Arguments size: 5 * 8 = 40
+// Frame size including return value: 12 + 40 + 8 = 60
+// Not 16-byte aligned, so need to add 4 bytes of padding
+// Total frame size: 64 bytes
+//
+// The stack grows "downwards", meaning each new function call's data is at a numerically smaller address than the
+// previous one. So the "top" of the stack has the numerically smallest address.
+//
+// RBP is the "base pointer", and means the bottom of the current function's stack area. This is the location where the
+// call instruction that led to this function's execution stored the return value.
+//
+// Parameters passed to this function live in memory owned by the caller, so they are at positive offsets from RBP,
+// right after the return address, so starting at RBP+8.
+//
+// The first local variable for the current function is the first thing within this stack frame. Since the stack grows
+// downwards, that means negative offsets from RBP. Each variable right now uses 4 bytes, putting the first local
+// variable in RBP-4. In the example, the last local variable referenced by the current stack frame is at RBP-12,
+// because that's the "top" of this frame's local variables.
+//
+// RSP is the "stack pointer" and points to the top of the stack. If this function doesn't call any other functions,
+// then RSP would point to the last local variable. If this function does call another function, then RSP points to the
+// first argument. Subsequent arguments live at positive RSP offsets near the top of the stack, with the first
+// argument being at RSP+0 and each subsequent one at an 8-byte slot farther from the top, e.g. RSP+8, RSP+16, etc..
+//
+// When issuing a call instruction, RSP must be 16-byte aligned, so if any padding is needed, it takes the next space
+// after the last stack argument.
+//
+// The x64 ABI says that the first 4 parameters are passed in registers RCX, RDX, R8, and R9, respectively, but space
+// must also be allocated on the stack in case the callee wants to take the address of one of those parameters. That
+// reserved space is called the "home area".
 impl FuncStackFrame {
     fn new() -> Self {
         Self {
             names: HashMap::new(),
-            max_base_offset: 0,
+            locals_size: 0,
+            arguments_size: 0,
         }
+    }
+
+    // Store a mapping from a parameter name to its location in this stack frame.
+    fn create_parameter_location(&mut self, param_num: usize, param: &TacVar) -> AsmLocation {
+        // RBP points to the return address, so to get to the parameters, we have to skip over that. Then the very next
+        // slot is the first parameter.
+        let rbp_offset = (POINTER_SIZE + (param_num as u32 * STACK_PARAMETER_SIZE)) as i32;
+
+        // Parameters are allocated by the caller (i.e. live in the caller's stack frame), so all parameters must be at
+        // positive RBP offsets, or else they'd actually be in this stack frame. Moreover, they need to be passt the
+        // return address.
+        assert!(rbp_offset >= POINTER_SIZE as i32);
+
+        let res = self.names.insert(param.0.clone(), rbp_offset);
+        assert!(res.is_none());
+
+        AsmLocation::RbpOffset(rbp_offset, param.0.clone())
     }
 
     fn create_or_get_location(&mut self, name: &str) -> Result<AsmLocation, String> {
         if let Some(offset) = self.names.get(name) {
             Ok(AsmLocation::RbpOffset(*offset, String::from(name)))
         } else {
-            // For now we are only storing 4-byte values.
-            self.max_base_offset += 4;
-            let offset = -(self.max_base_offset as i32);
+            // For now we are only storing VARIABLE_SIZE values. The maximum offset from the base pointer that is used
+            // in this stack frame grows by one slot.
+            self.locals_size += VARIABLE_SIZE;
 
-            assert!(self.names.insert(String::from(name), offset).is_none());
+            // And the offset of this location is at the new edge.
+            let offset = -(self.locals_size as i32);
+
+            let res = self.names.insert(String::from(name), offset);
+            assert!(res.is_none());
 
             Ok(AsmLocation::RbpOffset(offset, String::from(name)))
         }
     }
 
+    fn rsp_offset_from_rbp_offset(&self, rbp_offset: i32) -> u32 {
+        let rsp_offset = self.size() as i32 + rbp_offset;
+        assert!(rsp_offset >= 0);
+        rsp_offset as u32
+    }
+
     fn size(&self) -> u32 {
-        self.max_base_offset
+        self.locals_size + self.arguments_size
+    }
+}
+
+impl<'e> TraversalContext<'e, ()> {
+    fn new_blank(errors_opt: Option<&'e mut Vec<String>>) -> TraversalContext<'e, ()> {
+        Self::new(None, errors_opt)
+    }
+}
+
+impl<'e, T> TraversalContext<'e, T> {
+    fn new(initial: Option<T>, errors_opt: Option<&'e mut Vec<String>>) -> Self {
+        Self {
+            inner: initial.map(Box::new),
+            errors_len: errors_opt.as_deref().map(Vec::len).unwrap_or(0),
+            errors_opt,
+        }
+    }
+
+    /// Enters a deeper level of the context.
+    fn nest(&mut self, mut val: T)
+    where
+        T: Nestable,
+    {
+        // The new value that is becoming the current context gets its parent reference set to the current context.
+        *val.get_parent_opt_mut() = self.inner.take();
+
+        // The current context is set to the new context.
+        self.inner = Some(Box::new(val));
+    }
+
+    /// Exits a level of nesting.
+    fn unnest(&mut self) -> Box<T>
+    where
+        T: Nestable,
+    {
+        // Extract the current context, which is becoming obsolete.
+        let mut old_this = self.inner.take();
+
+        // Grab the parent context out of the current context and set it to be the new current context.
+        self.inner = old_this.as_mut().unwrap().get_parent_opt_mut().take();
+
+        // Return the former current context (with no parent link, of course).
+        old_this.unwrap()
+    }
+
+    /// Get a reference to the current context.
+    fn get(&self) -> Option<&T> {
+        self.inner.as_deref()
+    }
+
+    /// Get a mutable reference to the current context.
+    fn get_mut(&mut self) -> Option<&mut T> {
+        self.inner.as_deref_mut()
+    }
+
+    fn push_error<TError>(&mut self, result: Result<TError, String>) -> bool {
+        if let Some(ref mut errors) = self.errors_opt {
+            push_error(result, errors)
+        } else {
+            false
+        }
+    }
+
+    fn had_errors(&self) -> bool {
+        self.errors_opt.as_deref().map(Vec::len).unwrap_or(0) != self.errors_len
+    }
+
+    fn is_clean_traversal(&self) -> bool {
+        // Either this object has gotten unnested to its original state or it encountered an error.
+        self.inner.is_none() || self.had_errors()
     }
 }
 
@@ -3852,7 +4591,7 @@ fn lex_all_tokens<'i>(input: &'i str) -> Result<Vec<&'i str>, Vec<String>> {
 
 fn try_parse_function<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
-) -> Result<Option<AstFunction<'i>>, String> {
+) -> Result<Option<AstFunction>, String> {
     let mut tokens = original_tokens.clone();
 
     if !tokens.try_consume_expected_next_token("int") {
@@ -3867,23 +4606,36 @@ fn try_parse_function<'i, 't>(
         return Ok(None);
     }
 
+    // After the opening parenthesis for parameters, we're committed to parsing a function.
     *original_tokens = tokens;
 
     let mut parameters = vec![];
-    while let Some(parameter_name) =
-        try_parse_function_parameter(original_tokens, parameters.len() == 0)?
-    {
-        parameters.push(parameter_name);
+
+    // If the first parameter is void type, then it must be the only parameter. Otherwise, parse regular parameters.
+    if !original_tokens.try_consume_expected_next_token("void") {
+        while let Some(parameter_name) =
+            try_parse_function_parameter(original_tokens, parameters.len() == 0)?
+        {
+            parameters.push(parameter_name);
+        }
     }
 
     original_tokens.consume_expected_next_token(")")?;
 
-    let body = parse_block(original_tokens)?;
+    // This is either a function definition (body is present) or a function declaration (body absent, but semicolon
+    // instead).
+    let body_opt = try_parse_block(original_tokens)?;
+    if body_opt.is_none() {
+        original_tokens.consume_expected_next_token(";")?;
+    }
 
     Ok(Some(AstFunction {
-        name,
+        name: AstIdentifier(String::from(name)),
         parameters,
-        body,
+
+        // We parsed the body as an AstBlock, but it's stored as a list of block items, because the body doesn't
+        // introduce a new scope beyond the function itlself.
+        body_opt: body_opt.map(|v| v.0),
     }))
 }
 
@@ -3891,7 +4643,7 @@ fn try_parse_function<'i, 't>(
 fn try_parse_function_parameter<'i, 't>(
     tokens: &mut Tokens<'i, 't>,
     is_first_parameter: bool,
-) -> Result<Option<&'i str>, String> {
+) -> Result<Option<AstIdentifier>, String> {
     if !is_first_parameter {
         if !tokens.try_consume_expected_next_token(",") {
             return Ok(None);
@@ -3902,7 +4654,9 @@ fn try_parse_function_parameter<'i, 't>(
         return Ok(None);
     }
 
-    tokens.consume_identifier().map(Some)
+    tokens
+        .consume_identifier()
+        .map(|i| Some(AstIdentifier(String::from(i))))
 }
 
 fn parse_block<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstBlock, String> {
@@ -3927,8 +4681,11 @@ fn try_parse_block<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<Option<AstBloc
 
 #[instrument(target = "parse", level = "debug")]
 fn parse_block_item<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
-    if let Some(declaration) = try_parse_declaration(tokens)? {
-        Ok(AstBlockItem::Declaration(declaration))
+    // Try parsing as a function first, because the parameter list makes it easier to differentiate from an identifier.
+    if let Some(func) = try_parse_function(tokens)? {
+        Ok(AstBlockItem::FuncDeclaration(func))
+    } else if let Some(declaration) = try_parse_var_declaration(tokens)? {
+        Ok(AstBlockItem::VarDeclaration(declaration))
     } else {
         Ok(AstBlockItem::Statement(parse_statement(tokens)?))
     }
@@ -4037,7 +4794,7 @@ fn try_parse_for_statement<'i, 't>(
 
     tokens.consume_expected_next_token("(")?;
 
-    let initializer = if let Ok(Some(decl)) = try_parse_declaration(tokens) {
+    let initializer = if let Ok(Some(decl)) = try_parse_var_declaration(tokens) {
         AstForInit::Declaration(decl)
     } else {
         AstForInit::Expression(parse_optional_expression(tokens, ";")?)
@@ -4080,9 +4837,9 @@ fn parse_statement_labels<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<Vec<Ast
 }
 
 #[instrument(target = "parse", level = "debug")]
-fn try_parse_declaration<'i, 't>(
+fn try_parse_var_declaration<'i, 't>(
     tokens: &mut Tokens<'i, 't>,
-) -> Result<Option<AstDeclaration>, String> {
+) -> Result<Option<AstVarDeclaration>, String> {
     if !tokens.try_consume_expected_next_token("int") {
         return Ok(None);
     }
@@ -4098,7 +4855,7 @@ fn try_parse_declaration<'i, 't>(
 
     tokens.consume_expected_next_token(";")?;
 
-    let decl = AstDeclaration {
+    let decl = AstVarDeclaration {
         identifier: AstIdentifier(String::from(var_name)),
         initializer_opt,
     };
@@ -4241,10 +4998,14 @@ fn parse_factor<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, St
     } else if let Ok(operator) = tokens.consume_and_parse_next_token::<AstUnaryOperator>() {
         let inner = parse_factor(tokens)?;
         AstExpression::UnaryOperator(operator, Box::new(inner))
+    } else if let Some(func_call) = try_parse_function_call(tokens)? {
+        func_call
     } else if let Ok(var_name) = tokens.consume_identifier() {
         AstExpression::Var(AstIdentifier(String::from(var_name)))
-    } else {
+    } else if !tokens.is_empty() {
         return Err(format!("unknown factor \"{}\"", tokens[0]));
+    } else {
+        return Err(format!("end of file reached while parsing factor"));
     };
 
     // Immediately after parsing a factor, attempt to parse a postfix operator, because it's higher precedence than
@@ -4256,6 +5017,38 @@ fn parse_factor<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstExpression, St
             factor
         },
     )
+}
+
+fn try_parse_function_call<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+) -> Result<Option<AstExpression>, String> {
+    let mut tokens = original_tokens.clone();
+
+    let Some(identifier) = tokens.try_consume_identifier() else {
+        return Ok(None);
+    };
+
+    if !tokens.try_consume_expected_next_token("(") {
+        return Ok(None);
+    }
+
+    // With an identifier and an open parenthesis, this is now committed to being a function call.
+    *original_tokens = tokens;
+
+    let mut arguments = vec![];
+    while !original_tokens.try_consume_expected_next_token(")") {
+        // Arguments are separated by commas.
+        if !arguments.is_empty() {
+            original_tokens.consume_expected_next_token(",")?;
+        }
+
+        arguments.push(parse_expression(original_tokens)?);
+    }
+
+    Ok(Some(AstExpression::FuncCall(
+        AstIdentifier(String::from(identifier)),
+        arguments,
+    )))
 }
 
 #[instrument(target = "parse", level = "debug")]
@@ -4281,26 +5074,20 @@ fn try_parse_postfix_operator<'i, 't>(
     ret
 }
 
-fn generate_program_code(mode: Mode, ast_program: &mut AstProgram) -> Result<String, String> {
+fn generate_program_code(mode: Mode, ast_program: &AstProgram) -> Result<String, String> {
     let tac_program = ast_program.to_tac()?;
 
-    info!(
-        "tac:\n{}\n",
-        display_with(|f| { tac_program.fmt_node(f, 0) })
-    );
+    info!(tac = %DisplayFmtNode(&tac_program));
 
     match mode {
         Mode::All | Mode::CodegenOnly => {
             let mut asm_program = tac_program.to_asm()?;
 
-            info!("asm:\n{}", display_with(|f| asm_program.fmt_node(f, 0)));
+            info!(asm = %DisplayFmtNode(&asm_program));
 
             asm_program.finalize()?;
 
-            info!(
-                "asm after fixup:\n{}",
-                display_with(|f| asm_program.fmt_node(f, 0))
-            );
+            info!(asm = %DisplayFmtNode(&asm_program), "asm after finalize");
 
             asm_program.emit_code()
         }
@@ -4320,28 +5107,68 @@ fn get_register_name(register_name: &str, width: u32) -> String {
 
 // TODO: should have proper error handling in here
 fn assemble_and_link(
-    code: &str,
-    output_exe_path: &str,
+    asm_path: &Path,
+    output_path: &str,
+    extra_link_args_opt: Option<&[String]>,
     should_suppress_output: bool,
     temp_dir: &Path,
 ) -> Option<i32> {
-    let asm_path = temp_dir.join("code.asm");
-    let exe_temp_output_path = temp_dir.join("output.exe");
-    let pdb_temp_output_path = temp_dir.join("output.pdb");
-
-    std::fs::write(&asm_path, &code);
+    let temp_dir = path::absolute(temp_dir).expect("failed to make absolute path");
 
     let mut command = Command::new("ml64.exe");
-    let args = [
-        "/Zi",
-        "/Feoutput.exe",
-        "code.asm",
-        "/link",
-        "/pdb:output.pdb",
-    ];
-    info!("ml64.exe {} {}", args[0], args[1]);
-    command.args(&args);
+
+    let asm_full_path = path::absolute(asm_path).expect("failed to get full path to asm file");
+    let asm_full_path_str = asm_full_path
+        .to_str()
+        .expect("failed to get full path string for asm file");
+
+    // If link args are specified, even an empty list of them, it indicates the caller wants linking, i.e. not
+    // compile-only.
+    let mut command_args;
+    let temp_output_path;
+    let mut temp_pdb_path_opt = None;
+    if let Some(extra_link_args) = extra_link_args_opt {
+        temp_output_path = temp_dir.join("output.exe");
+
+        let mut temp_pdb_path = temp_output_path.clone();
+        temp_pdb_path.set_extension("pdb");
+
+        command_args = vec![
+            String::from("/Zi"),
+            format!("/Fe{}", temp_output_path.display()),
+            String::from(asm_full_path_str),
+            String::from("/link"),
+            String::from("/nodefaultlib:libcmt"),
+            String::from("msvcrt.lib"),
+            format!("/pdb:{}", temp_pdb_path.display()),
+        ];
+
+        // It's common to pass paths to object or library files in the link args, but it's also common to pass linker
+        // arguments. For paths, make them absolute so they can be used even if we change current directory for the
+        // assembler execution.
+        for arg in extra_link_args.iter() {
+            command_args.push(if let Ok(true) = std::fs::exists(arg) {
+                String::from(path::absolute(arg).unwrap().to_str().unwrap())
+            } else {
+                arg.clone()
+            });
+        }
+
+        temp_pdb_path_opt = Some(temp_pdb_path);
+    } else {
+        temp_output_path = temp_dir.join("code.obj");
+        command_args = vec![
+            String::from("/Zi"),
+            String::from("/c"),
+            format!("/Fo{}", temp_output_path.display()),
+            String::from(asm_full_path_str),
+        ];
+    };
+
+    command.args(&command_args);
     command.current_dir(&temp_dir);
+
+    debug!("{}", format_command_args(&command));
 
     if should_suppress_output {
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -4349,13 +5176,19 @@ fn assemble_and_link(
 
     let status = command.status().expect("failed to run ml64.exe");
 
-    info!("assembly status: {:?}", status);
     if status.success() {
-        std::fs::rename(&exe_temp_output_path, &Path::new(output_exe_path));
+        debug!(assembly_status = %status);
 
-        let mut pdb_path = Path::new(output_exe_path).to_path_buf();
-        pdb_path.set_extension("pdb");
-        std::fs::rename(&pdb_temp_output_path, &pdb_path);
+        std::fs::rename(&temp_output_path, &Path::new(output_path));
+
+        // Also move the PDB
+        if extra_link_args_opt.is_some() {
+            let mut pdb_path = Path::new(output_path).to_path_buf();
+            pdb_path.set_extension("pdb");
+            std::fs::rename(temp_pdb_path_opt.as_ref().unwrap(), &pdb_path);
+        }
+    } else {
+        error!(assembly_status = %status);
     }
 
     status.code()
@@ -4363,7 +5196,7 @@ fn assemble_and_link(
 
 // TODO should return line numbers with errors
 #[instrument(target = "parse", level = "debug", skip_all)]
-fn parse_and_validate<'i>(mode: Mode, input: &'i str) -> Result<AstProgram<'i>, Vec<String>> {
+fn parse_and_validate(mode: Mode, input: &str) -> Result<AstProgram, Vec<String>> {
     let token_strings = lex_all_tokens(&input)?;
     let mut tokens = Tokens(&token_strings);
 
@@ -4406,17 +5239,22 @@ fn preprocess(
     should_suppress_output: bool,
     temp_dir: &Path,
 ) -> Result<String, String> {
+    let temp_dir = path::absolute(temp_dir).expect("failed to make absolute path");
     let preprocessed_output_path = temp_dir.join("input.i");
 
     let temp_input_path = temp_dir.join("input.c");
     std::fs::write(&temp_input_path, &input);
 
     let mut command = Command::new("cl.exe");
-    let args = ["/P", "/Fiinput.i", "input.c"];
+    let args = [
+        String::from("/P"),
+        format!("/Fi{}", preprocessed_output_path.display()),
+        String::from(temp_input_path.to_str().unwrap()),
+    ];
     command.args(&args);
-    command.current_dir(&temp_dir);
+    command.current_dir(temp_dir);
 
-    info!("preprocess command: {:?}", command);
+    info!("preprocess command: {}", format_command_args(&command));
 
     if should_suppress_output {
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -4447,21 +5285,27 @@ fn compile_and_link(
         let input = preprocess(input, should_suppress_output, temp_dir)?;
 
         match parse_and_validate(args.mode, &input) {
-            Ok(ref mut ast) => match args.mode {
+            Ok(ref ast) => match args.mode {
                 Mode::All | Mode::TacOnly | Mode::CodegenOnly => {
                     let asm = generate_program_code(args.mode, ast)?;
+                    info!("assembly:\n{}", &asm);
+
+                    let asm_path = temp_dir.join("code.asm");
+                    std::fs::write(&asm_path, &asm);
 
                     if let Mode::All = args.mode {
-                        info!("assembly:\n{}", asm);
-
                         let exit_code = assemble_and_link(
-                            &asm,
+                            &asm_path,
                             &args.output_path.as_ref().unwrap(),
+                            if args.should_compile_only {
+                                None
+                            } else {
+                                Some(&args.extra_link_args)
+                            },
                             should_suppress_output,
                             temp_dir,
                         )
                         .expect("programs should always have an exit code");
-                        info!("assemble status: {}", exit_code);
 
                         if exit_code == 0 {
                             Ok(exit_code)
@@ -4497,11 +5341,13 @@ fn compile_and_link(
     std::fs::create_dir_all(&temp_dir);
     let ret = helper(args, input, should_suppress_output, temp_dir);
 
-    // Remove the temp dir if the compile result matches what the caller was expecting.
-    if ret.is_ok() == should_expect_success {
+    // If the user requested to keep the intermediate files, then don't clean them up. Also, if the build result was not
+    // what the caller expected (mainly tests), don't clean them up.
+    if !args.should_keep_intermediate_files && ret.is_ok() == should_expect_success {
         debug!("cleaning up temp dir {}", temp_dir.to_string_lossy());
         std::fs::remove_dir_all(&temp_dir);
     }
+
     ret
 }
 
@@ -4547,6 +5393,18 @@ struct LcArgs {
 
     #[arg(short = 'v')]
     verbose: bool,
+
+    /// Keep intermediate build files
+    #[arg(short = 'k')]
+    should_keep_intermediate_files: bool,
+
+    /// Compile-only. Don't link.
+    #[arg(short = 'c')]
+    should_compile_only: bool,
+
+    /// Additional arguments for the linker.
+    #[arg(name = "link", long = "link", value_name = "LINK_ARGS")]
+    extra_link_args: Vec<String>,
 }
 
 fn main() {

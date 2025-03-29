@@ -1,5 +1,6 @@
 use {
     crate::*,
+    std::{io::Read, path},
     tracing_subscriber,
     tracing_subscriber::{util::SubscriberInitExt, EnvFilter, Registry},
 };
@@ -96,45 +97,90 @@ mod test {
         });
     }
 
-    fn codegen_run_and_check_exit_code_or_compile_failure(
+    fn run_and_check_exit_code_and_output(
+        exe_path: &str,
+        (expected_exit_code, expected_stdout_opt): (i32, Option<&str>),
+    ) -> bool {
+        let mut result = true;
+
+        let mut child = Command::new(exe_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect(&format!("failed to run {}", exe_path));
+
+        let actual_exit_code = child
+            .wait()
+            .expect("child process must exit")
+            .code()
+            .expect("all processes must have exit code");
+
+        assert_eq!(expected_exit_code, actual_exit_code);
+        if expected_exit_code != actual_exit_code {
+            result = false;
+        }
+
+        if let Some(expected_stdout) = expected_stdout_opt {
+            let mut output = String::new();
+            let _ = child
+                .stdout
+                .unwrap()
+                .read_to_string(&mut output)
+                .expect("failed to get child output");
+
+            assert_eq!(expected_stdout, &output);
+            if expected_stdout != &output {
+                result = false;
+            }
+        }
+
+        result
+    }
+
+    fn codegen_run_and_check_exit_code_and_output_or_compile_failure(
         input: &str,
-        expected_result: Option<i32>,
-    ) {
+        extra_link_args: &[String],
+        expected_result_opt: Option<(i32, Option<&str>)>,
+    ) -> bool {
+        let mut result = true;
+
         let args = LcArgs {
             input_path: String::new(),
             output_path: Some(format!("test_{}.exe", generate_random_string(8))),
+            extra_link_args: Vec::from(extra_link_args),
             mode: Mode::All,
             verbose: true,
+            should_keep_intermediate_files: false,
+            should_compile_only: false,
         };
 
-        let compile_result = compile_and_link(&args, input, true, expected_result.is_some());
+        let compile_result = compile_and_link(&args, input, true, expected_result_opt.is_some());
         if compile_result.is_ok() {
-            let exe_path_abs = Path::new(args.output_path.as_ref().unwrap())
-                .canonicalize()
-                .unwrap();
+            let exe_path_abs = path::absolute(args.output_path.as_ref().unwrap()).unwrap();
             let exe_path_str = exe_path_abs.to_str().unwrap();
             let mut pdb_path = exe_path_abs.clone();
             pdb_path.set_extension("pdb");
 
-            if let Some(expected_exit_code) = expected_result {
-                let actual_exit_code = Command::new(exe_path_str)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .expect(&format!("failed to run {}", exe_path_str))
-                    .code()
-                    .expect("all processes must have exit code");
-
-                assert_eq!(expected_exit_code, actual_exit_code);
-                std::fs::remove_file(&exe_path_abs);
-                std::fs::remove_file(&pdb_path);
+            if let Some(expected_result) = expected_result_opt {
+                if run_and_check_exit_code_and_output(exe_path_str, expected_result) {
+                    std::fs::remove_file(&exe_path_abs);
+                    std::fs::remove_file(&pdb_path);
+                } else {
+                    result = false;
+                }
             } else {
                 assert!(false, "compile succeeded but expected failure");
+                result = false;
             }
         } else {
             println!("compile failed! {:?}", compile_result);
-            assert!(expected_result.is_none());
+            assert!(expected_result_opt.is_none());
+            if expected_result_opt.is_some() {
+                result = false;
+            }
         }
+
+        result
     }
 
     fn validate_error_count(input: &str, expected_error_count: usize) {
@@ -150,11 +196,27 @@ mod test {
     }
 
     fn codegen_run_and_check_exit_code(input: &str, expected_exit_code: i32) {
-        codegen_run_and_check_exit_code_or_compile_failure(input, Some(expected_exit_code))
+        let _ = codegen_run_and_check_exit_code_and_output_or_compile_failure(
+            input,
+            &[],
+            Some((expected_exit_code, None)),
+        );
     }
 
     fn codegen_run_and_expect_compile_failure(input: &str) {
-        codegen_run_and_check_exit_code_or_compile_failure(input, None)
+        let _ = codegen_run_and_check_exit_code_and_output_or_compile_failure(input, &[], None);
+    }
+
+    fn codegen_run_and_check_exit_code_and_output(
+        input: &str,
+        expected_exit_code: i32,
+        expected_stdout: &str,
+    ) {
+        let _ = codegen_run_and_check_exit_code_and_output_or_compile_failure(
+            input,
+            &[],
+            Some((expected_exit_code, Some(expected_stdout))),
+        );
     }
 
     fn test_codegen_expression(expression: &str, expected_exit_code: i32) {
@@ -173,6 +235,148 @@ mod test {
 
     fn test_codegen_mainfunc_failure(body: &str) {
         codegen_run_and_expect_compile_failure(&format!("int main() {{\n{}\n}}", body))
+    }
+
+    fn test_library(client_code: &str, library_code: &str, expected_exit_code: i32) {
+        full_test_library(client_code, library_code, expected_exit_code, None)
+    }
+
+    fn test_library_with_output(
+        client_code: &str,
+        library_code: &str,
+        expected_exit_code: i32,
+        expected_stdout: &str,
+    ) {
+        full_test_library(
+            client_code,
+            library_code,
+            expected_exit_code,
+            Some(expected_stdout),
+        )
+    }
+
+    fn full_test_library(
+        client_code: &str,
+        library_code: &str,
+        expected_exit_code: i32,
+        expected_stdout_opt: Option<&str>,
+    ) {
+        fn compile_with_standard_compiler(
+            code: &str,
+            temp_dir: &Path,
+            output_filename: &str,
+            extra_link_args_opt: Option<&[String]>,
+        ) -> PathBuf {
+            let code_path = temp_dir.join("code.c");
+            let output_path = temp_dir.join(output_filename);
+
+            std::fs::write(&code_path, code)
+                .map_err(format_io_err)
+                .unwrap();
+
+            let mut args = vec![];
+
+            args.push(String::from("/Zi"));
+            args.push(String::from(
+                path::absolute(code_path)
+                    .unwrap()
+                    .to_str()
+                    .expect("failed to format code path as string"),
+            ));
+
+            // If link args were supplied, even empty ones, then it means we're intended to link and produce an
+            // executable. Otherwise only compile to an object file.
+            if let Some(extra_link_args) = extra_link_args_opt {
+                args.push(format!("/Fe{}", output_filename));
+
+                args.push(String::from("/link"));
+                args.push(String::from("/nodefaultlib:libcmt"));
+                args.push(String::from("msvcrt.lib"));
+                for arg in extra_link_args.iter() {
+                    args.push(arg.clone());
+                }
+            } else {
+                args.push(String::from("/c"));
+                args.push(format!("/Fo{}", output_filename));
+            }
+
+            let mut command = Command::new("cl.exe");
+
+            command
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .current_dir(&temp_dir);
+
+            debug!(
+                "compile_with_standard_compiler command: {}",
+                format_command_args(&command)
+            );
+
+            let status = command.status().expect("failed to run cl.exe");
+
+            if !status.success() {
+                error!("cl failed with {:?}", status);
+            }
+
+            path::absolute(output_path).unwrap()
+        }
+
+        // First compile the library with the standard compiler and compile the client code with this compiler.
+        let temp_dir_name = format!("testrun_{}", generate_random_string(8));
+        let temp_dir = Path::new(&temp_dir_name);
+        std::fs::create_dir_all(&temp_dir);
+
+        let obj_path = compile_with_standard_compiler(library_code, &temp_dir, "library.obj", None);
+
+        if codegen_run_and_check_exit_code_and_output_or_compile_failure(
+            client_code,
+            &[String::from(obj_path.to_str().unwrap())],
+            Some((expected_exit_code, expected_stdout_opt)),
+        ) {
+            debug!("cleaning up temp dir {}", temp_dir.to_string_lossy());
+            std::fs::remove_dir_all(&temp_dir);
+        } else {
+            return;
+        }
+
+        let temp_dir_name = format!("testrun_{}", generate_random_string(8));
+        let temp_dir = Path::new(&temp_dir_name);
+        std::fs::create_dir_all(&temp_dir);
+
+        // Now compile the library code with our compiler and the client with the standard compiler and make sure this
+        // works too.
+        let args = LcArgs {
+            input_path: String::new(),
+            output_path: Some(String::from(
+                path::absolute(temp_dir.join("library.obj"))
+                    .unwrap()
+                    .to_str()
+                    .expect("could not convert path to str"),
+            )),
+            extra_link_args: vec![],
+            mode: Mode::All,
+            verbose: true,
+            should_keep_intermediate_files: false,
+            should_compile_only: true,
+        };
+
+        assert!(compile_and_link(&args, library_code, true, true).is_ok());
+
+        let exe_path = compile_with_standard_compiler(
+            client_code,
+            &temp_dir,
+            "output.exe",
+            Some(&vec![args.output_path.unwrap().clone()]),
+        );
+
+        if run_and_check_exit_code_and_output(
+            exe_path.to_str().expect("could not convert path to str"),
+            (expected_exit_code, expected_stdout_opt),
+        ) {
+            debug!("cleaning up temp dir {}", temp_dir.to_string_lossy());
+            std::fs::remove_dir_all(&temp_dir);
+        }
     }
 
     mod fail {
@@ -3212,166 +3416,1530 @@ label:
         }
     }
 
-    #[test]
-    #[ignore]
-    fn wrong_func_arg_count() {
-        validate_error_count(
-            r"int blah(int x, int y)
-{
-    return 5;
-}
+    mod functions {
+        use super::*;
 
-int main() {
-    while (blah()) { }
-    do { blah(); } while (blah());
-    if (blah()) { blah(); } else { blah(); }
-    int x = blah();
-    x = blah();
-    for (int y = blah(); blah(); blah()) { blah(); }
-    for (blah(); blah(); blah()) { blah(); }
-    blah();
-
-    int x = -blah();
-    x = blah(blah(10), blah(), blah());
-    return blah() + blah();
-}",
-            24,
-        );
+        test!(nested_function_arg_counts {
+            codegen_run_and_check_exit_code(
+                r"
+    int func0()
+    {
+        return 1;
     }
 
-    #[test]
-    #[ignore]
-    fn recursive_function() {
-        codegen_run_and_check_exit_code(
-            r"
-int sigma(int x) {
-    if (x == 0) {
-        return 0;
+    int func1(int a)
+    {
+        return a;
     }
 
-    return x + sigma(x - 1);
-}
-
-int main() {
-    return sigma(10);
-}
-",
-            55,
-        );
+    int func2(int a, int b)
+    {
+        return a + b;
     }
 
-    #[test]
-    #[ignore]
-    fn nested_function_arg_counts() {
-        codegen_run_and_check_exit_code(
-            r"
-int func0()
-{
+    int func3(int a, int b, int c)
+    {
+        return a + b + c;
+    }
+
+    int func4(int a, int b, int c, int d)
+    {
+        return a + b + c + d;
+    }
+
+    int func5(int a, int b, int c, int d, int e)
+    {
+        return a + b + c + d + e;
+    }
+
+    int func6(int a, int b, int c, int d, int e, int f)
+    {
+        return a + b + c + d + e + f;
+    }
+
+    int main() {
+        return func6(
+            func1(func0()),
+            func2(1, 2),
+            func3(1, 2, 3),
+            func4(1, 2, 3, 4),
+            func5(1, 2, 3, 4, 5),
+            func6(1, 2, 3, 4, 5, 6));
+    }
+    ",
+                56,
+            );
+        });
+
+        test!(nested_block_variable_allocation {
+            codegen_run_and_check_exit_code(
+                r"
+    int func()
+    {
+        int a = 1;
+        {
+            int b = 2;
+            {
+                int c = 3;
+                {
+                    int d = 4;
+                    a = a + b + c + d;
+                }
+            }
+        }
+        int e = 5;
+        int f = 6;
+        return a + e + f;
+    }
+
+    int main() {
+        return func();
+    }
+    ",
+                21,
+            );
+        });
+
+        test!(compound_assign_function_result {
+            codegen_run_and_check_exit_code(
+                r"
+int foo(void) {
+    return 2;
+}
+
+int main(void) {
+    int x = 3;
+    x -= foo();
+    return x;
+}
+    ",
+                1,
+            );
+        });
+
+        test!(preserve_ecx_bitwise_shift {
+            codegen_run_and_check_exit_code(
+                r"
+/* Make sure we don't clobber argument passed in ECX register by
+ * performing a bitwise shift operation that uses that register */
+
+int x(int a, int b, int c, int d, int e, int f) {
+    return a == 1 && b == 2 && c == 3 && d == 4 && e == 5 && f == 6;
+}
+
+int main(void) {
+    int a = 4;
+    return x(1, 2, 3, 4, 5, 24 >> (a / 2));
+}
+    ",
+                1,
+            );
+        });
+
+        test!(label_reuse_in_functions {
+            codegen_run_and_check_exit_code(
+                r"
+/* The same label can be used in multiple functions */
+int foo(void) {
+    goto label;
+    return 0;
+    label:
+        return 5;
+}
+
+int main(void) {
+    goto label;
+    return 0;
+    label:
+        return foo();
+}
+    ",
+                5,
+            );
+        });
+
+        test!(label_same_as_function_name {
+            codegen_run_and_check_exit_code(
+                r"
+/* The same identifier can be used
+ * in the same scope as both a function name and a label */
+int foo(void) {
+    goto foo;
+    return 0;
+    foo:
+        return 1;
+}
+
+int main(void) {
+    return foo();
+}
+    ",
+                1,
+            );
+        });
+
+        test!(label_naming_scheme {
+            codegen_run_and_check_exit_code(
+                r##"
+// We need to transform labels to avoid conflicts between identical labels
+// in different functions. This test case tries to catch a few
+// obvious-but-unsafe naming schemes: transforming label "lbl" in function "fun"
+// into "lblfun," "lbl_fun", "funlbl" or "fun_lbl".
+// Here we just want to see that the program compiles successfully (rather than
+// hitting an assembler error b/c of duplicate labels in assembly).
+
+int main(void) {
+    // If we combine function name and label with no separator,
+    // this will conflict with "label" in the "main_" function below
+    // (both will be main_label)
+    // If we combine function name and label with a _ separator, they'll still conflict;
+    // both will be main__label
+    _label:
+
+    // If we add function name to end of label, this will conflict with "label"
+    // in _main below (both will be label_main or label__main)
+    label_:
+    return 0;
+}
+
+int main_(void) {
+    label:
+    return 0;
+}
+
+int _main(void) {
+    label: return 0;
+}
+    "##,
+                0,
+            );
+        });
+
+        test!(stack_alignment {
+        const STACK_CHECK_ASM_CODE: &'static str = r##"
+INCLUDELIB msvcrt.lib
+
+.DATA
+.CODE
+
+check_stack_alignment_even PROC
+    mov rax,rsp
+
+    ; Get the low 4 bits. If any of these are set, then it's not a multiple of 16.
+    and rax,15
+
+    ; But we're checking *after* the call instruction, so rsp is expected to be off by one pointer size--the return address.
+    sub rax,8
+
+    ; At this point, if it was 16-byte aligned plus one pointer size, the return value is 0.
+    ret
+check_stack_alignment_even ENDP
+
+check_stack_alignment_odd = check_stack_alignment_even
+PUBLIC check_stack_alignment_odd
+
+END
+"##;
+
+                let temp_dir_name = format!("testrun_{}", generate_random_string(8));
+                let temp_dir = Path::new(&temp_dir_name);
+                std::fs::create_dir_all(&temp_dir);
+
+                let stack_check_asm_path = path::absolute(temp_dir.join("stack_check.asm")).unwrap();
+                let stack_check_obj_path = path::absolute(temp_dir.join("stack_check.obj")).unwrap();
+
+                let _ = std::fs::write(&stack_check_asm_path, STACK_CHECK_ASM_CODE).unwrap();
+
+                let exit_code = assemble_and_link(
+                    &stack_check_asm_path,
+                    stack_check_obj_path.to_str().unwrap(),
+                    None,
+                    true,
+                    &temp_dir,
+                )
+                .expect("programs should always have an exit code");
+
+                assert_eq!(exit_code, 0);
+
+                codegen_run_and_check_exit_code_and_output_or_compile_failure(
+                    r"
+/* Call functions with both even and odd numbers of stack arguments,
+ * to make sure the stack is correctly aligned in both cases.
+ */
+
+int check_stack_alignment_even(int a, int b, int c, int d, int e, int f, int g, int h);
+int check_stack_alignment_odd(int a, int b, int c, int d, int e, int f, int g, int h, int i);
+
+int check_even_arguments(int a, int b, int c, int d, int e, int f, int g, int h) {
+    return a == 1 &&
+           b == 2 &&
+           c == 3 &&
+           d == 4 &&
+           e == 5 &&
+           f == 6 &&
+           g == 7 &&
+           h == 8;
+}
+
+int check_odd_arguments(int a, int b, int c, int d, int e, int f, int g, int h, int i) {
+    return a == 1 &&
+           b == 2 &&
+           c == 3 &&
+           d == 4 &&
+           e == 5 &&
+           f == 6 &&
+           g == 7 &&
+           h == 8 &&
+           i == 9;
+}
+
+int main(void) {
+    /* Allocate an argument on the stack, to check that
+     * we properly account for already-allocated stack space
+     * when deciding how much padding to add
+     */
+    int x = 3;
+    if (check_stack_alignment_even(1, 2, 3, 4, 5, 6, 7, 8) != 0) { return 0; }
+    if (check_even_arguments(1, 2, 3, 4, 5, 6, 7, 8) != 1) { return 0; }
+    if (check_stack_alignment_odd(1, 2, 3, 4, 5, 6, 7, 8, 9) != 0) { return 0; }
+    if (check_odd_arguments(1, 2, 3, 4, 5, 6, 7, 8, 9) != 1) { return 0; }
+    // return x to make sure it hasn't been clobbered
+    return x;
+}
+    ",
+                    &[String::from(stack_check_obj_path.to_str().unwrap())],
+                    Some((3, None)),
+                );
+
+                std::fs::remove_dir_all(&temp_dir);
+            });
+
+        mod no_args {
+            use super::*;
+
+            test!(multiple_declarations {
+                codegen_run_and_check_exit_code(
+                    r"
+int main(void) {
+    int f(void);
+    int f(void);
+    return f();
+}
+
+int f(void) {
+    return 3;
+}
+        ",
+                    3,
+                );
+            });
+
+            test!(no_return_value {
+                codegen_run_and_check_exit_code(
+                    r"
+int foo(void) {
+    /* It's legal for a non-void function to not return a value.
+     * If the caller tries to use the value of the function, the result is undefined.
+     */
+    int x = 1;
+}
+
+int main(void) {
+    /* This is well-defined because we call foo but don't use its return value */
+    foo();
+    return 3;
+}
+        ",
+                    3,
+                );
+            });
+
+            test!(function_unary_precedence {
+                codegen_run_and_check_exit_code(
+                    r"
+int three(void) {
+    return 3;
+}
+
+int main(void) {
+    /* The function call operator () is higher precedence
+     * than unary prefix operators
+     */
+    return !three();
+}
+        ",
+                    0,
+                );
+            });
+
+            test!(call_in_expression {
+                codegen_run_and_check_exit_code(
+                    r"
+int bar(void) {
+    return 9;
+}
+
+int foo(void) {
+    return 2 * bar();
+}
+
+int main(void) {
+    /* Use multiple function calls in an expression,
+     * make sure neither overwrites the other's return value in EAX */
+    return foo() + bar() / 3;
+}
+        ",
+                    21,
+                );
+            });
+
+            test!(variable_shadows_function {
+                codegen_run_and_check_exit_code(
+                    r"
+int main(void) {
+    int foo(void);
+
+    int x = foo();
+    if (x > 0) {
+        int foo  = 3;
+        x = x + foo;
+    }
+    return x;
+}
+
+int foo(void) {
+    return 4;
+}
+        ",
+                    7,
+                );
+            });
+        }
+
+        mod args_in_registers {
+            use super::*;
+
+            test!(dont_clobber_edx {
+                codegen_run_and_check_exit_code(
+                    r"
+/* Make sure we don't clobber argument passed in EDX register by
+ * performing a division operation that uses that register */
+
+int x(int a, int b, int c, int d, int e, int f) {
+    return a == 1 && b == 2 && c == 3 && d == 4 && e == 5 && f == 6;
+}
+
+int main(void) {
+    int a = 4;
+    return x(1, 2, 3, 4, 5, 24 / a);
+}
+        ",
+                    1,
+                );
+            });
+
+            test!(expression_args {
+                codegen_run_and_check_exit_code(
+                    r"
+int sub(int a, int b) {
+    /* Make sure arguments are passed in the right order
+     * (we can test this with subtraction since a - b  != b - a)
+     */
+    return a - b;
+}
+
+int main(void) {
+    /* Make sure we can evaluate expressions passed as arguments */
+    int sum = sub(1 + 2, 1);
+    return sum;
+}
+        ",
+                    2,
+                );
+            });
+
+            test!(recursive {
+                codegen_run_and_check_exit_code(
+                    r"
+int fib(int n) {
+    if (n == 0 || n == 1) {
+        return n;
+    } else {
+        return fib(n - 1) + fib(n - 2);
+    }
+}
+
+int main(void) {
+    int n = 6;
+    return fib(n);
+}
+        ",
+                    8,
+                );
+            });
+
+            test!(forward_decl_change_param_names {
+                codegen_run_and_check_exit_code(
+                    r"
+int foo(int a, int b);
+
+int main(void) {
+    return foo(2, 1);
+}
+
+/* Multiple declarations of a function
+ * can use different parameter names
+ */
+int foo(int x, int y){
+    return x - y;
+}
+        ",
+                    1,
+                );
+            });
+
+            test!(hello_world {
+                codegen_run_and_check_exit_code_and_output(
+                    r"
+int putchar(int c);
+
+int main(void) {
+    putchar(72);
+    putchar(101);
+    putchar(108);
+    putchar(108);
+    putchar(111);
+    putchar(44);
+    putchar(32);
+    putchar(87);
+    putchar(111);
+    putchar(114);
+    putchar(108);
+    putchar(100);
+    putchar(33);
+}
+        ",
+                    0,
+                    "Hello, World!",
+                );
+            });
+
+            test!(params_are_preserved {
+                codegen_run_and_check_exit_code(
+                    r"
+/* Make sure that calling another function doesn't clobber
+ * arguments to the current function passed in the same registers
+ */
+
+int g(int w, int x, int y, int z) {
+    if (w == 2 && x == 4 && y == 6 && z == 8)
+        return 1;
+    return 0;
+}
+
+int f(int a, int b, int c, int d) {
+    int result = g(a * 2, b * 2, c * 2, d * 2);
+    return (result == 1 && a == 1 && b == 2 && c == 3 && d == 4);
+
+}
+
+int main(void) {
+    return f(1, 2, 3, 4);
+}
+        ",
+                    1,
+                );
+            });
+
+            test!(param_shadows_function_name {
+                codegen_run_and_check_exit_code(
+                    r"
+int a(void) {
     return 1;
 }
 
-int func1(int a)
-{
+int b(int a) {
     return a;
 }
 
-int func2(int a, int b)
-{
-    return a + b;
+int main(void) {
+    return a() + b(2);
+}
+        ",
+                    3,
+                );
+            });
+
+            test!(param_shadows_own_function_name {
+                codegen_run_and_check_exit_code(
+                    r"
+int a(int a) {
+    return a * 2;
 }
 
-int func3(int a, int b, int c)
-{
+int main(void) {
+    return a(1);
+}
+        ",
+                    2,
+                );
+            });
+
+            test!(param_shadows_local_variable {
+                codegen_run_and_check_exit_code(
+                    r"
+int main(void) {
+    int a = 10;
+    // a function declaration is a separate scope,
+    // so parameter 'a' doesn't conflict with variable 'a' above
+    int f(int a);
+    return f(a);
+}
+
+int f(int a) {
+    return a * 2;
+}
+        ",
+                    20,
+                );
+            });
+        }
+
+        mod stack_args {
+            use super::*;
+
+            test!(call_library_function {
+                codegen_run_and_check_exit_code_and_output(
+                    r"
+int putchar(int c);
+
+/* Make sure we can correctly manage calling conventions from the callee side
+ * (by accessing parameters, including parameters on the stack) and the caller side
+ * (by calling a standard library function) in the same function
+ */
+int foo(int a, int b, int c, int d, int e, int f, int g, int h) {
+    putchar(h);
+    return a + g;
+}
+
+int main(void) {
+    return foo(1, 2, 3, 4, 5, 6, 7, 65);
+}
+        ",
+                    8,
+                    "A",
+                );
+            });
+
+            test!(many_parameters {
+                codegen_run_and_check_exit_code(
+                    r"
+int foo(int a, int b, int c, int d, int e, int f, int g, int h) {
+    return (a == 1 && b == 2 && c == 3 && d == 4 && e == 5
+            && f == 6 && g == 7 && h == 8);
+}
+
+int main(void) {
+    return foo(1, 2, 3, 4, 5, 6, 7, 8);
+}
+        ",
+                    1,
+                );
+            });
+
+            test!(stack_leaks {
+                codegen_run_and_check_exit_code(
+                    r"
+/* Make sure stack arguments are deallocated correctly after returning from a function call; also test passing variables as stack arguments */
+
+int lots_of_args(int a, int b, int c, int d, int e, int f, int g, int h, int i, int j, int k, int l, int m, int n, int o) {
+    return l + o;
+}
+
+int main(void) {
+    int ret = 0;
+    for (int i = 0; i < 10000000; i = i + 1) {
+        ret = lots_of_args(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ret, 13, 14, 15);
+    }
+    return ret == 150000000;
+}
+        ",
+                    1,
+                );
+            });
+        }
+
+        mod libraries {
+            use super::*;
+
+            test!(addition {
+                test_library(
+                    r"
+int add(int x, int y);
+
+int main(void) {
+    return add(1, 2);
+}
+        ",
+                    r"
+int add(int x, int y) {
+    return x + y;
+}
+        ",
+                    3,
+                );
+            });
+
+            // TODO knutaf fix this
+            test!(many_args {
+                test_library(
+                    r"
+int fib(int a);
+
+int multiply_many_args(int a, int b, int c, int d, int e, int f, int g, int h);
+
+int main(void) {
+    int x = fib(4); // 3
+    // at least until we implement optimizations, seven will have other values
+    // adjacent to it in memory, which we'll push onto the stack when we pass it as an arg;
+    // this tests that the caller will just look at 7 and not the junk bytes next to it
+    int seven = 7;
+    int eight = fib(6);
+    int y = multiply_many_args(x, 2, 3, 4, 5, 6, seven, eight);
+    if (x != 3) {
+        return 1;
+    }
+    if (y != 589680) {
+        return 2;
+    }
+    return x + (y % 256);
+}
+        ",
+                    r"
+int fib(int n) {
+    if (n == 0 || n == 1) {
+        return n;
+    } else {
+        return fib(n - 1) + fib(n - 2);
+    }
+}
+
+int multiply_many_args(int a, int b, int c, int d, int e, int f, int g, int h) {
+
+    return a * b * c * d * e * f * fib(g) * fib(h);
+}
+        ",
+                    115,
+                );
+            });
+
+            test!(std_library_call {
+                test_library_with_output(
+                    r"
+int incr_and_print(int c);
+
+int main(void) {
+    incr_and_print(70);
+    return 0;
+}
+        ",
+                    r"
+int putchar(int c);
+
+int incr_and_print(int b) {
+    return putchar(b + 2);
+}
+        ",
+                    0,
+                    "H",
+                );
+            });
+
+            test!(division_clobber_rdx {
+                test_library(
+                    r"
+int f(int a, int b, int c, int d);
+
+int main(void) {
+    return f(10, 2, 100, 4);
+}
+        ",
+                    r"
+/* Division requires us to use the RDX register;
+ * make sure this doesn't clobber the argument passed
+ * in this register
+ */
+int f(int a, int b, int c, int d) {
+    // perform division
+    int x = a / b;
+    // make sure everything has the right value
+    if (a == 10 && b == 2 && c == 100 && d == 4 && x == 5)
+        return 1;
+    return 0;
+}
+        ",
+                    1,
+                );
+            });
+
+            test!(local_stack_variables {
+                test_library(
+                    r"
+int f(int reg1, int reg2, int reg3, int reg4, int reg5, int reg6,
+    int stack1, int stack2, int stack3);
+
+int main(void) {
+    return f(1, 2, 3, 4, 5, 6, -1, -2, -3);
+}
+        ",
+                    r"
+/* Make sure a called function can correctly access variables on the stack */
+int f(int reg1, int reg2, int reg3, int reg4, int reg5, int reg6,
+    int stack1, int stack2, int stack3) {
+    int x = 10;
+    // make sure every variable has the right value
+    if (reg1 == 1 && reg2 == 2 && reg3 == 3 && reg4 == 4 && reg5 == 5
+        && reg6 == 6 && stack1 == -1 && stack2 == -2 && stack3 == -3
+        && x == 10) {
+        // make sure we can update the value of one argument
+        stack2 = 100;
+        return stack2;
+    }
+    return 0;
+}
+        ",
+                    100,
+                );
+            });
+        }
+
+        mod fail {
+            use super::*;
+
+            test!(wrong_func_arg_count {
+                validate_error_count(
+                    r"int blah(int x, int y)
+        {
+            return 5;
+        }
+
+        int main() {
+            while (blah()) { }
+            do { } while (blah());
+            do { blah(); } while (1);
+            if (blah()) { } else { }
+            if (1) { blah(); } else { }
+            if (1) { } else { blah(); }
+            int x = blah();
+            x = blah();
+            x = -blah();
+            for (int y = blah(); ; ) { }
+            for (int y = 1; blah(); ) { }
+            for (int y = 1; ; blah()) { }
+            for (int y = 1; ; ) { blah(); }
+            blah();
+            x = blah(blah(10), blah());
+            return blah() + blah();
+        }",
+                    18,
+                );
+            });
+
+            test!(goto_across_functions {
+                test_codegen_mainfunc_failure(
+                    r"
+int foo(void) {
+    label:
+        return 0;
+}
+
+int main(void) {
+    /* You can't goto a label in another function */
+    goto label;
+    return 1;
+}
+                ",
+                );
+            });
+
+            test!(goto_function {
+                test_codegen_mainfunc_failure(
+                    r"
+int foo(void) {
+    return 3;
+}
+
+int main(void) {
+    /* You can't use a function name as a goto label */
+    goto foo;
+    return 3;
+}
+                ",
+                );
+            });
+
+            mod invalid_declarations {
+                use super::*;
+
+                test!(assign_to_func_call {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    // a function call is not an lvalue
+    // NOTE: in later chapters we'll detect this during type checking
+    // rather than identifier resolution
+    x() = 1;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(compound_assign_to_func_call {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    // a function call is not an lvalue
+    // NOTE: in later chapters we'll detect this during type checking
+    // rather than identifier resolution
+    x() += 1;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(decrement_func_call {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    // a function call is not an lvalue, so we can't decrement it
+    x()--;
+}
+                    ",
+                    );
+                });
+
+                test!(increment_func_call {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    // a function call is not an lvalue, so we can't increment it
+    ++x();
+}
+                    ",
+                    );
+                });
+
+                test!(duplicate_param_name_in_declaration {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* Duplicate parameter names are illegal in function declarations
+   as well as definitions */
+int foo(int a, int a);
+
+int main(void) {
+    return foo(1, 2);
+}
+
+int foo(int a, int b) {
+    return a + b;
+}
+                    ",
+                    );
+                });
+
+                test!(duplicate_param_name_in_definition {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* It's illegal for multiple parameters to a function to have the same name */
+int foo(int a, int a) {
+    return a;
+}
+
+int main(void) {
+    return foo(1, 2);
+}
+                    ",
+                    );
+                });
+
+                test!(nested_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    /* Nested function definitions are not permitted */
+    int foo(void) {
+        return 1;
+    }
+    return foo();
+}
+                    ",
+                    );
+                });
+
+                test!(redefine_func_as_var {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    /* It's illegal to declare an identifier with external linkage and
+     * no linkage in the same scope. Here, the function declaration foo
+     * has external linkage and the variable declaration has no linkage.
+     * The types here also conflict, but our implementation will catch
+     * the linkage error before this gets to the type checker.
+     */
+    int foo(void);
+    int foo = 1;
+    return foo;
+}
+
+int foo(void) {
+    return 1;
+}
+                    ",
+                    );
+                });
+
+                test!(redefine_var_as_func {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    /* It's illegal to declare an identifier with external linkage and
+     * no linkage in the same scope. Here, the function declaration foo
+     * has external linkage and the variable declaration has no linkage.
+     * The types here also conflict, but our implementation will catch
+     * the linkage error before this gets to the type checker.
+     */
+    int foo = 1;
+    int foo(void);
+    return foo;
+}
+
+int foo(void) {
+    return 1;
+}
+                    ",
+                    );
+                });
+
+                test!(redefine_parameter {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a) {
+    /* A function's parameter list and its body are in the same scope,
+     * so redeclaring a here is illegal. */
+    int a = 5;
+    return a;
+}
+
+int main(void) {
+    return foo(3);
+}
+                    ",
+                    );
+                });
+
+                test!(undeclared_func {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    /* You must declare a function before using it */
+    return foo(3);
+}
+
+int foo(int a) {
+    return 1;
+}
+                    ",
+                    );
+                });
+
+                test!(wrong_param_name {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a);
+
+int main(void) {
+    return foo(3);
+}
+
+int foo(int x) {
+    /* Only the parameter names from this definition are in scope.
+     * Parameter names from earlier declarations of foo aren't!
+     */
+    return a;
+}
+                    ",
+                    );
+                });
+
+                test!(call_label {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    int x = 1;
+    a:
+    x = x + 1;
+    a(); // can't call a label like a function
+    return x;
+
+}
+                    ",
+                    );
+                });
+            }
+
+            mod invalid_parse {
+                use super::*;
+
+                test!(call_non_identifier {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* You can only call a function, not a constant.
+   Our implementation will reject this during parsing.
+   Because the C grammar permits this declaration,
+   some compilers may reject it during type checking.
+*/
+
+int main(void) {
+    return 1();
+}
+                    ",
+                    );
+                });
+
+                test!(parameters_wrong_closing_delimiter {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* Make sure a parameter list ends with a closing ) and not some other character;
+ * this is a regression test for a bug in the reference implementation */
+
+int foo(int x, int y} { return x + y; }
+
+int main(void) { return 0;}
+                    ",
+                    );
+                });
+
+                test!(arguments_wrong_closing_delimiter {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* Make sure a argument list ends with a closing ) and not some other character;
+ * this is a regression test for a bug in the reference implementation */
+
+int foo(int x, int y) {
+    return x + y;
+}
+
+int main(void) { return foo(1, 2};}
+                    ",
+                    );
+                });
+
+                test!(parameter_declaration_in_call {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a) {
+    return 0;
+}
+
+int main(void) {
+    /* A function argument must be an expression, not a declaration */
+    return foo(int a);
+}
+                    ",
+                    );
+                });
+
+                test!(return_type_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* You cannot declare a function that returns a function.
+   Our implementation will reject this during parsing.
+   Because the C grammar permits this declaration,
+   some compilers may reject it during type checking.
+*/
+int foo(void)(void);
+
+int main(void) {
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(declaration_in_for_loop {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    /* Function declarations aren't permitted in for loop headers. */
+    for (int f(void); ; ) {
+        return 0;
+    }
+}
+                    ",
+                    );
+                });
+
+                test!(function_with_initializer {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* You can't declare a function with an initializer.
+   Our implementation will reject this during parsing.
+   Because the C grammar permits this declaration,
+   some compilers may reject it during type checking.
+*/
+int foo(void) = 3;
+
+int main(void) {
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(arguments_trailing_comma {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a, int b, int c) {
     return a + b + c;
 }
 
-int func4(int a, int b, int c, int d)
-{
-    return a + b + c + d;
+int main(void) {
+    /* Trailing commas aren't permitted in argument lists */
+    return foo(1, 2, 3,);
+}
+                    ",
+                    );
+                });
+
+                test!(parameters_trailing_comma {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* Trailing commas aren't permitted in parameter lists */
+int foo(int a,) {
+    return a + 1;
 }
 
-int func5(int a, int b, int c, int d, int e)
-{
-    return a + b + c + d + e;
+int main(void) {
+    return foo(4);
+}
+                    ",
+                    );
+                });
+
+                test!(parameters_unclosed_parentheses {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a, int b {
+    return 0;
 }
 
-int func6(int a, int b, int c, int d, int e, int f)
-{
-    return a + b + c + d + e + f;
+int main(void) {
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(arguments_unclosed_parentheses {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a, int b) {
+    return 0;
 }
 
-int main() {
-    return func6(
-        func1(func0()),
-        func2(1, 2),
-        func3(1, 2, 3),
-        func4(1, 2, 3, 4),
-        func5(1, 2, 3, 4, 5),
-        func6(1, 2, 3, 4, 5, 6));
+int main(void) {
+    return foo(1, 2;
 }
-",
-            56,
-        );
-    }
+                    ",
+                    );
+                });
 
-    #[test]
-    #[ignore]
-    fn nested_block_variable_allocation() {
-        codegen_run_and_check_exit_code(
-            r"
-int func()
-{
-    int a = 1;
-    {
-        int b = 2;
-        {
-            int c = 3;
-            {
-                int d = 4;
-                a = a + b + c + d;
+                test!(parameter_default_value {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* Variable initializers aren't permitted in parameter lists */
+int bad_params(int a = 3) {
+    return 1;
+}
+
+int main(void) {
+    return 0;
+}
+                    ",
+                    );
+                });
             }
-        }
-    }
-    int e = 5;
-    int f = 6;
-    return a + e + f;
-}
 
-int main() {
-    return func();
-}
-",
-            21,
-        );
-    }
+            mod invalid_types {
+                use super::*;
 
-    #[test]
-    #[ignore]
-    fn parameter_redefinition() {
-        test_codegen_mainfunc_failure(
-            r"int blah(int x)
-{
-    int x;
+                test!(assign_func_to_variable {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+int main(void) {
+    int a = 10;
+    a = x;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(assign_to_func {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    int x(void);
+    x = 3;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(call_variable {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    int x = 0;
+    /* x isn't a function, so you can't call it */
+    return x();
+}
+                    ",
+                    );
+                });
+
+                test!(conflicting_declaration {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a);
+
+int main(void) {
     return 5;
 }
 
-int main() {
-    return 1;
-}",
-        );
+/* The forward declaration and definition of 'foo' conflict
+ * (different numbers of parameters)
+ */
+int foo(int a, int b) {
+    return 4;
+}
+                    ",
+                    );
+                });
 
-        test_codegen_mainfunc_failure(
-            r"int blah(int x)
-{
-    {
-        int x;
-        return 5;
-    }
+                test!(conflicting_local_declaration {
+                    test_codegen_mainfunc_failure(
+                        r"
+int bar(void);
+
+int main(void) {
+    /* Two local declarations of foo in 'main' and 'bar' conflict -
+     * different numbers of parameters
+     */
+    int foo(int a);
+    return bar() + foo(1);
 }
 
-int main() {
-    return 1;
-}",
-        );
+int bar(void) {
+    int foo(int a, int b);
+    return foo(1, 2);
+}
+                    ",
+                    );
+                });
+
+                test!(divide_by_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    int a = 10 / x;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(multiple_definitions {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* Function 'foo' is defined twice */
+int foo(void){
+    return 3;
+}
+
+int main(void) {
+    return foo();
+}
+
+int foo(void){
+    return 4;
+}
+                    ",
+                    );
+                });
+
+                test!(multiple_definitions_with_local {
+                    test_codegen_mainfunc_failure(
+                        r"
+/* Function 'foo' is defined twice */
+int foo(void){
+    return 3;
+}
+
+int main(void) {
+    // after seeing this declaration, we should still remember that
+    // foo was defined earlier
+    int foo(void);
+    return foo();
+}
+
+int foo(void){
+    return 4;
+}
+                    ",
+                    );
+                });
+
+                test!(too_few_args {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a, int b) {
+    return a + 1;
+}
+
+int main(void) {
+    /* foo is called with too many arguments */
+    return foo(1);
+}
+                    ",
+                    );
+                });
+
+                test!(too_many_args {
+                    test_codegen_mainfunc_failure(
+                        r"
+int foo(int a) {
+    return a + 1;
+}
+
+int main(void) {
+    /* foo is called with too many arguments */
+    return foo(1, 2);
+}
+                    ",
+                    );
+                });
+
+                test!(bitwise_op_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    x >> 2;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(compound_assign_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    x += 3;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(compound_assign_function_rhs {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    int a = 3;
+    a += x;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(postfix_increment_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void) {
+    x++;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(prefix_decrement_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+int x(void);
+
+int main(void){
+    --x;
+    return 0;
+}
+                    ",
+                    );
+                });
+
+                test!(switch_on_function {
+                    test_codegen_mainfunc_failure(
+                        r"
+int main(void) {
+    int f(void);
+    switch (f)
+        return 0;
+}
+                    ",
+                    );
+                });
+            }
+        }
+    }
+
+    mod padding {
+        use super::*;
+
+        test!(simple {
+            for num in 0..=16 {
+                info!(num, align = 16, result = pad_to_alignment(num, 16));
+                assert_eq!(pad_to_alignment(num, 16), 16);
+            }
+
+            for num in 17..=32 {
+                info!(num, align = 16, result = pad_to_alignment(num, 16));
+                assert_eq!(pad_to_alignment(num, 16), 32);
+            }
+        });
     }
 }
