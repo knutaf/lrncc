@@ -5,8 +5,8 @@ extern crate regex;
 
 use {
     clap::Parser,
-    rand::distributions::Alphanumeric,
-    rand::{thread_rng, Rng},
+    rand::distr::Alphanumeric,
+    rand::Rng,
     regex::Regex,
     std::{
         collections::{HashMap, HashSet},
@@ -36,7 +36,7 @@ const KEYWORDS: [&'static str; 13] = [
 const PARAMETER_REG_MAPPING: [&'static str; 4] = ["cx", "dx", "r8", "r9"];
 
 fn generate_random_string(len: usize) -> String {
-    thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .map(char::from)
         .take(len)
