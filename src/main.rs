@@ -4364,6 +4364,8 @@ impl FunctionTracking {
 // Example stack. Caller passed us 6 parameters. This function uses 3 local variables and itself calls another function
 // that takes 5 parameters.
 //
+// Name            |size | RBP offset| RSP offset
+// ----------------------------------------------
 // param 5         | 8   | RBP + 48  | RSP + 104
 // param 4         | 8   | RBP + 40  | RSP + 96
 // param 3         | 8   | RBP + 32  | RSP + 88
