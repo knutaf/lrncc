@@ -891,13 +891,17 @@ impl AstFunction {
                         // Entering the function body creates a new scope. Note that this scope includes the parameters
                         // and the function body together, so that declaring a variable in the function body that
                         // tries to shadow a parameter is an error.
-                        if function.is_definition() {
-                            let mut new_block_tracking = BlockTracking::new();
-                            for param in function.parameters.iter_mut() {
-                                let temp_ident = new_block_tracking.symbols.add_variable(resolve_tracking.global_tracking, param)?;
-                                *param = temp_ident;
-                            }
+                        //
+                        // Duplicate parameter names are illegal, so always try adding all the paramters, which will
+                        // catch duplicate parameter errors, but only keep the new block if we're entering a new
+                        // function definition.
+                        let mut new_block_tracking = BlockTracking::new();
+                        for param in function.parameters.iter_mut() {
+                            let temp_ident = new_block_tracking.symbols.add_variable(resolve_tracking.global_tracking, param)?;
+                            *param = temp_ident;
+                        }
 
+                        if function.is_definition() {
                             context
                                 .get_mut()
                                 .unwrap()
@@ -4650,10 +4654,15 @@ fn try_parse_function_parameter<'i, 't>(
         if !tokens.try_consume_expected_next_token(",") {
             return Ok(None);
         }
-    }
 
-    if !tokens.try_consume_expected_next_token("int") {
-        return Ok(None);
+        // Having successfully consumed a comma, it means there must be a parameter here.
+        tokens.consume_expected_next_token("int")?;
+    } else {
+        // Since this is the first parameter, we don't know if the next token is paramter or if it's an empty parameter
+        // list.
+        if !tokens.try_consume_expected_next_token("int") {
+            return Ok(None);
+        }
     }
 
     tokens

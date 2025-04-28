@@ -14,3 +14,4 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-forest = { version = "0.1", features = ["ansi", "smallvec", "env-filter"] }
+parse_int = "0.9"
