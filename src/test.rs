@@ -189,7 +189,7 @@ mod test {
 
     fn validate_error_count(input: &str, expected_error_count: usize) {
         match parse_and_validate(Mode::All, input) {
-            Ok(_ast) => {
+            Ok((_ast, _global_tracking)) => {
                 // If parsing succeeded, then the caller should have expected 0 errors.
                 assert_eq!(expected_error_count, 0);
             }
