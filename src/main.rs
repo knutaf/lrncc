@@ -28,12 +28,18 @@ const STACK_PARAMETER_SIZE: u32 = 8;
 const POINTER_SIZE: u32 = 8;
 const FUNCTION_CALL_ALIGNMENT: u32 = 16;
 
-const KEYWORDS: [&'static str; 13] = [
+const KEYWORDS: [&'static str; 15] = [
     "int", "void", "return", "if", "goto", "for", "while", "do", "break", "continue", "switch",
-    "case", "default",
+    "case", "default", "static", "extern",
 ];
 
+const SPECIFIERS: [&'static str; 3] = ["int", "static", "extern"];
+
 const PARAMETER_REG_MAPPING: [&'static str; 4] = ["cx", "dx", "r8", "r9"];
+
+fn variant_eq<T>(a: &T, b: &T) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
 
 fn generate_random_string(len: usize) -> String {
     rand::rng()
@@ -101,6 +107,11 @@ where
     }
 
     Ok(())
+}
+
+/// Mangles and writes a name in a way that won't clash with externally defined symbols.
+fn write_mangled_name(f: &mut fmt::Formatter, name: &str) -> fmt::Result {
+    write!(f, "@@@{}", name)
 }
 
 /// A wrapper to allow passing an arbitrary formatter for Display, so you don't have to implement Display for every type
@@ -205,16 +216,6 @@ impl<T: FmtNode> fmt::Display for DisplayFmtNode<T> {
     }
 }
 
-/// Produces a mangled name that won't clash with a C identifier but is valid to use in ASM listings.
-fn mangle_function_name(name: &str) -> String {
-    // Do not mangle "main" or else your program crashes. Not totally sure why.
-    if name == "main" {
-        String::from("main")
-    } else {
-        format!("@@@{}", name)
-    }
-}
-
 // A wrapper around a slice of tokens with convenience functions useful for parsing.
 #[derive(PartialEq, Clone, Debug)]
 struct Tokens<'i, 't>(&'t [&'i str]);
@@ -283,6 +284,28 @@ impl<'i, 't> Tokens<'i, 't> {
         }
     }
 
+    fn consume_specifier(&mut self) -> Result<&'i str, String> {
+        fn is_token_specifier(token: &str) -> bool {
+            lazy_static! {
+                static ref SPECIFIERS_REGEX: Regex =
+                    Regex::new(&format!(r"^(?:{})$", SPECIFIERS.join("|")))
+                        .expect("failed to compile regex");
+            }
+
+            SPECIFIERS_REGEX.is_match(token)
+        }
+
+        let (tokens, remaining_tokens) = self.consume_tokens(1)?;
+
+        if is_token_specifier(tokens[0]) {
+            *self = remaining_tokens;
+            debug!("consumed specifier {}", tokens[0]);
+            Ok(tokens[0])
+        } else {
+            Err(format!("token \"{}\" is not a specifier name", tokens[0]))
+        }
+    }
+
     fn consume_and_parse_next_token<T>(&mut self) -> Result<T, String>
     where
         T: std::str::FromStr,
@@ -311,7 +334,13 @@ impl<'i, 't> Deref for Tokens<'i, 't> {
 
 #[derive(Debug)]
 struct AstProgram {
-    functions: Vec<AstFunction>,
+    declarations: Vec<AstDeclaration>,
+}
+
+#[derive(Debug, Clone)]
+enum AstDeclaration {
+    VarDeclaration(AstVarDeclaration),
+    FuncDeclaration(AstFunction),
 }
 
 #[derive(Debug, Clone)]
@@ -321,23 +350,31 @@ struct AstBlock(Vec<AstBlockItem>);
 struct AstIdentifier(String);
 
 #[derive(Debug, Clone)]
+enum AstStorageClass {
+    Unset,
+    Static,
+    Extern,
+}
+
+#[derive(Debug, Clone)]
 struct AstFunction {
     name: AstIdentifier,
-    parameters: Vec<AstIdentifier>,
+    parameters: Vec<AstVarDeclaration>,
     body_opt: Option<Vec<AstBlockItem>>,
+    storage_class: AstStorageClass,
 }
 
 #[derive(Debug, Clone)]
 enum AstBlockItem {
     Statement(AstStatement),
-    VarDeclaration(AstVarDeclaration),
-    FuncDeclaration(AstFunction),
+    Declaration(AstDeclaration),
 }
 
 #[derive(Clone, Debug)]
 struct AstVarDeclaration {
     identifier: AstIdentifier,
     initializer_opt: Option<AstExpression>,
+    storage_class: AstStorageClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -401,6 +438,13 @@ struct SwitchCase {
     label_opt: Option<AstLabel>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum Linkage {
+    None,
+    Internal,
+    External,
+}
+
 #[derive(Clone, Debug)]
 enum AstExpression {
     Constant(u32),
@@ -459,7 +503,20 @@ enum AstBinaryOperator {
 
 #[derive(Debug)]
 struct TacProgram {
-    functions: Vec<TacFunction>,
+    toplevel_items: Vec<TacTopLevelItem>,
+}
+
+#[derive(Debug)]
+enum TacTopLevelItem {
+    Var(TacTopLevelVariable),
+    Function(TacFunction),
+}
+
+#[derive(Debug)]
+struct TacTopLevelVariable {
+    name: TacVar,
+    is_global: bool,
+    initial_value_opt: Option<i32>,
 }
 
 // TODO: string slice instead
@@ -525,14 +582,27 @@ enum TacBinaryOperator {
 
 #[derive(Debug)]
 struct AsmProgram {
-    functions: Vec<AsmFunction>,
+    toplevel_items: Vec<AsmTopLevelItem>,
+}
+
+#[derive(Debug)]
+enum AsmTopLevelItem {
+    Var(AsmTopLevelVar),
+    Function(AsmFunction),
+}
+
+#[derive(Debug)]
+struct AsmTopLevelVar {
+    name: String,
+    is_global: bool,
+    initial_value_opt: Option<i32>,
 }
 
 // TODO: use str slice
 #[derive(Debug)]
 struct AsmFunction {
     name: String,
-    mangled_name: String,
+    is_global: bool,
     body_opt: Option<Vec<AsmInstruction>>,
 }
 
@@ -563,12 +633,16 @@ enum AsmVal {
 }
 
 #[derive(Debug, Clone)]
+struct AsmVar(String);
+
+#[derive(Debug, Clone)]
 enum AsmLocation {
     Reg(&'static str),
     PseudoReg(String),
     PseudoArgReg(u32),
     RbpOffset(i32, String),
     RspOffset(u32, String),
+    Data(AsmVar),
 }
 
 #[derive(Debug, Clone)]
@@ -601,13 +675,28 @@ enum AsmCondCode {
 
 #[derive(Debug)]
 struct SymbolTable {
-    symbols: HashMap<AstIdentifier, Symbol>,
+    symbols: HashMap<AstIdentifier, SymbolEntry>,
+}
+
+#[derive(Debug)]
+struct SymbolEntry {
+    symbol: Symbol,
+    is_definition: bool,
+    is_added_in_scope: bool,
+    linkage: Linkage,
+}
+
+#[derive(Debug, Clone)]
+enum StaticInitializer {
+    None,
+    Tentative,
+    Constant(i32),
 }
 
 #[derive(Debug, Clone)]
 enum Symbol {
-    Var(AstIdentifier),
-    Function(usize, bool),
+    Var(AstIdentifier, StaticInitializer),
+    Function(usize),
 }
 
 #[derive(Debug)]
@@ -657,59 +746,143 @@ trait Nestable {
 }
 
 impl AstProgram {
-    fn new(functions: Vec<AstFunction>) -> Self {
-        Self { functions }
+    fn new(declarations: Vec<AstDeclaration>) -> Self {
+        Self { declarations }
     }
 
-    fn validate_and_resolve(&mut self) -> Result<(), Vec<String>> {
+    fn validate_and_resolve(&mut self) -> Result<GlobalTracking, Vec<String>> {
         let mut global_tracking = GlobalTracking::new();
 
         let mut errors = vec![];
-        for func in self.functions.iter_mut() {
-            let mut function_tracking = FunctionTracking::new();
+        for declaration in self.declarations.iter_mut() {
+            match declaration {
+                AstDeclaration::VarDeclaration(ref var_decl) => {
+                    debug!(target: "resolve", var = %DisplayFmtNode(var_decl), "resolving variable");
+                    push_error(
+                        global_tracking.add_file_scope_variable(var_decl, true),
+                        &mut errors,
+                    );
 
-            func.validate_and_resolve_symbols(&mut global_tracking, &mut errors);
-            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after validate_and_resolve");
+                    if !errors.is_empty() {
+                        return Err(errors);
+                    }
+                }
+                AstDeclaration::FuncDeclaration(ref mut func) => {
+                    debug!(target: "resolve", func = %DisplayFmtNode(&func), "resolving function");
 
-            func.validate_and_allocate_goto_labels(
-                &mut global_tracking,
-                &mut function_tracking,
-                &mut errors,
-            );
-            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after label checking");
+                    let mut function_tracking = FunctionTracking::new();
 
-            func.rewrite_goto_labels(&function_tracking, &mut errors);
-            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after goto resolution");
+                    func.validate_and_resolve_symbols(&mut global_tracking, &mut errors);
+                    if !errors.is_empty() {
+                        return Err(errors);
+                    }
+                    debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after validate_and_resolve");
 
-            func.label_loops_and_switches(&mut global_tracking, &mut errors);
-            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after loop labeling");
+                    func.validate_and_allocate_goto_labels(
+                        &mut global_tracking,
+                        &mut function_tracking,
+                        &mut errors,
+                    );
+                    if !errors.is_empty() {
+                        return Err(errors);
+                    }
+                    debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after label checking");
 
-            func.resolve_switch_cases(&mut global_tracking, &mut errors);
-            debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after switch resolving");
+                    func.rewrite_goto_labels(&function_tracking, &mut errors);
+                    if !errors.is_empty() {
+                        return Err(errors);
+                    }
+                    debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after goto resolution");
+
+                    func.label_loops_and_switches(&mut global_tracking, &mut errors);
+                    if !errors.is_empty() {
+                        return Err(errors);
+                    }
+                    debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after loop labeling");
+
+                    func.resolve_switch_cases(&mut global_tracking, &mut errors);
+                    if !errors.is_empty() {
+                        return Err(errors);
+                    }
+                    debug!(target: "resolve", func = %DisplayFmtNode(&func), "func after switch resolving");
+                }
+            }
         }
 
         if errors.is_empty() {
-            Ok(())
+            Ok(global_tracking)
         } else {
             Err(errors)
         }
     }
 
-    fn to_tac(&self) -> Result<TacProgram, String> {
-        let mut global_tracking = GlobalTracking::new();
+    fn to_tac(&self, global_tracking: &mut GlobalTracking) -> Result<TacProgram, String> {
+        let mut toplevel_items = vec![];
 
-        let mut functions = vec![];
-        for func in self.functions.iter() {
-            functions.push(func.to_tac(&mut global_tracking)?);
+        for symbol_entry in global_tracking.symbols.symbols.values() {
+            // Only declare static variables for symbols that we actually have a definition for in this compilation unit
+            if let SymbolEntry {
+                symbol: Symbol::Var(name, initializer),
+                linkage,
+                ..
+            } = symbol_entry
+            {
+                toplevel_items.push(TacTopLevelItem::Var(TacTopLevelVariable {
+                    name: name.to_tac(),
+                    is_global: match linkage {
+                        Linkage::None | Linkage::Internal => false,
+                        Linkage::External => true,
+                    },
+                    initial_value_opt: match initializer {
+                        StaticInitializer::None => None,
+                        StaticInitializer::Tentative => Some(0),
+                        StaticInitializer::Constant(value) => Some(*value),
+                    },
+                }));
+            }
         }
 
-        Ok(TacProgram { functions })
+        for declaration in self.declarations.iter() {
+            match declaration {
+                // Static variables are converted to TAC above using symbol table entries, not the AST.
+                AstDeclaration::VarDeclaration(_var_decl) => {}
+                AstDeclaration::FuncDeclaration(ref func) => {
+                    toplevel_items.push(TacTopLevelItem::Function(func.to_tac(global_tracking)?));
+                }
+            }
+        }
+
+        Ok(TacProgram { toplevel_items })
     }
 }
 
 impl FmtNode for AstProgram {
     fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
-        Self::fmt_nodelist(f, self.functions.iter(), "\n\n", 0)
+        Self::fmt_nodelist(f, self.declarations.iter(), "\n\n", 0)
+    }
+}
+
+impl AstDeclaration {
+    fn traverse_ast<TContext, FuncVisit>(
+        &mut self,
+        context: &mut TraversalContext<TContext>,
+        func: &mut FuncVisit,
+    ) where
+        FuncVisit: FnMut(bool, AstNode, &mut TraversalContext<TContext>) -> Result<(), String>,
+    {
+        match self {
+            AstDeclaration::VarDeclaration(declaration) => declaration.traverse_ast(context, func),
+            AstDeclaration::FuncDeclaration(declaration) => declaration.traverse_ast(context, func),
+        }
+    }
+}
+
+impl FmtNode for AstDeclaration {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        match self {
+            AstDeclaration::VarDeclaration(declaration) => declaration.fmt_node(f, indent_levels),
+            AstDeclaration::FuncDeclaration(declaration) => declaration.fmt_node(f, indent_levels),
+        }
     }
 }
 
@@ -763,7 +936,7 @@ impl AstFunction {
         }
 
         impl<'g, 'e> ResolveTracking<'g, 'e> {
-            fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<&Symbol, String> {
+            fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<&SymbolEntry, String> {
                 // First look up the symbol in the current block, which is the narrowest scope. This will also search
                 // parent scopes in turn.
                 if let Some(block_tracking) = self.block_tracking_opt.get() {
@@ -773,22 +946,10 @@ impl AstFunction {
                 }
 
                 // If it wasn't found in any block scope then search the global scope last.
-                match self.global_tracking.symbols.lookup_symbol(identifier) {
-                    Ok(Some(symbol)) => Ok(symbol),
-                    Ok(None) => Err(format!("identifier {} not found", identifier)),
-                    Err(err @ _) => Err(err),
-                }
-            }
-
-            fn lookup_function_declaration(
-                &self,
-                identifier: &AstIdentifier,
-            ) -> Result<&Symbol, String> {
-                let symbol @ Symbol::Function(_, _) = self.lookup_symbol(identifier)? else {
-                    return Err(format!("{} is not a function", identifier));
-                };
-
-                Ok(symbol)
+                self.global_tracking
+                    .symbols
+                    .lookup_symbol(identifier)
+                    .ok_or(format!("identifier {} not found", identifier))
             }
         }
 
@@ -805,8 +966,61 @@ impl AstFunction {
                 }
             }
 
-            fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<&Symbol, String> {
-                if let Some(symbol) = self.symbols.symbols.get(identifier) {
+            fn add_variable(
+                &mut self,
+                global_tracking: &mut GlobalTracking,
+                declaration: &AstVarDeclaration,
+            ) -> Result<AstIdentifier, String> {
+                let linkage = match declaration.storage_class {
+                    // Regular variables have no linkage, meaning other variables in other blocks with the same name
+                    // don't have any relation to this one.
+                    //
+                    // `static` when used in block scope doesn't affect linkage at all: the variable gets no linkage.
+                    // Instead it affects storage class, which is handled elsewhere.
+                    AstStorageClass::Unset | AstStorageClass::Static => Linkage::None,
+                    AstStorageClass::Extern => {
+                        // Extern at block scope means use whatever linkage was previously used at file scope, or if
+                        // not, then declare it anew with external linkage.
+                        if let Some(existing_symbol) = global_tracking
+                            .symbols
+                            .lookup_symbol(&declaration.identifier)
+                        {
+                            let Symbol::Var(_, _) = existing_symbol.symbol else {
+                                return Err(format!(
+                                    "{} was previously defined as a different type",
+                                    declaration.identifier
+                                ));
+                            };
+
+                            existing_symbol.linkage.clone()
+                        } else {
+                            if declaration.initializer_opt.is_some() {
+                                return Err(format!("variable {} declared as extern at block scope cannot have initializer", declaration.identifier));
+                            }
+
+                            // The symbol was not previously declared, so add it to the global scope with external linkage.
+                            let _ = global_tracking.add_file_scope_variable(&declaration, false)?;
+                            Linkage::External
+                        }
+                    }
+                };
+
+                let identifier =
+                    self.symbols
+                        .add_variable(global_tracking, declaration, linkage)?;
+
+                // Static variables need to be added to the global symbol table so that they will be stored in static
+                // data in the TAC pass. Because we mangled the name so it can't clash with a real variable name,
+                // there's no risk of clashing.
+                if let AstStorageClass::Static = declaration.storage_class {
+                    global_tracking.add_block_static_variable(declaration, &identifier)?;
+                }
+
+                Ok(identifier)
+            }
+
+            fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<&SymbolEntry, String> {
+                if let Some(symbol) = self.symbols.lookup_symbol(identifier) {
                     Ok(symbol)
                 } else {
                     return if let Some(ref parent) = self.parent_opt {
@@ -815,17 +1029,6 @@ impl AstFunction {
                         Err(format!("identifier '{}' not found", identifier))
                     };
                 }
-            }
-
-            fn resolve_variable(
-                &self,
-                identifier: &AstIdentifier,
-            ) -> Result<&AstIdentifier, String> {
-                let Symbol::Var(ref temp_identifier) = self.lookup_symbol(identifier)? else {
-                    return Err(format!("{} is not a variable", identifier));
-                };
-
-                Ok(temp_identifier)
             }
         }
 
@@ -854,39 +1057,30 @@ impl AstFunction {
                             unreachable!("variable declaration outside of a block");
                         };
 
-                        decl.identifier = block_tracking.symbols
-                            .add_variable(&mut resolve_tracking.global_tracking, &decl.identifier)?;
+                        decl.identifier = block_tracking
+                            .add_variable(&mut resolve_tracking.global_tracking, &decl)?;
                     }
                     AstNode::Function(function) => {
                         let resolve_tracking = context.get_mut().unwrap();
 
-                        // First lookup this new function declaration in the global symbol table. If the symbol is found
-                        // but is not a function, e.g.. is a variable, then no checks need to be done specifically
-                        // against it. We'll next try to add it to the appropriate scope, and that will fail if there's
-                        // a type mismatch.
-                        if let Some(Symbol::Function(param_count, is_definition)) = resolve_tracking.global_tracking.symbols.lookup_symbol(&function.name)? {
-                            // Already had a definition stored in the symbol table, and now trying to store another.
-                            if *is_definition && function.is_definition() {
-                                return Err(format!("duplicate function definition for {}", function.name));
-                            }
+                        let is_global_scope = resolve_tracking.block_tracking_opt.get().is_none();
 
-                            if *param_count != function.parameters.len() {
-                                return Err(format!("cannot declare function {} with {} parameters. previously declared with {} parameters", function.name, function.parameters.len(), param_count));
-                            }
-                        }
+                        // All functions have linkage, so try to add this to the global symbol table too. Only consider
+                        // it in the global scope if we're currently at global scope, though.
+                        resolve_tracking.global_tracking.symbols.add_function(&function, is_global_scope)?;
 
                         // We are in a block, so add this function declaration to the current block.
                         if let Some(block_tracking) = resolve_tracking.block_tracking_opt.get_mut() {
-                            if function.is_definition() {
-                                return Err(format!("not permitted to have function definition within another function definition"));
+                            if let AstStorageClass::Static = function.storage_class {
+                                return Err(format!("cannot declare function {} as static at block level", function.name));
                             }
 
-                            block_tracking.symbols.add_function(&function)?;
-                        }
+                            if function.is_definition() {
+                                return Err(format!("not permitted to have function definition {} within another function definition", function.name));
+                            }
 
-                        // Function declarations have external linkage, and so all declarations of a given function need
-                        // to have the same signature, so also add it to the global table.
-                        resolve_tracking.global_tracking.symbols.add_function(&function)?;
+                            block_tracking.symbols.add_function(&function, true)?;
+                        }
 
                         // Entering the function body creates a new scope. Note that this scope includes the parameters
                         // and the function body together, so that declaring a variable in the function body that
@@ -897,8 +1091,8 @@ impl AstFunction {
                         // function definition.
                         let mut new_block_tracking = BlockTracking::new();
                         for param in function.parameters.iter_mut() {
-                            let temp_ident = new_block_tracking.symbols.add_variable(resolve_tracking.global_tracking, param)?;
-                            *param = temp_ident;
+                            let temp_ident = new_block_tracking.symbols.add_variable(resolve_tracking.global_tracking, param, Linkage::None)?;
+                            param.identifier = temp_ident;
                         }
 
                         if function.is_definition() {
@@ -938,18 +1132,24 @@ impl AstFunction {
                         };
                     }
                     AstNode::Expression(AstExpression::Var(ast_ident)) => {
-                        let Some(block_tracking) =
-                            context.get_mut().unwrap().block_tracking_opt.get_mut()
-                        else {
-                            unreachable!("variable use {} outside of a block", ast_ident);
+                        let symbol @ SymbolEntry { symbol: Symbol::Var(ref identifier, _), .. } = context.get().unwrap().lookup_symbol(ast_ident)? else {
+                            return Err(format!("{} is not a variable", ast_ident));
                         };
 
-                        *ast_ident = block_tracking.resolve_variable(ast_ident)?.clone();
+                        if !symbol.is_added_in_scope {
+                            return Err(format!("{} is not declared at this scope", ast_ident));
+                        }
+
+                        *ast_ident = identifier.clone();
                     }
                     AstNode::Expression(AstExpression::FuncCall(ast_ident, arguments)) => {
-                        let Symbol::Function(param_count, _) = context.get().unwrap().lookup_function_declaration(ast_ident)? else {
-                            unreachable!("lookup_function_declaration returned something other than a function");
+                        let symbol @ SymbolEntry { symbol: Symbol::Function(param_count), .. } = context.get().unwrap().lookup_symbol(ast_ident)? else {
+                            return Err(format!("{} is not a function", ast_ident));
                         };
+
+                        if !symbol.is_added_in_scope {
+                            return Err(format!("{} is not declared at this scope", ast_ident));
+                        }
 
                         if arguments.len() != *param_count {
                             return Err(format!("function {} expected {} arguments but was passed {}", ast_ident, param_count, arguments.len()));
@@ -1030,7 +1230,11 @@ impl AstFunction {
 
         Ok(TacFunction {
             name: self.name.0.clone(),
-            parameters: self.parameters.iter().map(AstIdentifier::to_tac).collect(),
+            parameters: self
+                .parameters
+                .iter()
+                .map(|p| p.identifier.to_tac())
+                .collect(),
             body_opt,
         })
     }
@@ -1351,8 +1555,8 @@ impl AstFunction {
 impl FmtNode for AstFunction {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
         Self::write_indent(f, indent_levels)?;
-        write!(f, "FUNC {}(", self.name)?;
-        fmt_list(f, self.parameters.iter(), ", ")?;
+        write!(f, "{} FUNC {}(", self.storage_class, self.name)?;
+        fmt_list(f, self.parameters.iter().map(|p| &p.identifier), ", ")?;
         write!(f, ")")?;
 
         if let Some(ref body) = self.body_opt {
@@ -1383,6 +1587,27 @@ impl fmt::Display for AstIdentifier {
     }
 }
 
+impl std::str::FromStr for AstStorageClass {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "static" => Ok(AstStorageClass::Static),
+            "extern" => Ok(AstStorageClass::Extern),
+            _ => Err(format!("unknown storage class {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for AstStorageClass {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            AstStorageClass::Unset => "Auto",
+            AstStorageClass::Static => "Static",
+            AstStorageClass::Extern => "Extern",
+        })
+    }
+}
+
 impl AstBlockItem {
     fn traverse_ast<TContext, FuncVisit>(
         &mut self,
@@ -1395,10 +1620,7 @@ impl AstBlockItem {
             AstBlockItem::Statement(statement) => {
                 statement.traverse_ast(context, func);
             }
-            AstBlockItem::VarDeclaration(declaration) => {
-                declaration.traverse_ast(context, func);
-            }
-            AstBlockItem::FuncDeclaration(declaration) => {
+            AstBlockItem::Declaration(declaration) => {
                 declaration.traverse_ast(context, func);
             }
         }
@@ -1411,14 +1633,14 @@ impl AstBlockItem {
     ) -> Result<(), String> {
         match self {
             AstBlockItem::Statement(statement) => statement.to_tac(global_tracking, instructions),
-            AstBlockItem::VarDeclaration(declaration) => {
-                declaration.to_tac(global_tracking, instructions)
-            }
-            AstBlockItem::FuncDeclaration(declaration) => {
-                // Function definitions as block items aren't supported and should have been rejected in a precious
-                // analysis pass. For declarations, no code is emitted.
-                assert!(!declaration.is_definition());
+            AstBlockItem::Declaration(AstDeclaration::FuncDeclaration(func)) => {
+                // Function definitions as block items aren't supported and should have been rejected in a
+                // previous analysis pass. For declarations, no code is emitted.
+                assert!(!func.is_definition());
                 Ok(())
+            }
+            AstBlockItem::Declaration(AstDeclaration::VarDeclaration(declaration)) => {
+                declaration.to_tac(global_tracking, instructions)
             }
         }
     }
@@ -1428,8 +1650,7 @@ impl FmtNode for AstBlockItem {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
         match self {
             AstBlockItem::Statement(statement) => statement.fmt_node(f, indent_levels),
-            AstBlockItem::VarDeclaration(declaration) => declaration.fmt_node(f, indent_levels),
-            AstBlockItem::FuncDeclaration(declaration) => declaration.fmt_node(f, indent_levels),
+            AstBlockItem::Declaration(declaration) => declaration.fmt_node(f, indent_levels),
         }
     }
 }
@@ -1460,6 +1681,12 @@ impl AstVarDeclaration {
         global_tracking: &mut GlobalTracking,
         instructions: &mut Vec<TacInstruction>,
     ) -> Result<(), String> {
+        // This function only handles stack variable declarations. Variables with static storage are handled as toplevel
+        // items.
+        let AstStorageClass::Unset = self.storage_class else {
+            return Ok(());
+        };
+
         if let Some(initializer) = &self.initializer_opt {
             let tac_val = initializer.to_tac(global_tracking, instructions)?;
             instructions.push(TacInstruction::CopyVal(tac_val, self.identifier.to_tac()));
@@ -1473,7 +1700,7 @@ impl FmtNode for AstVarDeclaration {
     fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
         Self::write_indent(f, indent_levels)?;
 
-        write!(f, "int {}", self.identifier)?;
+        write!(f, "{} int {}", self.storage_class, self.identifier)?;
 
         if let Some(initializer) = &self.initializer_opt {
             write!(f, " = ")?;
@@ -2078,6 +2305,15 @@ impl FmtNode for AstForInit {
                     Ok(())
                 }
             }
+        }
+    }
+}
+
+impl Linkage {
+    fn has(&self) -> bool {
+        match self {
+            Linkage::None => false,
+            Linkage::Internal | Linkage::External => true,
         }
     }
 }
@@ -2742,26 +2978,91 @@ impl FmtNode for AstExpression {
 }
 
 impl TacProgram {
-    fn to_asm(&self) -> Result<AsmProgram, String> {
-        let mut functions = Vec::new();
-        for func in self.functions.iter() {
-            functions.push(func.to_asm()?);
+    fn to_asm(&self, global_tracking: &GlobalTracking) -> Result<AsmProgram, String> {
+        let mut toplevel_items = Vec::new();
+
+        for item in self.toplevel_items.iter() {
+            match item {
+                TacTopLevelItem::Var(var) => {
+                    toplevel_items.push(AsmTopLevelItem::Var(var.to_asm()?))
+                }
+                TacTopLevelItem::Function(func) => {
+                    toplevel_items.push(AsmTopLevelItem::Function(func.to_asm(global_tracking)?))
+                }
+            }
         }
 
-        Ok(AsmProgram { functions })
+        Ok(AsmProgram { toplevel_items })
     }
 }
 
 impl FmtNode for TacProgram {
     fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
-        Self::fmt_nodelist(f, self.functions.iter(), "\n\n", 0)
+        Self::fmt_nodelist(f, self.toplevel_items.iter(), "\n\n", 0)
+    }
+}
+
+impl FmtNode for TacTopLevelItem {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        match self {
+            TacTopLevelItem::Var(var) => var.fmt_node(f, indent_levels),
+            TacTopLevelItem::Function(func) => func.fmt_node(f, indent_levels),
+        }
+    }
+}
+
+impl TacTopLevelVariable {
+    fn to_asm(&self) -> Result<AsmTopLevelVar, String> {
+        Ok(AsmTopLevelVar {
+            name: self.name.0.clone(),
+            is_global: self.is_global,
+            initial_value_opt: self.initial_value_opt,
+        })
+    }
+}
+
+impl FmtNode for TacTopLevelVariable {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        Self::write_indent(f, indent_levels)?;
+
+        write!(
+            f,
+            "{} VAR {}",
+            if self.is_global { "PUBLIC" } else { "PRIV" },
+            &self.name.0
+        )?;
+
+        if let Some(initial_value) = self.initial_value_opt {
+            write!(f, " = {}", initial_value)?;
+        }
+
+        Ok(())
     }
 }
 
 impl TacFunction {
-    fn to_asm(&self) -> Result<AsmFunction, String> {
+    fn to_asm(&self, global_tracking: &GlobalTracking) -> Result<AsmFunction, String> {
+        let Some(SymbolEntry {
+            symbol: Symbol::Function(_),
+            linkage,
+            ..
+        }) = global_tracking
+            .symbols
+            .lookup_symbol(&AstIdentifier(self.name.clone()))
+        else {
+            panic!(
+                "cannot find function name {} in symbol table that should be there",
+                &self.name
+            );
+        };
+
+        let is_global = match linkage {
+            Linkage::None | Linkage::Internal => false,
+            Linkage::External => true,
+        };
+
         let Some(ref tac_body) = self.body_opt else {
-            return Ok(AsmFunction::new(&self.name, None));
+            return Ok(AsmFunction::new(&self.name, None, is_global));
         };
 
         let mut frame = FuncStackFrame::new();
@@ -2809,7 +3110,7 @@ impl TacFunction {
         }
 
         for instruction in tac_body.iter() {
-            instruction.to_asm(&mut body)?;
+            instruction.to_asm(global_tracking, &mut body)?;
         }
 
         let mut errors = Vec::new();
@@ -2864,7 +3165,7 @@ impl TacFunction {
             }
         }
 
-        let mut asm_func = AsmFunction::new(&self.name, Some(body));
+        let mut asm_func = AsmFunction::new(&self.name, Some(body), is_global);
 
         debug!(target: "asm", asm = %DisplayFmtNode(&asm_func), "before convert rbp to rsp offset");
 
@@ -2924,28 +3225,41 @@ impl fmt::Display for TacLabel {
 }
 
 impl TacInstruction {
-    fn to_asm(&self, func_body: &mut Vec<AsmInstruction>) -> Result<(), String> {
+    fn to_asm(
+        &self,
+        global_tracking: &GlobalTracking,
+        func_body: &mut Vec<AsmInstruction>,
+    ) -> Result<(), String> {
         match self {
             TacInstruction::Return(val) => {
-                func_body.push(AsmInstruction::Mov(val.to_asm()?, AsmLocation::Reg("eax")));
+                func_body.push(AsmInstruction::Mov(
+                    val.to_asm(global_tracking)?,
+                    AsmLocation::Reg("eax"),
+                ));
                 func_body.push(AsmInstruction::Ret(0));
             }
 
             // !a is the same as (a == 0), so do a comparison to zero and set if equal.
             TacInstruction::UnaryOp(TacUnaryOperator::Not, src_val, dest_var) => {
                 // Compare the value to zero.
-                func_body.push(AsmInstruction::Cmp(AsmVal::Imm(0), src_val.to_asm()?));
+                func_body.push(AsmInstruction::Cmp(
+                    AsmVal::Imm(0),
+                    src_val.to_asm(global_tracking)?,
+                ));
 
                 // Clear the destination before the SetCc.
-                let dest_asm_loc = dest_var.to_asm()?;
+                let dest_asm_loc = dest_var.to_asm(global_tracking)?;
                 func_body.push(AsmInstruction::Mov(AsmVal::Imm(0), dest_asm_loc.clone()));
 
                 // Set if equal to zero.
                 func_body.push(AsmInstruction::SetCc(AsmCondCode::E, dest_asm_loc));
             }
             TacInstruction::UnaryOp(unary_op, src_val, dest_var) => {
-                let dest_asm_loc = dest_var.to_asm()?;
-                func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_asm_loc.clone()));
+                let dest_asm_loc = dest_var.to_asm(global_tracking)?;
+                func_body.push(AsmInstruction::Mov(
+                    src_val.to_asm(global_tracking)?,
+                    dest_asm_loc.clone(),
+                ));
                 func_body.push(AsmInstruction::UnaryOp(unary_op.to_asm()?, dest_asm_loc));
             }
 
@@ -2959,7 +3273,7 @@ impl TacInstruction {
                 // idiv takes the numerator in EDX:EAX (that's low 32 bits in EAX and high 32 bits in EDX). Since we're
                 // operating only on 32 bits, move the value to EAX first.
                 func_body.push(AsmInstruction::Mov(
-                    left_val.to_asm()?,
+                    left_val.to_asm(global_tracking)?,
                     AsmLocation::Reg("eax"),
                 ));
 
@@ -2968,17 +3282,13 @@ impl TacInstruction {
 
                 // The idiv instruction takes only the denominator as an argument, implicitly operating on EDX:EAX as
                 // the numerator.
-                func_body.push(AsmInstruction::Idiv(right_val.to_asm()?));
+                func_body.push(AsmInstruction::Idiv(right_val.to_asm(global_tracking)?));
 
                 // The result of idiv is stored with quotient in EAX and remainer in EDX.
                 let result_loc = AsmLocation::Reg(if let TacBinaryOperator::Divide = binary_op {
                     "eax"
                 } else {
-                    assert!(if let TacBinaryOperator::Modulus = binary_op {
-                        true
-                    } else {
-                        false
-                    });
+                    assert!(variant_eq(binary_op, &TacBinaryOperator::Modulus));
 
                     "edx"
                 });
@@ -2986,7 +3296,7 @@ impl TacInstruction {
                 // Move from idiv's result register to the intended destination.
                 func_body.push(AsmInstruction::Mov(
                     AsmVal::Loc(result_loc),
-                    dest_var.to_asm()?,
+                    dest_var.to_asm(global_tracking)?,
                 ));
             }
 
@@ -3002,9 +3312,12 @@ impl TacInstruction {
                 right_val,
                 dest_var,
             ) => {
-                func_body.push(AsmInstruction::Cmp(right_val.to_asm()?, left_val.to_asm()?));
+                func_body.push(AsmInstruction::Cmp(
+                    right_val.to_asm(global_tracking)?,
+                    left_val.to_asm(global_tracking)?,
+                ));
 
-                let dest_asm_loc = dest_var.to_asm()?;
+                let dest_asm_loc = dest_var.to_asm(global_tracking)?;
 
                 // Zero out the destination because the SetCc instruction only writes the low 1 byte.
                 func_body.push(AsmInstruction::Mov(AsmVal::Imm(0), dest_asm_loc.clone()));
@@ -3019,9 +3332,9 @@ impl TacInstruction {
             // the operator in the destination register.
             TacInstruction::BinaryOp(left_val, binary_op, right_val, dest_var) => {
                 // Normal binary operators take the left hand side in the destination register, so move it there first.
-                let dest_asm_loc = dest_var.to_asm()?;
+                let dest_asm_loc = dest_var.to_asm(global_tracking)?;
                 func_body.push(AsmInstruction::Mov(
-                    left_val.to_asm()?,
+                    left_val.to_asm(global_tracking)?,
                     dest_asm_loc.clone(),
                 ));
 
@@ -3029,12 +3342,15 @@ impl TacInstruction {
                 // the destination.
                 func_body.push(AsmInstruction::BinaryOp(
                     binary_op.to_asm()?,
-                    right_val.to_asm()?,
+                    right_val.to_asm(global_tracking)?,
                     dest_asm_loc,
                 ));
             }
             TacInstruction::CopyVal(src_val, dest_var) => {
-                func_body.push(AsmInstruction::Mov(src_val.to_asm()?, dest_var.to_asm()?));
+                func_body.push(AsmInstruction::Mov(
+                    src_val.to_asm(global_tracking)?,
+                    dest_var.to_asm(global_tracking)?,
+                ));
             }
             TacInstruction::Jump(label) => {
                 func_body.push(AsmInstruction::Jmp(label.to_asm()?));
@@ -3042,7 +3358,10 @@ impl TacInstruction {
             jump_type @ (TacInstruction::JumpIfZero(val, label)
             | TacInstruction::JumpIfNotZero(val, label)) => {
                 // First compare to zero.
-                func_body.push(AsmInstruction::Cmp(AsmVal::Imm(0), val.to_asm()?));
+                func_body.push(AsmInstruction::Cmp(
+                    AsmVal::Imm(0),
+                    val.to_asm(global_tracking)?,
+                ));
 
                 // Then jump if they were equal or not equal, depending on the jump type.
                 func_body.push(AsmInstruction::JmpCc(
@@ -3055,7 +3374,10 @@ impl TacInstruction {
                 ));
             }
             TacInstruction::JumpIfEqual(val1, val2, label) => {
-                func_body.push(AsmInstruction::Cmp(val1.to_asm()?, val2.to_asm()?));
+                func_body.push(AsmInstruction::Cmp(
+                    val1.to_asm(global_tracking)?,
+                    val2.to_asm(global_tracking)?,
+                ));
                 func_body.push(AsmInstruction::JmpCc(AsmCondCode::E, label.to_asm()?));
             }
             TacInstruction::Label(label) => {
@@ -3067,17 +3389,17 @@ impl TacInstruction {
                 // pushed onto the stack in reverse order, arg 0 will be closest to RSP.
                 for (i, arg) in arguments.iter().enumerate() {
                     func_body.push(AsmInstruction::Mov(
-                        arg.to_asm()?,
+                        arg.to_asm(global_tracking)?,
                         AsmLocation::PseudoArgReg(i as u32),
                     ));
                 }
 
-                func_body.push(AsmInstruction::Call(mangle_function_name(&label.0)));
+                func_body.push(AsmInstruction::Call(label.0.clone()));
 
                 // Function return value is stored in eax. Move it to the expected destination location.
                 func_body.push(AsmInstruction::Mov(
                     AsmVal::Loc(AsmLocation::Reg("eax")),
-                    dest_var.to_asm()?,
+                    dest_var.to_asm(global_tracking)?,
                 ));
             }
         }
@@ -3165,10 +3487,10 @@ impl FmtNode for TacVar {
 }
 
 impl TacVal {
-    fn to_asm(&self) -> Result<AsmVal, String> {
+    fn to_asm(&self, global_tracking: &GlobalTracking) -> Result<AsmVal, String> {
         Ok(match self {
             TacVal::Constant(num) => AsmVal::Imm(*num),
-            TacVal::Var(var) => AsmVal::Loc(var.to_asm()?),
+            TacVal::Var(var) => AsmVal::Loc(var.to_asm(global_tracking)?),
         })
     }
 }
@@ -3189,8 +3511,24 @@ impl FmtNode for TacVal {
 }
 
 impl TacVar {
-    fn to_asm(&self) -> Result<AsmLocation, String> {
-        Ok(AsmLocation::PseudoReg(self.0.clone()))
+    fn to_asm(&self, global_tracking: &GlobalTracking) -> Result<AsmLocation, String> {
+        // TODO: unsure if the symbol table should store AstIdentifier or String
+        // When converting a TAC variable access to ASM, the variable is either a stack variable, in which case it goes
+        // into a pseudoregister, or it is a static variable, which is a named location. The symbol table tells us which
+        // one it is.
+        Ok(
+            if let Some(SymbolEntry {
+                symbol: Symbol::Var(_, _),
+                ..
+            }) = global_tracking
+                .symbols
+                .lookup_symbol(&AstIdentifier(self.0.clone()))
+            {
+                AsmLocation::Data(AsmVar(self.0.clone()))
+            } else {
+                AsmLocation::PseudoReg(self.0.clone())
+            },
+        )
     }
 }
 
@@ -3275,8 +3613,10 @@ impl fmt::Display for TacBinaryOperator {
 
 impl AsmProgram {
     fn finalize(&mut self) -> Result<(), String> {
-        for func in self.functions.iter_mut() {
-            func.finalize()?;
+        for item in self.toplevel_items.iter_mut() {
+            if let AsmTopLevelItem::Function(func) = item {
+                func.finalize()?;
+            }
         }
 
         Ok(())
@@ -3293,46 +3633,65 @@ INCLUDELIB msvcrt.lib
                     "
                 )?;
 
-                writeln!(f, "; ALIAS declarations in this section allow for function names with keywords to be used as identifiers")?;
+                writeln!(f, "; ALIAS declarations in this section allow for symbols with names that clash with keywords to be used as identifiers")?;
 
-                // Only emit each function once. Let definitions take precedence over declarations.
-                let mut func_names = HashSet::new();
-                for func in self
-                    .functions
+                // Only emit each item once. Let definitions take precedence over declarations.
+                let mut symbol_names = HashSet::new();
+                for item in self
+                    .toplevel_items
                     .iter()
-                    .filter(|f| f.is_definition())
-                    .chain(self.functions.iter().filter(|f| !f.is_definition()))
+                    .filter(|i| i.is_definition())
+                    .chain(self.toplevel_items.iter().filter(|i| !i.is_definition()))
                 {
-                    if func_names.insert(&func.name) {
-                        func.emit_declaration(f)?;
+                    if symbol_names.insert(item.get_name()) {
+                        item.emit_declaration(f)?;
                     }
                 }
 
+                // Emit variables in the .DATA section.
                 writeln!(
                     f,
                     r"
 .DATA
+ALIGN 4
+                         "
+                )?;
+
+                for item in self.toplevel_items.iter() {
+                    if let AsmTopLevelItem::Var(var) = item {
+                        var.emit_code(f)?;
+                    }
+                }
+
+                // Emit functions in the .CODE section.
+                writeln!(
+                    f,
+                    r"
 .CODE
                          "
                 )?;
 
-                for func in self.functions.iter().filter(|f| f.is_definition()) {
-                    func.emit_code(f)?;
+                for item in self.toplevel_items.iter() {
+                    if let AsmTopLevelItem::Function(func) = item {
+                        if func.is_definition() {
+                            func.emit_code(f)?;
+                        }
+                    }
                 }
 
                 writeln!(f)?;
-                writeln!(f, "; NOKEYWORD is used here to allow us to import or export the original function name, when that name might be a MASM keyword.")?;
+                writeln!(f, "; NOKEYWORD is used here to allow us to import or export the original symbol, when that name might be a MASM keyword.")?;
 
-                // Only emit each function once. Let definitions take precedence over declarations.
-                func_names.clear();
-                for func in self
-                    .functions
+                // Only emit each item once. Let definitions take precedence over declarations.
+                symbol_names.clear();
+                for item in self
+                    .toplevel_items
                     .iter()
-                    .filter(|f| f.is_definition())
-                    .chain(self.functions.iter().filter(|f| !f.is_definition()))
+                    .filter(|i| i.is_definition())
+                    .chain(self.toplevel_items.iter().filter(|i| !i.is_definition()))
                 {
-                    if func_names.insert(&func.name) {
-                        func.emit_footer(f)?;
+                    if symbol_names.insert(item.get_name()) {
+                        item.emit_footer(f)?;
                     }
                 }
 
@@ -3346,25 +3705,143 @@ INCLUDELIB msvcrt.lib
 
 impl FmtNode for AsmProgram {
     fn fmt_node(&self, f: &mut fmt::Formatter, _indent_levels: u32) -> fmt::Result {
-        Self::fmt_nodelist(f, self.functions.iter(), "\n\n", 0)
+        Self::fmt_nodelist(f, self.toplevel_items.iter(), "\n\n", 0)
+    }
+}
+
+impl AsmTopLevelItem {
+    fn get_name(&self) -> &str {
+        match self {
+            AsmTopLevelItem::Var(var) => &var.name,
+            AsmTopLevelItem::Function(func) => &func.name,
+        }
+    }
+
+    fn is_definition(&self) -> bool {
+        match self {
+            AsmTopLevelItem::Var(var) => var.is_definition(),
+            AsmTopLevelItem::Function(func) => func.is_definition(),
+        }
+    }
+
+    fn is_global(&self) -> bool {
+        match self {
+            AsmTopLevelItem::Var(var) => var.is_global,
+            AsmTopLevelItem::Function(func) => func.is_global,
+        }
+    }
+
+    fn emit_declaration(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // The ALIAS <new_name> = <existing_name> directive creates a new symbol with "new_name", and requires that you
+        // have a definition or EXTERN entry for "existing_name" elsewhere in the ASM listing.
+        //
+        // If we have a definition, it is emitted later in the listing using its mangled name so that it can be
+        // easily referenced within this listing. This is necessary especially if the name clashes with a built-in,
+        // reserved word like "add", "sub", "mov", etc..
+        //
+        // If we have only a declaration, then there will be an EXTERN directive later in the ASM listing that brings in
+        // the symbol by its original name from some other compilation unit. But we might not be able to refer to that
+        // original name, if it's one of those reserved words. So set up an alias with a mangled name that we can use to
+        // refer to it in this listing.
+        if !self.is_definition() {
+            write!(f, "ALIAS <")?;
+            write_mangled_name(f, self.get_name())?;
+            writeln!(f, "> = <{}>", self.get_name())?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_footer(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // If we are defining a new symbol in this listing, we did so using a mangled name to avoid clashing with
+        // reserved MASM keywords. That name is private to this compilation unit, either by default (for variables) or
+        // because we declared it as PRIVATE (for functions). This is desirable because we don't want to expose our
+        // internal names. But we do want the *original* name made public to be linked against, so make it not a keyword
+        // and assign a new symbol to it, then publicize that symbol. That makes it show up properly in the object file.
+        if self.is_definition() {
+            writeln!(f, "OPTION NOKEYWORD: <{}>", self.get_name())?;
+
+            write!(f, "{} = ", self.get_name())?;
+            write_mangled_name(f, self.get_name())?;
+            writeln!(f)?;
+
+            if self.is_global() {
+                writeln!(f, "PUBLIC {}", self.get_name())?;
+            }
+
+        // If we were bringing in a symbol, it needs an EXTERN declaration. Because it might be a reserved MASM keyword,
+        // remove the name from the keywords list.
+        } else {
+            writeln!(f, "OPTION NOKEYWORD: <{}>", self.get_name())?;
+            writeln!(
+                f,
+                "EXTERN {}:{}",
+                self.get_name(),
+                match self {
+                    AsmTopLevelItem::Var(_) => {
+                        "DWORD"
+                    }
+                    AsmTopLevelItem::Function(_) => {
+                        "PROC"
+                    }
+                }
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for AsmTopLevelItem {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        match self {
+            AsmTopLevelItem::Var(var) => var.fmt_node(f, indent_levels),
+            AsmTopLevelItem::Function(func) => func.fmt_node(f, indent_levels),
+        }
+    }
+}
+
+impl AsmTopLevelVar {
+    fn is_definition(&self) -> bool {
+        self.initial_value_opt.is_some()
+    }
+
+    fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Only need to emit code for variables that are defined in this compilation unit.
+        if let Some(initial_value) = self.initial_value_opt {
+            writeln!(f, "@@@{} DWORD {}", self.name, initial_value)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl FmtNode for AsmTopLevelVar {
+    fn fmt_node(&self, f: &mut fmt::Formatter, indent_levels: u32) -> fmt::Result {
+        Self::write_indent(f, indent_levels)?;
+        write!(f, "VAR {}", self.name)?;
+
+        if let Some(initial_value) = self.initial_value_opt {
+            write!(f, " = {}", initial_value)?;
+        }
+
+        writeln!(f)?;
+
+        Ok(())
     }
 }
 
 impl AsmFunction {
-    fn new(name: &str, body_opt: Option<Vec<AsmInstruction>>) -> Self {
+    fn new(name: &str, body_opt: Option<Vec<AsmInstruction>>, is_global: bool) -> Self {
         Self {
             name: String::from(name),
-            mangled_name: mangle_function_name(name),
+            is_global,
             body_opt,
         }
     }
 
     fn is_definition(&self) -> bool {
         self.body_opt.is_some()
-    }
-
-    fn has_mangled_name(&self) -> bool {
-        self.name != self.mangled_name
     }
 
     fn finalize(&mut self) -> Result<(), String> {
@@ -3401,13 +3878,13 @@ impl AsmFunction {
             i += 1;
         }
 
-        // For any Mov that uses a stack offset for both src and dest, x64 assembly requires that we first store it in a
-        // temporary register.
+        // For any Mov that uses a memory location for both src and dest, x64 assembly requires that we first copy the
+        // source value to a temporary register.
         i = 0;
         while i < body.len() {
             if let AsmInstruction::Mov(
-                ref _src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
-                ref mut dest_loc @ AsmLocation::RspOffset(_, _),
+                ref _src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _) | AsmLocation::Data(_)),
+                ref mut dest_loc @ (AsmLocation::RspOffset(_, _) | AsmLocation::Data(_)),
             ) = &mut body[i]
             {
                 let real_dest = dest_loc.clone();
@@ -3432,7 +3909,7 @@ impl AsmFunction {
             if let AsmInstruction::BinaryOp(
                 AsmBinaryOperator::Imul,
                 _src_val,
-                ref mut dest_loc @ AsmLocation::RspOffset(_, _),
+                ref mut dest_loc @ (AsmLocation::RspOffset(_, _) | AsmLocation::Data(_)),
             ) = &mut body[i]
             {
                 let real_dest = dest_loc.clone();
@@ -3485,8 +3962,8 @@ impl AsmFunction {
         i = 0;
         while i < body.len() {
             if let AsmInstruction::Cmp(
-                ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
-                ref _dest_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
+                ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _) | AsmLocation::Data(_)),
+                ref _dest_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _) | AsmLocation::Data(_)),
             ) = &mut body[i]
             {
                 let real_src_val = src_val.clone();
@@ -3504,14 +3981,14 @@ impl AsmFunction {
             i += 1;
         }
 
-        // For any binary operator that uses a stack offset for both right hand side and dest, x64 assembly requires
+        // For any binary operator that uses a memory address for both right hand side and dest, x64 assembly requires
         // that we first store the destination in a temporary register.
         i = 0;
         while i < body.len() {
             if let AsmInstruction::BinaryOp(
                 _binary_op,
-                ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _)),
-                ref _dest_loc @ AsmLocation::RspOffset(_, _),
+                ref mut src_val @ AsmVal::Loc(AsmLocation::RspOffset(_, _) | AsmLocation::Data(_)),
+                ref _dest_loc @ (AsmLocation::RspOffset(_, _) | AsmLocation::Data(_)),
             ) = &mut body[i]
             {
                 let real_src_val = src_val.clone();
@@ -3552,69 +4029,22 @@ impl AsmFunction {
         Ok(())
     }
 
-    fn emit_declaration(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // The ALIAS <new_name> = <existing_name> directive creates a new entry with "new_name", and requires that you
-        // have a definition or EXTERN entry for "existing_name" elsewhere in the ASM listing. For functions that don't
-        // have any name mangling, of course this doesn't have any effect and in fact causes a multiple declarations
-        // error.
-        if self.has_mangled_name() {
-            // If we have a definition, it is emitted later in the listing using its mangled name so that it can be
-            // easily referenced within this listing. This is necessary especially if the function name is a built-in,
-            // reserved word like "add", "sub", "mov", etc..
-            //
-            // If we have only a declaration, then there will be an EXTERN directive later in the ASM listing that
-            // brings in the function by its original name from some other compilation unit. But we might not be able
-            // to refer to that original name, if it's one of those reserved words. So set up an alias with a mangled
-            // name that we can use to refer to it in this listing.
-            if !self.is_definition() {
-                writeln!(f, "ALIAS <{}> = <{}>", self.mangled_name, self.name)?;
-            }
-        }
-
-        Ok(())
-    }
-
     fn emit_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let Some(ref body) = self.body_opt else {
             unreachable!("should not call emit_code on a declaration");
         };
 
-        write!(f, "{} PROC", self.mangled_name)?;
-
-        // For any functions that have a mangled name, we don't want to expose the mangled name to allow linking against
-        // it from other compilation units. We'll expose the correct name a different way. See `emit_footer` for that.
-        if self.has_mangled_name() {
-            write!(f, " PRIVATE")?;
-        }
-
-        writeln!(f)?;
+        // Because all functions are declared using a mangled name, declare it as PRIVATE so as not to expose that
+        // internal, mangled name. Later in the listing, we will publicize the function if needed.
+        write_mangled_name(f, &self.name)?;
+        writeln!(f, " PROC PRIVATE")?;
 
         for inst in body.iter() {
             inst.emit_code(f)?;
         }
 
-        writeln!(f, "{} ENDP", self.mangled_name)
-    }
-
-    fn emit_footer(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // If we are defining a new function in this listing, we did so using a mangled name to avoid clashing with
-        // reserved MASM keywords. Because we mangled the name, we also declared it as PRIVATE (a.k.a. static) so that
-        // other compilation units can't link against it. But we do want the original name available to be linked
-        // against, so make it not a keyword and assign a new label to it, then publicize that label. That makes it show
-        // up properly in the object file.
-        if self.is_definition() {
-            if self.has_mangled_name() {
-                writeln!(f, "OPTION NOKEYWORD: <{}>", self.name)?;
-                writeln!(f, "{} = {}", self.name, self.mangled_name)?;
-                writeln!(f, "PUBLIC {}", self.name)?;
-            }
-
-        // If we were bringing in a function, it needs an EXTERN declaration. Because it might be a reserved MASM
-        // keyword, remove the name from the keywords list.
-        } else {
-            writeln!(f, "OPTION NOKEYWORD: <{}>", self.name)?;
-            writeln!(f, "EXTERN {}:PROC", self.name)?;
-        }
+        write_mangled_name(f, &self.name)?;
+        writeln!(f, " ENDP")?;
 
         Ok(())
     }
@@ -3837,7 +4267,9 @@ impl AsmInstruction {
                 writeln!(f, ":")?;
             }
             AsmInstruction::Call(func_name) => {
-                writeln!(f, "    call {}", func_name)?;
+                write!(f, "    call ")?;
+                write_mangled_name(f, func_name)?;
+                writeln!(f)?;
             }
         }
 
@@ -4103,6 +4535,9 @@ impl AsmLocation {
                     rsp_offset
                 )?;
             }
+            AsmLocation::Data(var) => {
+                write!(f, "@@@{}", &var.0)?;
+            }
             _ => panic!("cannot handle emitting {:?}", self),
         }
 
@@ -4116,6 +4551,9 @@ impl AsmLocation {
             }
             AsmLocation::RspOffset(_rsp_offset, name) => {
                 f.write_str(name)?;
+            }
+            AsmLocation::Data(name) => {
+                f.write_str(&name.0)?;
             }
             _ => panic!("{:?} should not be written into ASM", self),
         }
@@ -4147,6 +4585,9 @@ impl FmtNode for AsmLocation {
             }
             AsmLocation::RspOffset(offset, name) => {
                 write!(f, "rsp+{} ({})", offset, name)?;
+            }
+            AsmLocation::Data(var) => {
+                write!(f, "{}", &var.0)?;
             }
         }
 
@@ -4232,74 +4673,264 @@ impl SymbolTable {
         }
     }
 
-    fn add_function(&mut self, function: &AstFunction) -> Result<(), String> {
-        if let Some(symbol) = self.symbols.get(&function.name) {
-            return match symbol {
-                Symbol::Var(_) => Err(format!(
+    fn add_function(
+        &mut self,
+        function: &AstFunction,
+        is_added_in_scope: bool,
+    ) -> Result<(), String> {
+        if let Some(symbol) = self.symbols.get_mut(&function.name) {
+            return match symbol.symbol {
+                Symbol::Var(_, _) => Err(format!(
                     "function {} previously defined as a variable in this scope",
                     function.name
                 )),
-                Symbol::Function(param_count, _) => {
-                    if *param_count != function.parameters.len() {
+                Symbol::Function(param_count) => {
+                    // Already had a definition stored in the symbol table, and now trying to store another.
+                    if symbol.is_definition && function.is_definition() {
+                        Err(format!(
+                            "duplicate function definition for {}",
+                            function.name
+                        ))
+                    } else if param_count != function.parameters.len() {
                         Err(format!("function {} declared with {} parameters, but previously declared with {} parameters", function.name, function.parameters.len(), param_count))
                     } else {
+                        match (&symbol.linkage, &function.storage_class) {
+                            (Linkage::None, _) => {
+                                unreachable!("functions always have linkage")
+                            }
+
+                            // If declaring now as extern, it is compatible with any previous linkage.
+                            (_, AstStorageClass::Unset | AstStorageClass::Extern) => {}
+
+                            // Static means internal linkage, so that's compatible.
+                            (Linkage::Internal, AstStorageClass::Static) => {}
+
+                            // External before but changed to static isn't allowed.
+                            (Linkage::External, AstStorageClass::Static) => {
+                                return Err(format!("function {} changed linkage", function.name));
+                            }
+                        }
+
+                        // This function might have been only forward-declared in a block scope earlier, but now is
+                        // being declared at its proper scope, so update its entry.
+                        if is_added_in_scope {
+                            if !symbol.is_added_in_scope {
+                                debug!(target: "resolve", name = &function.name.0, "updated symbol to be in scope");
+                            }
+
+                            symbol.is_added_in_scope = true;
+                        }
+
+                        debug!(target: "resolve", name = &function.name.0, ?symbol, "reused function declaration");
                         Ok(())
                     }
                 }
             };
         }
 
-        let old_value = self.symbols.insert(
-            function.name.clone(),
-            Symbol::Function(function.parameters.len(), function.is_definition()),
-        );
+        // New function declarations are external by default unless specifically `static`.
+        let linkage = match function.storage_class {
+            AstStorageClass::Unset | AstStorageClass::Extern => Linkage::External,
+            AstStorageClass::Static => Linkage::Internal,
+        };
+
+        let symbol = SymbolEntry {
+            symbol: Symbol::Function(function.parameters.len()),
+            is_definition: function.is_definition(),
+            is_added_in_scope,
+            linkage,
+        };
+
+        debug!(target: "resolve", name = &function.name.0, ?symbol, "added function");
+
+        let old_value = self.symbols.insert(function.name.clone(), symbol);
         assert!(old_value.is_none());
 
         Ok(())
     }
 
-    fn lookup_symbol(&self, identifier: &AstIdentifier) -> Result<Option<&Symbol>, String> {
-        if let Some(symbol) = self.symbols.get(identifier) {
-            if let Symbol::Function(_, _) = symbol {
-                Ok(Some(symbol))
-            } else {
-                Err(format!(
-                    "identifier {} declared as not a function",
-                    identifier
-                ))
-            }
-        } else {
-            Ok(None)
-        }
+    fn lookup_symbol(&self, identifier: &AstIdentifier) -> Option<&SymbolEntry> {
+        self.symbols.get(identifier)
     }
 
-    /// Adds a variable to the map and returns a unique, mangled identifier to refer to the variable with.
     fn add_variable(
         &mut self,
         global_tracking: &mut GlobalTracking,
-        ast_identifier: &AstIdentifier,
+        declaration: &AstVarDeclaration,
+        linkage: Linkage,
     ) -> Result<AstIdentifier, String> {
-        if let Some(symbol) = self.symbols.get(&ast_identifier) {
-            match symbol {
-                Symbol::Var(_) => {
-                    return Err(format!("duplicate variable declaration {}", ast_identifier));
+        self.add_variable_ex(Some(global_tracking), declaration, linkage, true, None)
+    }
+
+    /// Adds a variable to the map and returns an identifier to refer to the variable with. In some cases the identifier
+    /// will be the same as the original name; in other cases, it will be mangled for internal use.
+    fn add_variable_ex(
+        &mut self,
+        global_tracking_opt: Option<&mut GlobalTracking>,
+        declaration: &AstVarDeclaration,
+        linkage: Linkage,
+        is_added_in_scope: bool,
+        identifier_opt: Option<&AstIdentifier>,
+    ) -> Result<AstIdentifier, String> {
+        let initializer = match linkage {
+            // Variables with no linkage don't need to have their initializers stored. Actually, block-scope static
+            // variables stored in the global table will be stored with Internal linkage. And stack variables are
+            // initialized at runtime using assembly instructions, not pre-set values statically in the data
+            // section.
+            Linkage::None => StaticInitializer::None,
+            Linkage::Internal | Linkage::External => {
+                // For internal and external linkage, the rules are complicated.
+                // - if an initializer is provided, it's always used.
+                // - static variables get a tentative initializer
+                // - without storage class specified, it's also tentative
+                // - extern storage class means no initializer
+                if let Some(ref ast_initializer) = declaration.initializer_opt {
+                    StaticInitializer::Constant(ast_initializer.eval_i32_constant()?)
+                } else if let Linkage::External = linkage {
+                    match declaration.storage_class {
+                        AstStorageClass::Unset => StaticInitializer::Tentative,
+                        AstStorageClass::Extern => StaticInitializer::None,
+                        AstStorageClass::Static => {
+                            unreachable!("this would have been internal linkage")
+                        }
+                    }
+                } else {
+                    StaticInitializer::Tentative
                 }
-                Symbol::Function(_, _) => {
+            }
+        };
+
+        // Use the override variable name if it was requested.
+        let original_var_name = if let Some(identifier_override) = identifier_opt {
+            identifier_override.clone()
+        } else {
+            declaration.identifier.clone()
+        };
+
+        if let Some(existing_symbol) = self.symbols.get_mut(&original_var_name) {
+            match existing_symbol.symbol {
+                Symbol::Var(ref identifier, ref mut existing_initializer) => {
+                    // Existing symbol: has linkage
+                    // New symbol: has linkage
+                    // Result: these refer to the same symbol. The new symbol might provide an initializer that updates
+                    //     a previous declaration to being a definition or updates a previous tentative definition
+                    //     to being explicitly initialized.
+                    //
+                    // Existing symbol: has linkage
+                    // New symbol: no linkage
+                    // Result: this is a clash. redefinition with different type of linkage
+                    //
+                    // Existing symbol: no linkage
+                    // New symbol: has linkage
+                    // Result: this is a clash. redefinition with different type of linkage
+                    //
+                    // Existing symbol: no linkage
+                    // New symbol: no linkage
+                    // Result: this is a clash. two local variables with the same name in the same scope
+                    if !existing_symbol.linkage.has() || !linkage.has() {
+                        return Err(format!(
+                            "duplicate variable declaration {}",
+                            declaration.identifier
+                        ));
+                    }
+
+                    if existing_symbol.linkage != linkage {
+                        return Err(format!(
+                            "variable {} redefinition with different linkage",
+                            declaration.identifier
+                        ));
+                    }
+
+                    // If these two declarations are linked together, the new declaration might change the initializer.
+                    if linkage.has() {
+                        assert!(existing_symbol.linkage.has());
+
+                        match (&existing_initializer, &initializer) {
+                            // A declaration with no initializer doesn't change anything.
+                            (_, StaticInitializer::None) => {}
+
+                            // Without a previous initializer, any initializer provided now can be used.
+                            (
+                                StaticInitializer::None | StaticInitializer::Tentative,
+                                initializer,
+                            ) => {
+                                *existing_initializer = initializer.clone();
+                            }
+
+                            // Cannot define with an initializer if it already had been.
+                            (StaticInitializer::Constant(_), StaticInitializer::Constant(_)) => {
+                                return Err(format!(
+                                    "variable {} redefinition",
+                                    declaration.identifier
+                                ));
+                            }
+                            (StaticInitializer::Constant(_), _) => {}
+                        }
+                    }
+
+                    if let StaticInitializer::Constant(_) = &existing_initializer {
+                        existing_symbol.is_definition = true;
+                    }
+
+                    // If we've established that the new symbol and existing symbol both have linkage, then they both
+                    // refer to the same symbol and have the same name, so we can return that.
+                    if existing_symbol.linkage.has() {
+                        assert!(linkage.has());
+
+                        // It's possible the existing symbol was forward-declared due to use of extern in block scope
+                        // or something. But if we're encountering the real declaration in its proper scope, mark it
+                        // that way so that further lookups of this symbol are allowed to access it, i.e. it is
+                        // in-scope.
+                        if is_added_in_scope {
+                            existing_symbol.is_added_in_scope = true;
+                        }
+
+                        return Ok(identifier.clone());
+                    }
+                }
+                Symbol::Function(_) => {
                     return Err(format!(
                         "variable {} previously defined as a function in this scope",
-                        ast_identifier
+                        declaration.identifier
                     ));
                 }
             }
         }
 
-        let temp_var = global_tracking.create_temporary_ast_ident(&ast_identifier);
-        let old_value = self
-            .symbols
-            .insert(ast_identifier.clone(), Symbol::Var(temp_var.clone()));
+        // We have to decide what internal variable name we should store in the symbol table. If an override was passed
+        // in, always use that. Otherwise, the name is either a fixed name (for symbols with linkage), so that all
+        // declarations of it can "link" together, or it's a new temporary identifier to refer to a stack location.
+        let internal_var_name = if let Some(identifier_override) = identifier_opt {
+            identifier_override.clone()
+        } else {
+            // If the new symbol has any linkage then the internal name should match the external name, so that it can
+            // link properly with other declarations of the symbol.
+            if linkage.has() {
+                declaration.identifier.clone()
+            } else {
+                global_tracking_opt
+                    .unwrap()
+                    .create_temporary_ast_ident(&declaration.identifier)
+            }
+        };
+
+        // Both explicit and tentative definitions count as definitions.
+        let is_definition = !variant_eq(&initializer, &StaticInitializer::None);
+
+        let old_value = self.symbols.insert(
+            original_var_name.clone(),
+            SymbolEntry {
+                symbol: Symbol::Var(internal_var_name.clone(), initializer),
+                is_definition,
+                is_added_in_scope,
+                linkage,
+            },
+        );
         assert!(old_value.is_none());
 
-        Ok(temp_var)
+        debug!(target: "resolve", original_ident = &original_var_name.0, new_ident = &internal_var_name.0, "added variable");
+
+        Ok(internal_var_name)
     }
 }
 
@@ -4320,7 +4951,7 @@ impl GlobalTracking {
     fn create_temporary_ast_ident(&mut self, identifier: &AstIdentifier) -> AstIdentifier {
         self.next_temporary_id += 1;
         AstIdentifier(format!(
-            "{:03}_var_{}",
+            "@{:03}_var_{}",
             self.next_temporary_id - 1,
             identifier
         ))
@@ -4329,6 +4960,64 @@ impl GlobalTracking {
     fn allocate_label(&mut self, prefix: &str) -> String {
         self.next_label_id += 1;
         format!("{}_{:03}", prefix, self.next_label_id - 1)
+    }
+
+    fn add_file_scope_variable(
+        &mut self,
+        declaration: &AstVarDeclaration,
+        is_added_in_scope: bool,
+    ) -> Result<AstIdentifier, String> {
+        // All file-scope variables have some kind of linkage. By default, or with the "extern" keyword, they have
+        // external linkage. With "static" they have internal linkage. If extern follows a previous declaration, it
+        // silently changes to
+        let linkage = match declaration.storage_class {
+            // No storage class specified at file scope declaration means external.
+            AstStorageClass::Unset => Linkage::External,
+
+            // Static storage class at file scope declaration means internal.
+            AstStorageClass::Static => Linkage::Internal,
+
+            // Extern storage class at file scope means use whatever was used before, or fall back to external.
+            AstStorageClass::Extern => {
+                if let Some(existing_symbol) = self.symbols.lookup_symbol(&declaration.identifier) {
+                    let Symbol::Var(_, _) = existing_symbol.symbol else {
+                        return Err(format!(
+                            "{} was previously defined as a different type",
+                            declaration.identifier
+                        ));
+                    };
+
+                    existing_symbol.linkage.clone()
+                } else {
+                    // The symbol was not previously declared, so extern defaults to external linkage.
+                    Linkage::External
+                }
+            }
+        };
+
+        // There should never be variables at file scope with no linkage.
+        assert!(linkage != Linkage::None);
+
+        self.symbols
+            .add_variable_ex(None, declaration, linkage, is_added_in_scope, None)
+    }
+
+    fn add_block_static_variable(
+        &mut self,
+        declaration: &AstVarDeclaration,
+        identifier: &AstIdentifier,
+    ) -> Result<AstIdentifier, String> {
+        assert!(variant_eq(
+            &declaration.storage_class,
+            &AstStorageClass::Static
+        ));
+
+        // Block static variables don't actually have internal linkage, but when adding them to the *global* symbol
+        // table, the way they're initialized behaves similarly to variables with linkage, so pass this in as a cheap
+        // way to reuse the logic. Doing this shouldn't afford them other internal linkage behaviors because their name
+        // is mangled in a way that only allows them to be used in the scope they're defined in.
+        self.symbols
+            .add_variable_ex(None, declaration, Linkage::Internal, true, Some(identifier))
     }
 }
 
@@ -4595,14 +5284,66 @@ fn lex_all_tokens<'i>(input: &'i str) -> Result<Vec<&'i str>, Vec<String>> {
     Ok(tokens)
 }
 
+fn try_parse_type_and_storage_class<'i, 't>(
+    original_tokens: &mut Tokens<'i, 't>,
+) -> Result<Option<AstStorageClass>, String> {
+    let mut tokens = original_tokens.clone();
+
+    let mut specifiers = Vec::new();
+    while let Ok(specifier) = tokens.consume_specifier() {
+        specifiers.push(specifier);
+    }
+
+    if specifiers.is_empty() {
+        return Ok(None);
+    }
+
+    *original_tokens = tokens;
+
+    let mut typ_opt = None;
+    let mut storage_class_opt = None;
+    for specifier in specifiers.iter() {
+        if *specifier == "int" {
+            if let Some(typ) = typ_opt {
+                return Err(format!(
+                    "Found type {} when type {} was already given",
+                    specifier, typ
+                ));
+            }
+
+            typ_opt = Some(specifier);
+            continue;
+        }
+
+        if let Some(storage_class) = storage_class_opt {
+            return Err(format!(
+                "Found storage class {} when storage class {} was already given",
+                specifier, storage_class
+            ));
+        }
+
+        storage_class_opt = Some(
+            specifier
+                .parse::<AstStorageClass>()
+                .expect("storage class that couldn't be parsed"),
+        );
+    }
+
+    if typ_opt.is_none() {
+        return Err(format!("type required"));
+    }
+
+    Ok(Some(storage_class_opt.unwrap_or(AstStorageClass::Unset)))
+}
+
 fn try_parse_function<'i, 't>(
     original_tokens: &mut Tokens<'i, 't>,
 ) -> Result<Option<AstFunction>, String> {
     let mut tokens = original_tokens.clone();
 
-    if !tokens.try_consume_expected_next_token("int") {
+    let Some(storage_class) = try_parse_type_and_storage_class(&mut tokens)? else {
         return Ok(None);
-    }
+    };
 
     let Some(name) = tokens.try_consume_identifier() else {
         return Ok(None);
@@ -4622,7 +5363,11 @@ fn try_parse_function<'i, 't>(
         while let Some(parameter_name) =
             try_parse_function_parameter(original_tokens, parameters.len() == 0)?
         {
-            parameters.push(parameter_name);
+            parameters.push(AstVarDeclaration {
+                identifier: parameter_name,
+                initializer_opt: None,
+                storage_class: AstStorageClass::Unset,
+            });
         }
     }
 
@@ -4642,6 +5387,7 @@ fn try_parse_function<'i, 't>(
         // We parsed the body as an AstBlock, but it's stored as a list of block items, because the body doesn't
         // introduce a new scope beyond the function itlself.
         body_opt: body_opt.map(|v| v.0),
+        storage_class,
     }))
 }
 
@@ -4692,13 +5438,24 @@ fn try_parse_block<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<Option<AstBloc
 
 #[instrument(target = "parse", level = "debug")]
 fn parse_block_item<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<AstBlockItem, String> {
-    // Try parsing as a function first, because the parameter list makes it easier to differentiate from an identifier.
-    if let Some(func) = try_parse_function(tokens)? {
-        Ok(AstBlockItem::FuncDeclaration(func))
-    } else if let Some(declaration) = try_parse_var_declaration(tokens)? {
-        Ok(AstBlockItem::VarDeclaration(declaration))
+    if let Some(declaration) = try_parse_declaration(tokens)? {
+        Ok(AstBlockItem::Declaration(declaration))
     } else {
         Ok(AstBlockItem::Statement(parse_statement(tokens)?))
+    }
+}
+
+#[instrument(target = "parse", level = "debug")]
+fn try_parse_declaration<'i, 't>(
+    tokens: &mut Tokens<'i, 't>,
+) -> Result<Option<AstDeclaration>, String> {
+    // Try parsing as a function first, because the parameter list makes it easier to differentiate from an identifier.
+    if let Some(func) = try_parse_function(tokens)? {
+        Ok(Some(AstDeclaration::FuncDeclaration(func)))
+    } else if let Some(declaration) = try_parse_var_declaration(tokens)? {
+        Ok(Some(AstDeclaration::VarDeclaration(declaration)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -4806,6 +5563,16 @@ fn try_parse_for_statement<'i, 't>(
     tokens.consume_expected_next_token("(")?;
 
     let initializer = if let Ok(Some(decl)) = try_parse_var_declaration(tokens) {
+        match decl.storage_class {
+            AstStorageClass::Unset => {}
+            AstStorageClass::Static | AstStorageClass::Extern => {
+                return Err(format!(
+                    "declaration in for loop header of variable {} cannot be static or extern",
+                    decl.identifier
+                ));
+            }
+        }
+
         AstForInit::Declaration(decl)
     } else {
         AstForInit::Expression(parse_optional_expression(tokens, ";")?)
@@ -4851,9 +5618,9 @@ fn parse_statement_labels<'i, 't>(tokens: &mut Tokens<'i, 't>) -> Result<Vec<Ast
 fn try_parse_var_declaration<'i, 't>(
     tokens: &mut Tokens<'i, 't>,
 ) -> Result<Option<AstVarDeclaration>, String> {
-    if !tokens.try_consume_expected_next_token("int") {
+    let Some(storage_class) = try_parse_type_and_storage_class(tokens)? else {
         return Ok(None);
-    }
+    };
 
     let var_name = tokens.consume_identifier()?;
 
@@ -4869,6 +5636,7 @@ fn try_parse_var_declaration<'i, 't>(
     let decl = AstVarDeclaration {
         identifier: AstIdentifier(String::from(var_name)),
         initializer_opt,
+        storage_class,
     };
 
     debug!(target: "parse", decl = %DisplayFmtNode(&decl), "parsed declaration");
@@ -5085,14 +5853,18 @@ fn try_parse_postfix_operator<'i, 't>(
     ret
 }
 
-fn generate_program_code(mode: Mode, ast_program: &AstProgram) -> Result<String, String> {
-    let tac_program = ast_program.to_tac()?;
+fn generate_program_code(
+    mode: Mode,
+    ast_program: &AstProgram,
+    global_tracking: &mut GlobalTracking,
+) -> Result<String, String> {
+    let tac_program = ast_program.to_tac(global_tracking)?;
 
     info!(tac = %DisplayFmtNode(&tac_program));
 
     match mode {
         Mode::All | Mode::CodegenOnly => {
-            let mut asm_program = tac_program.to_asm()?;
+            let mut asm_program = tac_program.to_asm(global_tracking)?;
 
             info!(asm = %DisplayFmtNode(&asm_program));
 
@@ -5207,22 +5979,25 @@ fn assemble_and_link(
 
 // TODO should return line numbers with errors
 #[instrument(target = "parse", level = "debug", skip_all)]
-fn parse_and_validate(mode: Mode, input: &str) -> Result<AstProgram, Vec<String>> {
+fn parse_and_validate(
+    mode: Mode,
+    input: &str,
+) -> Result<(AstProgram, GlobalTracking), Vec<String>> {
     let token_strings = lex_all_tokens(&input)?;
     let mut tokens = Tokens(&token_strings);
 
     if let Mode::LexOnly = mode {
-        return Ok(AstProgram::new(vec![]));
+        return Ok((AstProgram::new(vec![]), GlobalTracking::new()));
     }
 
     // TODO all parsing should return a list of errors, not just one. for now, wrap it in a single error
     let mut ast = {
-        let mut functions = vec![];
-        while let Some(function) = try_parse_function(&mut tokens).map_err(|e| vec![e])? {
-            functions.push(function);
+        let mut declarations = vec![];
+        while let Some(declaration) = try_parse_declaration(&mut tokens).map_err(|e| vec![e])? {
+            declarations.push(declaration);
         }
 
-        AstProgram::new(functions)
+        AstProgram::new(declarations)
     };
 
     info!(target: "parse", ast = %DisplayFmtNode(&ast));
@@ -5235,14 +6010,14 @@ fn parse_and_validate(mode: Mode, input: &str) -> Result<AstProgram, Vec<String>
     }
 
     if let Mode::ParseOnly = mode {
-        return Ok(ast);
+        return Ok((ast, GlobalTracking::new()));
     }
 
-    ast.validate_and_resolve()?;
+    let global_tracking = ast.validate_and_resolve()?;
 
     info!(target: "resolve", ast = %DisplayFmtNode(&ast), "AST after resolve");
 
-    Ok(ast)
+    Ok((ast, global_tracking))
 }
 
 fn preprocess(
@@ -5296,9 +6071,9 @@ fn compile_and_link(
         let input = preprocess(input, should_suppress_output, temp_dir)?;
 
         match parse_and_validate(args.mode, &input) {
-            Ok(ref ast) => match args.mode {
+            Ok((ast, mut global_tracking)) => match args.mode {
                 Mode::All | Mode::TacOnly | Mode::CodegenOnly => {
-                    let asm = generate_program_code(args.mode, ast)?;
+                    let asm = generate_program_code(args.mode, &ast, &mut global_tracking)?;
                     info!("assembly:\n{}", &asm);
 
                     let asm_path = temp_dir.join("code.asm");
@@ -5335,7 +6110,8 @@ fn compile_and_link(
             },
             Err(errors) => {
                 if errors.len() > 1 {
-                    for error_message in errors.iter().skip(1) {
+                    println!("{} errors found", errors.len());
+                    for error_message in errors.iter() {
                         println!("Error: {}", error_message);
                     }
                 }
